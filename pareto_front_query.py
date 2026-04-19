@@ -39,7 +39,6 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from design_variables import lower_bounds, load_variable_specs, upper_bounds, variable_names
 
 try:
     import torch
@@ -49,12 +48,34 @@ except Exception:
     nn = None
 
 
+VAR_NAMES = [
+    "d1s",
+    "dH",
+    "beta1hb",
+    "beta1sb",
+    "d2",
+    "b2",
+    "beta2hb",
+    "beta2sb",
+    "Lz",
+    "t",
+    "TipClear",
+    "nBl",
+    "rake_te_s",
+    "P_out",
+]
+
 ALL_OUTPUT_NAMES = ["Efficiency", "totalpressureratio", "Power", "MassFlow"]
 SURROGATE_OUTPUT_NAMES = ["Efficiency", "totalpressureratio", "MassFlow"]
-_VARIABLE_SPECS = load_variable_specs()
-VAR_NAMES = variable_names(_VARIABLE_SPECS)
-L_BOUNDS = lower_bounds(_VARIABLE_SPECS)
-U_BOUNDS = upper_bounds(_VARIABLE_SPECS)
+
+L_BOUNDS = np.array(
+    [0.34, 0.044, 70.0, 20.0, 0.45, 0.044, 40.0, 40.0, 0.185, 0.0015, 0.0007, 9, -25.0, 8.0],
+    dtype=float,
+)
+U_BOUNDS = np.array(
+    [0.42, 0.056, 84.0, 35.0, 0.53, 0.056, 54.0, 55.0, 0.215, 0.0035, 0.0015, 12, -15.0, 13.0],
+    dtype=float,
+)
 
 MAX_LE_SWEEP_DIFF = 52.0
 MIN_RAKE_TE_S_BY_NBL = {
@@ -74,16 +95,6 @@ DEFAULT_SELECTION_JSON = "pareto_selected_point.json"
 DEFAULT_ENGINEERING_CSV = "pareto_engineering_ranked.csv"
 DEFAULT_ENGINEERING_JSON = "pareto_engineering_report.json"
 GEOM_WARN_FEATURE_NAMES = [name for name in VAR_NAMES if name != "P_out"]
-
-
-def configure_runtime(design_variables_path: str | None = None):
-    globals_dict = globals()
-    specs = load_variable_specs(design_variables_path) if design_variables_path else load_variable_specs()
-    globals_dict["_VARIABLE_SPECS"] = specs
-    globals_dict["VAR_NAMES"] = variable_names(specs)
-    globals_dict["L_BOUNDS"] = lower_bounds(specs)
-    globals_dict["U_BOUNDS"] = upper_bounds(specs)
-    globals_dict["GEOM_WARN_FEATURE_NAMES"] = [name for name in globals_dict["VAR_NAMES"] if name != "P_out"]
 
 
 @dataclass

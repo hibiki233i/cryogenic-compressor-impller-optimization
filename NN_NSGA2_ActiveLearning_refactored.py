@@ -25,7 +25,6 @@ from cfx_runner import run_cfx_pipeline
 warnings.filterwarnings("ignore", category=UserWarning)
 import joblib
 from pymoo.util.nds.non_dominated_sorting import NonDominatedSorting
-from design_variables import lower_bounds, load_variable_specs, upper_bounds, variable_names
 
 CREATE_NO_WINDOW = 0x08000000 if os.name == 'nt' else 0
 
@@ -50,11 +49,15 @@ SURROGATE_OUTPUT_NAMES = ['Efficiency', TARGET_PR_NAME, 'MassFlow']
 SURROGATE_OUTPUT_IDX = [0, 1, 3]  
 TRUE_HV_REF_EFF = 0.6
 TRUE_HV_REF_PR  = 1.8
-DESIGN_VARIABLES_PATH = _env_or_default("IMPELLER_DESIGN_VARIABLES_PATH", "design_variables.json")
-_VARIABLE_SPECS = load_variable_specs(DESIGN_VARIABLES_PATH)
-VAR_NAMES = variable_names(_VARIABLE_SPECS)
-L_BOUNDS = lower_bounds(_VARIABLE_SPECS)
-U_BOUNDS = upper_bounds(_VARIABLE_SPECS)
+L_BOUNDS = np.array([
+    0.34, 0.044, 70.0, 20.0, 0.45, 0.044, 40.0, 40.0,
+    0.185, 0.0015, 0.0007, 9, -25.0, 8.0
+], dtype=float)
+
+U_BOUNDS = np.array([
+    0.42, 0.056, 84.0, 35.0, 0.53, 0.056, 54.0, 55.0,
+    0.215, 0.0035, 0.0015, 12, -15.0, 13.0
+], dtype=float)
 
 # 基于当前设计变量范围和叶轮几何经验的保守几何阈值。
 # beta1hb - beta1sb 的理论上限约为 64 deg，原 62 deg 基本不起筛选作用；
@@ -142,12 +145,6 @@ def configure_runtime(**overrides):
     for key, value in overrides.items():
         if key in globals_dict and value is not None:
             globals_dict[key] = value
-    if globals_dict.get("DESIGN_VARIABLES_PATH"):
-        specs = load_variable_specs(globals_dict["DESIGN_VARIABLES_PATH"])
-        globals_dict["VAR_NAMES"] = variable_names(specs)
-        globals_dict["L_BOUNDS"] = lower_bounds(specs)
-        globals_dict["U_BOUNDS"] = upper_bounds(specs)
-        globals_dict["GEOM_WARN_FEATURE_NAMES"] = [name for name in globals_dict["VAR_NAMES"] if name != "P_out"]
 
 
 def parse_runtime_args():
@@ -503,7 +500,7 @@ def _generate_candidates_mixed(
     n_local  = int(cfg.n_candidates * cfg.local_sample_ratio)
     n_global = cfg.n_candidates - n_local
 
-    sampler = qmc.LatinHypercube(d=len(VAR_NAMES), seed=None)
+    sampler = qmc.LatinHypercube(d=14, seed=None)
     X_global = snap_discrete_vars(
         qmc.scale(sampler.random(n_global), L_BOUNDS, U_BOUNDS)
     )
@@ -511,11 +508,11 @@ def _generate_candidates_mixed(
     if current_pareto_X is not None and len(current_pareto_X) > 0:
         sigma = (U_BOUNDS - L_BOUNDS) * 0.06   # 各维度范围的 6%
         idx = np.random.choice(len(current_pareto_X), n_local, replace=True)
-        X_local = current_pareto_X[idx] + np.random.randn(n_local, len(VAR_NAMES)) * sigma
+        X_local = current_pareto_X[idx] + np.random.randn(n_local, 14) * sigma
         X_local = np.clip(X_local, L_BOUNDS, U_BOUNDS)
         X_local = snap_discrete_vars(X_local)
     else:
-        sampler2 = qmc.LatinHypercube(d=len(VAR_NAMES), seed=None)
+        sampler2 = qmc.LatinHypercube(d=14, seed=None)
         X_local = snap_discrete_vars(
             qmc.scale(sampler2.random(n_local), L_BOUNDS, U_BOUNDS)
         )
@@ -1316,7 +1313,7 @@ def select_candidates_diverse(
     attempts = 0
     while len(selected) < n_pick and attempts < 200:
         attempts += 1
-        sampler = qmc.LatinHypercube(d=len(VAR_NAMES), seed=None)
+        sampler = qmc.LatinHypercube(d=14, seed=None)
         x_rand  = snap_discrete_vars(
             qmc.scale(sampler.random(1), L_BOUNDS, U_BOUNDS)
         )[0]

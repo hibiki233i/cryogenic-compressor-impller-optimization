@@ -8,16 +8,13 @@
     "geometry_script_path": "D:\\BOUNDYR\\Run-GeometryMeshing.ps1",
     "cfx_bin_dir": "D:\\ANSYS Inc\\v251\\CFX\\bin",
     "template_cfx": "D:\\BOUNDYR\\Templates\\BaseModel.cfx",
-    "template_cse": "D:\\BOUNDYR\\Templates\\Extract_Results.cse",
-    "base_cft": "D:\\BOUNDYR\\Templates\\0908-2.cft",
-    "cft_batch_template": "D:\\BOUNDYR\\Templates\\BaseModel.cft-batch"
+    "template_cse": "D:\\BOUNDYR\\Templates\\Extract_Results.cse"
   },
   "workspace": {
     "project_root": "D:\\BOUNDYR",
     "doe_runs_dir": "D:\\BOUNDYR\\Runs",
     "active_learning_runs_dir": "D:\\BOUNDYR\\ActiveLearning_Runs",
     "training_csv": "D:\\BOUNDYR\\Compressor_Training_Data.csv",
-    "design_variables_json": "D:\\BOUNDYR\\design_variables.json",
     "pareto_export_dir": "D:\\BOUNDYR\\pareto_cft_cases"
   },
   "runtime": {

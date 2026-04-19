@@ -22,9 +22,24 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import pandas as pd
-from design_variables import variable_names
 
-VAR_NAMES = variable_names()
+
+VAR_NAMES = [
+    "d1s",
+    "dH",
+    "beta1hb",
+    "beta1sb",
+    "d2",
+    "b2",
+    "beta2hb",
+    "beta2sb",
+    "Lz",
+    "t",
+    "TipClear",
+    "nBl",
+    "rake_te_s",
+    "P_out",
+]
 
 DEFAULT_ENGINEERING_CSV = "pareto_engineering_ranked.csv"
 DEFAULT_FRONT_CSV = "pareto_front_points.csv"
