@@ -71,3 +71,5 @@ Configure these paths in the GUI `Environment` tab before running DOE or active-
 - The project is currently structured to support Windows-based engineering workflows.
 - Existing legacy research scripts are preserved and wrapped by the desktop app rather than fully replaced.
 - DOE recovery, active-learning resume, Pareto querying, and case export are all available through the GUI layer.
+- The GUI now maintains DOE design-variable bounds in `design_variables.json`, shared by DOE, active learning, and Pareto workflows.
+- Environment validation can create an empty training CSV automatically when the configured file does not yet exist.

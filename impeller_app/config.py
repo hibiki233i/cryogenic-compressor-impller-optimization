@@ -11,6 +11,8 @@ class SolverPaths:
     cfx_bin_dir: Path = Path(r"D:\ANSYS Inc\v251\CFX\bin")
     template_cfx: Path = Path("Templates/BaseModel.cfx")
     template_cse: Path = Path("Templates/Extract_Results.cse")
+    base_cft: Path = Path("Templates/0908-2.cft")
+    cft_batch_template: Path = Path("Templates/BaseModel.cft-batch")
 
 
 @dataclass
@@ -19,6 +21,7 @@ class WorkspacePaths:
     doe_runs_dir: Path = Path("Runs")
     active_learning_runs_dir: Path = Path("ActiveLearning_Runs")
     training_csv: Path = Path("Compressor_Training_Data.csv")
+    design_variables_json: Path = Path("design_variables.json")
     extra_samples_json: Path = Path("extra_samples.json")
     pool_checkpoint_csv: Path = Path("al_training_pool_checkpoint.csv")
     checkpoint_meta_json: Path = Path("al_checkpoint_meta.json")
@@ -43,6 +46,7 @@ class WorkspacePaths:
             doe_runs_dir=_resolve(root, self.doe_runs_dir),
             active_learning_runs_dir=_resolve(root, self.active_learning_runs_dir),
             training_csv=_resolve(root, self.training_csv),
+            design_variables_json=_resolve(root, self.design_variables_json),
             extra_samples_json=_resolve(root, self.extra_samples_json),
             pool_checkpoint_csv=_resolve(root, self.pool_checkpoint_csv),
             checkpoint_meta_json=_resolve(root, self.checkpoint_meta_json),
@@ -88,6 +92,8 @@ class AppConfig:
                 cfx_bin_dir=self.solver.cfx_bin_dir,
                 template_cfx=_resolve(self.workspace.project_root, self.solver.template_cfx),
                 template_cse=_resolve(self.workspace.project_root, self.solver.template_cse),
+                base_cft=_resolve(self.workspace.project_root, self.solver.base_cft),
+                cft_batch_template=_resolve(self.workspace.project_root, self.solver.cft_batch_template),
             ),
             workspace=self.workspace.resolve_all(),
             runtime=self.runtime,
@@ -109,6 +115,7 @@ class AppConfig:
             "FAILED_POINTS_PATH": str(ws.failed_points_npy),
             "POOL_CHECKPOINT_CSV": str(ws.pool_checkpoint_csv),
             "CHECKPOINT_META_PATH": str(ws.checkpoint_meta_json),
+            "DESIGN_VARIABLES_PATH": str(ws.design_variables_json),
         }
 
 

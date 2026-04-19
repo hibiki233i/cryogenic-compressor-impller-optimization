@@ -11,26 +11,7 @@ from scipy.stats import qmc
 from ..config import AppConfig
 from ..models import TaskResult, TaskUpdate
 from cfx_runner import run_cfx_pipeline
-
-
-DOEVariableNames = [
-    "d1s",
-    "dH",
-    "beta1hb",
-    "beta1sb",
-    "d2",
-    "b2",
-    "beta2hb",
-    "beta2sb",
-    "Lz",
-    "t",
-    "TipClear",
-    "nBl",
-    "rake_te_s",
-    "P_out",
-]
-L_BOUNDS = np.array([0.34, 0.044, 70.0, 20.0, 0.45, 0.044, 40.0, 40.0, 0.185, 0.0015, 0.0007, 9.0, -25.0, 8.0])
-U_BOUNDS = np.array([0.42, 0.056, 84.0, 35.0, 0.53, 0.056, 54.0, 55.0, 0.215, 0.0035, 0.0015, 12.0, -15.0, 13.0])
+from design_variables import ensure_training_csv, load_variable_specs, lower_bounds, training_csv_columns, upper_bounds, variable_names
 MIN_NORMAL = 3.6
 MIN_DISCARD = 0.0001
 
@@ -43,6 +24,10 @@ def _emit(progress_callback, message: str, progress=None, metrics=None):
 class RunnerAPI:
     def __init__(self, config: AppConfig):
         self.config = config.resolved()
+        self.variable_specs = load_variable_specs(self.config.workspace.design_variables_json)
+        self.variable_names = variable_names(self.variable_specs)
+        self.l_bounds = lower_bounds(self.variable_specs)
+        self.u_bounds = upper_bounds(self.variable_specs)
 
     def validate_environment(self) -> TaskResult:
         cfg = self.config
@@ -51,7 +36,8 @@ class RunnerAPI:
             "geometry_script": cfg.solver.geometry_script_path,
             "template_cfx": cfg.solver.template_cfx,
             "template_cse": cfg.solver.template_cse,
-            "training_csv": cfg.workspace.training_csv,
+            "base_cft": cfg.solver.base_cft,
+            "cft_batch_template": cfg.solver.cft_batch_template,
         }
         cfx_execs = [
             cfg.solver.cfx_bin_dir / "cfx5pre.exe",
@@ -64,7 +50,29 @@ class RunnerAPI:
         missing = {name: str(path) for name, path in checks.items() if not Path(path).exists()}
         if missing:
             return TaskResult(status="failed", message="Environment validation failed.", metrics={"missing": missing})
-        return TaskResult(status="succeeded", message="Environment validation passed.", metrics={"checked": {k: str(v) for k, v in checks.items()}})
+
+        created_training_csv = False
+        training_csv = cfg.workspace.training_csv
+        try:
+            if not training_csv.exists():
+                ensure_training_csv(training_csv, self.variable_specs)
+                created_training_csv = True
+            ensure_training_csv(training_csv, self.variable_specs)
+        except Exception as exc:
+            return TaskResult(
+                status="failed",
+                message="Environment validation failed while preparing training CSV.",
+                metrics={"training_csv": str(training_csv), "error": str(exc)},
+            )
+
+        checked = {k: str(v) for k, v in checks.items()}
+        checked["training_csv"] = str(training_csv)
+        checked["design_variables_json"] = str(cfg.workspace.design_variables_json)
+        return TaskResult(
+            status="succeeded",
+            message="Environment validation passed.",
+            metrics={"checked": checked, "created_training_csv": created_training_csv},
+        )
 
     def recover_runs(self) -> TaskResult:
         recovery = self._recover_doe_progress()
@@ -80,12 +88,12 @@ class RunnerAPI:
         )
 
     def generate_lhs_samples(self, count: int, seed: int = 42) -> list[dict]:
-        sampler = qmc.LatinHypercube(d=len(DOEVariableNames), seed=seed)
-        sample_real = qmc.scale(sampler.random(n=count), L_BOUNDS, U_BOUNDS)
-        return [dict(zip(DOEVariableNames, row)) for row in sample_real]
+        sampler = qmc.LatinHypercube(d=len(self.variable_names), seed=seed)
+        sample_real = qmc.scale(sampler.random(n=count), self.l_bounds, self.u_bounds)
+        return [dict(zip(self.variable_names, row)) for row in sample_real]
 
     def _columns(self) -> list[str]:
-        return DOEVariableNames + ["Efficiency", "PressureRatio", "Power", "MassFlow", "totalpressureratio", "is_boundary"]
+        return training_csv_columns(self.variable_specs)
 
     def _load_extra_samples(self) -> list[dict]:
         path = self.config.workspace.extra_samples_json
@@ -97,9 +105,9 @@ class RunnerAPI:
         self.config.workspace.extra_samples_json.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
     def _new_extra_sample(self) -> dict:
-        norm = qmc.LatinHypercube(d=len(DOEVariableNames)).random(1)
-        sample_real = qmc.scale(norm, L_BOUNDS, U_BOUNDS)[0]
-        sample = dict(zip(DOEVariableNames, sample_real))
+        norm = qmc.LatinHypercube(d=len(self.variable_names)).random(1)
+        sample_real = qmc.scale(norm, self.l_bounds, self.u_bounds)[0]
+        sample = dict(zip(self.variable_names, sample_real))
         extras = self._load_extra_samples()
         extras.append(sample)
         self._save_extra_samples(extras)
@@ -186,7 +194,7 @@ class RunnerAPI:
             "-WorkingDir",
             str(working_dir),
         ]
-        for name in DOEVariableNames:
+        for name in self.variable_names:
             if name == "P_out":
                 continue
             value = int(round(float(sample[name]))) if name == "nBl" else sample[name]

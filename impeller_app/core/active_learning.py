@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import os
 from pathlib import Path
 
 import joblib
@@ -56,6 +57,7 @@ class ActiveLearningService:
     @property
     def legacy(self):
         if self._legacy is None:
+            os.environ["IMPELLER_DESIGN_VARIABLES_PATH"] = str(self.config.workspace.design_variables_json)
             self._legacy = active_learning_module()
             self._legacy.configure_runtime(**self.config.legacy_overrides())
         return self._legacy

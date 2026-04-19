@@ -1,3 +1,3 @@
-from .external import DOEVariableNames, RunnerAPI
+from .external import RunnerAPI
 
-__all__ = ["RunnerAPI", "DOEVariableNames"]
+__all__ = ["RunnerAPI"]

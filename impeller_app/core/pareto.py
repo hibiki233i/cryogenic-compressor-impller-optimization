@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 from ..config import AppConfig
@@ -11,7 +12,10 @@ from ..models import TaskResult
 class ParetoService:
     def __init__(self, config: AppConfig):
         self.config = config.resolved()
+        os.environ["IMPELLER_DESIGN_VARIABLES_PATH"] = str(self.config.workspace.design_variables_json)
         self.pareto = pareto_module()
+        if hasattr(self.pareto, "configure_runtime"):
+            self.pareto.configure_runtime(str(self.config.workspace.design_variables_json))
         self.exporter = export_module()
 
     def compute_pareto_front(self) -> TaskResult:
@@ -80,6 +84,8 @@ class ParetoService:
 
     def export_cases(self, top_n: int = 1, force: bool = False, base_cft: str | None = None, cft_batch_template: str | None = None) -> TaskResult:
         cfg = self.config
+        resolved_base_cft = base_cft or str(cfg.solver.base_cft)
+        resolved_batch_template = cft_batch_template or str(cfg.solver.cft_batch_template)
         engineering_df = self.exporter.load_csv(str(cfg.workspace.pareto_engineering_csv))
         front_df = self.exporter.load_csv(str(cfg.workspace.pareto_front_csv))
         args = type(
@@ -90,8 +96,8 @@ class ParetoService:
                 "front_indices": None,
                 "curve_fractions": None,
                 "case_prefix": "ParetoCase",
-                "base_cft": base_cft,
-                "cft_batch_template": cft_batch_template,
+                "base_cft": resolved_base_cft,
+                "cft_batch_template": resolved_batch_template,
                 "force": force,
             },
         )()
@@ -102,7 +108,7 @@ class ParetoService:
             case_dir = cfg.workspace.pareto_export_dir / f"ParetoCase_{i:02d}_F{int(row['front_index']):02d}"
             if case_dir.exists() and force:
                 self.exporter.shutil.rmtree(case_dir)
-            summary = self.exporter.write_case_files(case_dir, row, base_cft, cft_batch_template)
+            summary = self.exporter.write_case_files(case_dir, row, resolved_base_cft, resolved_batch_template)
             exported.append(summary)
         report_path = cfg.workspace.pareto_export_dir / "export_report.json"
         report_path.write_text(json.dumps({"count": len(exported), "cases": exported}, ensure_ascii=False, indent=2), encoding="utf-8")
