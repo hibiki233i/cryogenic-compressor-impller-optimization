@@ -151,6 +151,38 @@ class ImpellerAppTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "TRAINING_CSV 中没有可用于主动学习的样本"):
             legacy_al.split_with_fixed_testset(df)
 
+    def test_runtime_path_overrides_apply_to_resume_and_pool_checkpoint_helpers(self):
+        original_meta = legacy_al.CHECKPOINT_META_PATH
+        original_pool = legacy_al.POOL_CHECKPOINT_CSV
+        original_test = legacy_al.TEST_SET_CSV
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                meta_path = root / "al_checkpoint_meta.json"
+                pool_path = root / "al_training_pool_checkpoint.csv"
+                test_path = root / "fixed_test_set.csv"
+
+                meta_path.write_text(json.dumps({"completed_iters": 0, "in_progress_iter": 5}), encoding="utf-8")
+                pd.DataFrame(columns=legacy_al.VAR_NAMES + legacy_al.ALL_OUTPUT_NAMES + ["is_boundary"]).to_csv(pool_path, index=False)
+
+                legacy_al.configure_runtime(
+                    CHECKPOINT_META_PATH=str(meta_path),
+                    POOL_CHECKPOINT_CSV=str(pool_path),
+                    TEST_SET_CSV=str(test_path),
+                )
+
+                self.assertEqual(legacy_al.get_resume_iter(), 4)
+                loaded = legacy_al.load_pool_checkpoint()
+                self.assertIsNotNone(loaded)
+                self.assertEqual(len(loaded), 0)
+                self.assertEqual(legacy_al.TEST_SET_CSV, str(test_path))
+        finally:
+            legacy_al.configure_runtime(
+                CHECKPOINT_META_PATH=original_meta,
+                POOL_CHECKPOINT_CSV=original_pool,
+                TEST_SET_CSV=original_test,
+            )
+
     def test_run_active_learning_iteration_returns_failed_result_on_validation_error(self):
         class FailingLegacy:
             def get_resume_iter(self):

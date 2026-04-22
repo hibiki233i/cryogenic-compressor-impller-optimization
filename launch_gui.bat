@@ -3,12 +3,16 @@ setlocal
 
 cd /d "%~dp0"
 
-if exist "%cd%\dist\ImpellerWorkbench\ImpellerWorkbench.exe" (
-  start "" "%cd%\dist\ImpellerWorkbench\ImpellerWorkbench.exe"
-  goto :eof
+if /i "%IMPELLER_USE_BUILT_EXE%"=="1" (
+  if exist "%cd%\dist\ImpellerWorkbench\ImpellerWorkbench.exe" (
+    echo Launching built executable because IMPELLER_USE_BUILT_EXE=1...
+    start "" "%cd%\dist\ImpellerWorkbench\ImpellerWorkbench.exe"
+    goto :eof
+  )
+  echo IMPELLER_USE_BUILT_EXE=1 was set, but built executable was not found.
 )
 
-echo Built executable not found, falling back to Python launcher...
+echo Launching Python source app...
 call :detect_python
 if errorlevel 1 goto :no_python
 

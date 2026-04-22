@@ -171,9 +171,11 @@ def parse_runtime_args():
 
 #断点需跑的辅助函数
 def get_resume_iter(
-    checkpoint_meta_path=CHECKPOINT_META_PATH,
-    hv_csv_path=HV_CSV_PATH
+    checkpoint_meta_path=None,
+    hv_csv_path=None
 ):
+    checkpoint_meta_path = CHECKPOINT_META_PATH if checkpoint_meta_path is None else checkpoint_meta_path
+    hv_csv_path = HV_CSV_PATH if hv_csv_path is None else hv_csv_path
     if os.path.exists(checkpoint_meta_path):
         try:
             with open(checkpoint_meta_path, "r", encoding="utf-8") as f:
@@ -196,7 +198,8 @@ def get_resume_iter(
     return 0
 
 
-def load_pool_checkpoint(pool_csv=POOL_CHECKPOINT_CSV):
+def load_pool_checkpoint(pool_csv=None):
+    pool_csv = POOL_CHECKPOINT_CSV if pool_csv is None else pool_csv
     if not os.path.exists(pool_csv):
         return None
 
@@ -226,11 +229,15 @@ def save_checkpoint(
     total_success: int,
     completed_iters: int = None,
     in_progress_iter: int = None,
-    pool_csv=POOL_CHECKPOINT_CSV,
-    failed_points_path=FAILED_POINTS_PATH,
-    hv_csv_path=HV_CSV_PATH,
-    checkpoint_meta_path=CHECKPOINT_META_PATH
+    pool_csv=None,
+    failed_points_path=None,
+    hv_csv_path=None,
+    checkpoint_meta_path=None
 ):
+    pool_csv = POOL_CHECKPOINT_CSV if pool_csv is None else pool_csv
+    failed_points_path = FAILED_POINTS_PATH if failed_points_path is None else failed_points_path
+    hv_csv_path = HV_CSV_PATH if hv_csv_path is None else hv_csv_path
+    checkpoint_meta_path = CHECKPOINT_META_PATH if checkpoint_meta_path is None else checkpoint_meta_path
     df_pool = pd.DataFrame(X_pool, columns=VAR_NAMES)
     for j, col in enumerate(ALL_OUTPUT_NAMES):
         df_pool[col] = Y_pool[:, j]
@@ -379,12 +386,13 @@ def load_and_clean_data(csv_path: str):
 # =============================================================================
 # 数据划分：固定测试集
 # =============================================================================
-def split_with_fixed_testset(df: pd.DataFrame, test_csv=TEST_SET_CSV, test_size=0.15):
+def split_with_fixed_testset(df: pd.DataFrame, test_csv=None, test_size=0.15):
     """
     固定测试集：
     - 第一次运行：从当前 df 中划分测试集并保存到 test_csv
     - 后续运行：读取 test_csv，并从当前 df 中按设计变量匹配剔除测试样本
     """
+    test_csv = TEST_SET_CSV if test_csv is None else test_csv
     df = df.copy()
 
     if len(df) == 0:
