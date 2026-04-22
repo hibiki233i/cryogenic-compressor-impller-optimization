@@ -125,6 +125,10 @@ class ImpellerAppTests(unittest.TestCase):
             result = ActiveLearningService(config).resume_from_checkpoint()
             self.assertEqual(result.status, "succeeded")
             self.assertEqual(result.metrics["completed_iters"], 3)
+            self.assertEqual(Path(result.metrics["pool_checkpoint_path"]).resolve(), (root / "al_training_pool_checkpoint.csv").resolve())
+            self.assertFalse(result.metrics["pool_checkpoint_exists"])
+            self.assertEqual(Path(result.metrics["checkpoint_meta_path"]).resolve(), (root / "al_checkpoint_meta.json").resolve())
+            self.assertTrue(result.metrics["checkpoint_meta_exists"])
 
     def test_split_with_fixed_testset_rejects_empty_training_data(self):
         df = pd.DataFrame(columns=legacy_al.VAR_NAMES + legacy_al.ALL_OUTPUT_NAMES + ["is_boundary"])

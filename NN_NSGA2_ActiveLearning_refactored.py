@@ -1359,6 +1359,8 @@ def main_multiobjective_active_learning(max_al_iters: int | None = None):
 
    # 固定测试集；训练池始终来自当前最新 CSV
     X_pool, X_test_fixed, Y_pool, Y_test_fixed, W_pool, W_test_fixed = split_with_fixed_testset(df)
+    print(f"[断点续跑] 训练池 checkpoint 路径: {os.path.abspath(POOL_CHECKPOINT_CSV)}")
+    print(f"[断点续跑] checkpoint 文件存在: {'yes' if os.path.exists(POOL_CHECKPOINT_CSV) else 'no'}")
 
     pool_checkpoint_df = load_pool_checkpoint()
     if pool_checkpoint_df is not None:
@@ -1366,6 +1368,8 @@ def main_multiobjective_active_learning(max_al_iters: int | None = None):
         Y_pool = pool_checkpoint_df[ALL_OUTPUT_NAMES].values.astype(float)
         W_pool = pool_checkpoint_df['is_boundary'].values.astype(float)
         print(f"[断点续跑] 已从训练池 checkpoint 恢复样本: {len(X_pool)}")
+    else:
+        print(f"[断点续跑] 未找到可用训练池 checkpoint，继续使用 TRAINING_CSV 划分后的训练池: {len(X_pool)}")
 
     # 失败点池：主动学习中动态累积
     if os.path.exists(FAILED_POINTS_PATH):
@@ -1396,6 +1400,7 @@ def main_multiobjective_active_learning(max_al_iters: int | None = None):
         except Exception as e:
             print(f"[断点续跑] 读取 checkpoint 元信息中的计数失败，将从 0 开始累计: {e}")
 
+    print(f"[断点续跑] checkpoint 元信息路径: {os.path.abspath(CHECKPOINT_META_PATH)}")
     print(f"[断点续跑] 已完成轮次: {start_iter} | 本次将运行到总轮次: {effective_max_al_iters}")
     if resumed_in_progress_iter is not None:
         print(f"[断点续跑] 检测到上次可能中断于第 {int(resumed_in_progress_iter)} 轮进行中，本次将基于已落盘训练池重新开始该轮。")

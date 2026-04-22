@@ -69,7 +69,14 @@ class ActiveLearningService:
         if meta_path.exists():
             checkpoint_meta = json.loads(meta_path.read_text(encoding="utf-8"))
             completed_iters = int(checkpoint_meta.get("completed_iters", 0))
-        metrics = {"completed_iters": completed_iters, "pool_size": 0}
+        metrics = {
+            "completed_iters": completed_iters,
+            "pool_size": 0,
+            "pool_checkpoint_path": str(pool_path),
+            "pool_checkpoint_exists": pool_path.exists(),
+            "checkpoint_meta_path": str(meta_path),
+            "checkpoint_meta_exists": meta_path.exists(),
+        }
         if pool_path.exists():
             metrics["pool_size"] = sum(1 for _ in pool_path.open("r", encoding="utf-8")) - 1
         if meta_path.exists():
