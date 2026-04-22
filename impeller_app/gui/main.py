@@ -576,6 +576,7 @@ class MainWindow(QMainWindow):
     def _persist_current_config(self) -> AppConfig:
         self.config = self._current_config()
         resolved = self.config.resolved()
+        serialized_specs = self._serialize_variable_specs()
         save_variable_specs(serialized_specs, resolved.workspace.design_variables_json)
         self.variable_specs = load_variable_specs(resolved.workspace.design_variables_json)
         self.config_path = self.config.save()
