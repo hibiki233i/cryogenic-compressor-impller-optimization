@@ -380,6 +380,18 @@ def split_with_fixed_testset(df: pd.DataFrame, test_csv=TEST_SET_CSV, test_size=
     """
     df = df.copy()
 
+    if len(df) == 0:
+        raise ValueError(
+            "TRAINING_CSV 中没有可用于主动学习的样本。"
+            "请先运行 DOE / Recover Runs 生成训练数据，并确认 Compressor_Training_Data.csv 不是空文件。"
+        )
+
+    if len(df) < 2:
+        raise ValueError(
+            f"TRAINING_CSV 中只有 {len(df)} 条可用样本，无法划分固定测试集。"
+            "请先补充更多 DOE 样本后再运行主动学习。"
+        )
+
     if os.path.exists(test_csv):
         test_df = pd.read_csv(test_csv)
 

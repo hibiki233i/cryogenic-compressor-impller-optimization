@@ -12,6 +12,7 @@ from impeller_app.config import AppConfig, RuntimeSettings, SolverPaths, Workspa
 from impeller_app.core.active_learning import ActiveLearningService
 from impeller_app.core.pareto import ParetoService
 from impeller_app.runner.external import RunnerAPI
+import NN_NSGA2_ActiveLearning_refactored as legacy_al
 
 
 class ImpellerAppTests(unittest.TestCase):
@@ -124,6 +125,27 @@ class ImpellerAppTests(unittest.TestCase):
             result = ActiveLearningService(config).resume_from_checkpoint()
             self.assertEqual(result.status, "succeeded")
             self.assertEqual(result.metrics["completed_iters"], 3)
+
+    def test_split_with_fixed_testset_rejects_empty_training_data(self):
+        df = pd.DataFrame(columns=legacy_al.VAR_NAMES + legacy_al.ALL_OUTPUT_NAMES + ["is_boundary"])
+        with self.assertRaisesRegex(ValueError, "TRAINING_CSV 中没有可用于主动学习的样本"):
+            legacy_al.split_with_fixed_testset(df)
+
+    def test_run_active_learning_iteration_returns_failed_result_on_validation_error(self):
+        class FailingLegacy:
+            def get_resume_iter(self):
+                return 0
+
+            def main_multiobjective_active_learning(self, max_al_iters=None):
+                raise ValueError("TRAINING_CSV 中没有可用于主动学习的样本。")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self.make_config(Path(tmp))
+            service = ActiveLearningService(config)
+            service._legacy = FailingLegacy()
+            result = service.run_active_learning_iteration(1)
+            self.assertEqual(result.status, "failed")
+            self.assertIn("TRAINING_CSV 中没有可用于主动学习的样本", result.message)
 
     def test_compute_pareto_front_without_solver(self):
         with tempfile.TemporaryDirectory() as tmp:
