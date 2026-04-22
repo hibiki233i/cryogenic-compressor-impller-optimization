@@ -178,7 +178,14 @@ def get_resume_iter(
         try:
             with open(checkpoint_meta_path, "r", encoding="utf-8") as f:
                 meta = json.load(f)
-            return int(meta.get("completed_iters", 0))
+            completed_iters = int(meta.get("completed_iters", 0) or 0)
+            in_progress_iter = meta.get("in_progress_iter")
+            if in_progress_iter is not None:
+                in_progress_iter = int(in_progress_iter)
+                # If metadata is inconsistent, prefer restarting the interrupted
+                # 1-based iteration instead of dropping back to an older checkpoint.
+                completed_iters = max(completed_iters, in_progress_iter - 1)
+            return completed_iters
         except Exception as e:
             print(f"[断点续跑] 读取 checkpoint 元信息失败，将回退到 HV 历史: {e}")
 

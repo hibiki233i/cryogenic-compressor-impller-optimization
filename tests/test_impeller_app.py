@@ -130,6 +130,22 @@ class ImpellerAppTests(unittest.TestCase):
             self.assertEqual(Path(result.metrics["checkpoint_meta_path"]).resolve(), (root / "al_checkpoint_meta.json").resolve())
             self.assertTrue(result.metrics["checkpoint_meta_exists"])
 
+    def test_resume_from_checkpoint_uses_in_progress_iter_when_completed_iters_is_stale(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "Compressor_Training_Data.csv").write_text(
+                "d1s,dH,beta1hb,beta1sb,d2,b2,beta2hb,beta2sb,Lz,t,TipClear,nBl,rake_te_s,P_out,Efficiency,totalpressureratio,Power,MassFlow,is_boundary\n",
+                encoding="utf-8",
+            )
+            meta = {"completed_iters": 0, "in_progress_iter": 124}
+            (root / "al_checkpoint_meta.json").write_text(json.dumps(meta), encoding="utf-8")
+            config = self.make_config(root)
+            result = ActiveLearningService(config).resume_from_checkpoint()
+            self.assertEqual(result.status, "succeeded")
+            self.assertEqual(result.metrics["completed_iters"], 0)
+            self.assertEqual(result.metrics["in_progress_iter"], 124)
+            self.assertEqual(result.metrics["effective_resume_iter"], 123)
+
     def test_split_with_fixed_testset_rejects_empty_training_data(self):
         df = pd.DataFrame(columns=legacy_al.VAR_NAMES + legacy_al.ALL_OUTPUT_NAMES + ["is_boundary"])
         with self.assertRaisesRegex(ValueError, "TRAINING_CSV 中没有可用于主动学习的样本"):

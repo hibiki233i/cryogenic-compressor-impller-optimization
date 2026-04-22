@@ -66,11 +66,19 @@ class ActiveLearningService:
         meta_path = self.config.workspace.checkpoint_meta_json
         pool_path = self.config.workspace.pool_checkpoint_csv
         completed_iters = 0
+        effective_resume_iter = 0
+        in_progress_iter = None
         if meta_path.exists():
             checkpoint_meta = json.loads(meta_path.read_text(encoding="utf-8"))
             completed_iters = int(checkpoint_meta.get("completed_iters", 0))
+            in_progress_iter = checkpoint_meta.get("in_progress_iter")
+            if in_progress_iter is not None:
+                in_progress_iter = int(in_progress_iter)
+            effective_resume_iter = max(completed_iters, (in_progress_iter - 1) if in_progress_iter is not None else 0)
         metrics = {
             "completed_iters": completed_iters,
+            "effective_resume_iter": effective_resume_iter,
+            "in_progress_iter": in_progress_iter,
             "pool_size": 0,
             "pool_checkpoint_path": str(pool_path),
             "pool_checkpoint_exists": pool_path.exists(),
