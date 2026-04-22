@@ -77,3 +77,4 @@ Notes:
 - The GUI keeps the legacy Python scripts as the computation engine and layers a configurable desktop shell around them.
 - `NN_NSGA2_ActiveLearning_refactored.py` and `cfx_runner.py` now accept configuration overrides so the GUI is no longer blocked on hardcoded paths.
 - `windows-app-config.template.json` is included as a deployment checklist for Windows target machines.
+- The GUI now persists edited paths and runtime parameters to `%APPDATA%\BOUNDYR\impeller-app-config.json` on Windows and reloads them automatically at startup.

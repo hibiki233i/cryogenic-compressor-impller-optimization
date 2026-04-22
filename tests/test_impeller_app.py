@@ -35,6 +35,44 @@ class ImpellerAppTests(unittest.TestCase):
             self.assertEqual(result.status, "failed")
             self.assertIn("powershell_exe", result.metrics["missing"])
 
+    def test_config_round_trip_persists_paths_and_runtime(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / "app-config.json"
+            config = AppConfig(
+                solver=SolverPaths(
+                    powershell_exe=Path(r"C:\tools\pwsh.exe"),
+                    geometry_script_path=Path(r"D:\work\Run-GeometryMeshing.ps1"),
+                    cfx_bin_dir=Path(r"D:\ANSYS\CFX\bin"),
+                    template_cfx=Path(r"D:\work\BaseModel.cfx"),
+                    template_cse=Path(r"D:\work\Extract_Results.cse"),
+                ),
+                workspace=WorkspacePaths(
+                    project_root=Path(r"D:\BOUNDYR"),
+                    doe_runs_dir=Path(r"D:\BOUNDYR\Runs"),
+                    active_learning_runs_dir=Path(r"D:\BOUNDYR\ActiveLearning_Runs"),
+                    training_csv=Path(r"D:\BOUNDYR\Compressor_Training_Data.csv"),
+                    pareto_export_dir=Path(r"D:\BOUNDYR\pareto_cft_cases"),
+                ),
+                runtime=RuntimeSettings(
+                    cfx_cores=12,
+                    doe_initial_samples=64,
+                    doe_target_samples=128,
+                    active_learning_additional_iters=3,
+                    pareto_geom_safe_threshold=0.55,
+                ),
+            )
+
+            saved_path = config.save(config_path)
+            restored = AppConfig.load(saved_path)
+
+            self.assertEqual(saved_path, config_path)
+            self.assertEqual(restored.solver.geometry_script_path, Path(r"D:\work\Run-GeometryMeshing.ps1"))
+            self.assertEqual(restored.workspace.project_root, Path(r"D:\BOUNDYR"))
+            self.assertEqual(restored.workspace.pareto_export_dir, Path(r"D:\BOUNDYR\pareto_cft_cases"))
+            self.assertEqual(restored.runtime.cfx_cores, 12)
+            self.assertEqual(restored.runtime.doe_target_samples, 128)
+
     def test_recover_runs_rebuilds_training_csv(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

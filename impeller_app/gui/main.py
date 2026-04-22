@@ -87,7 +87,8 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("Impeller Optimization Workbench")
         self.resize(1320, 860)
-        self.config = AppConfig().resolved()
+        self.config_path = None
+        self.config = AppConfig.load()
         self._workers = []
 
         root = QWidget()
@@ -305,7 +306,12 @@ class MainWindow(QMainWindow):
             active_learning_additional_iters=self.al_iters.value(),
             pareto_geom_safe_threshold=self.geom_safe.value(),
         )
-        return AppConfig(solver=solver, workspace=workspace, runtime=runtime).resolved()
+        return AppConfig(solver=solver, workspace=workspace, runtime=runtime)
+
+    def _persist_current_config(self) -> AppConfig:
+        self.config = self._current_config()
+        self.config_path = self.config.save()
+        return self.config.resolved()
 
     def _run_worker(self, fn):
         worker = Worker(fn)
@@ -341,32 +347,32 @@ class MainWindow(QMainWindow):
         QMessageBox.critical(self, "Unhandled Error", text)
 
     def _validate_environment(self):
-        config = self._current_config()
+        config = self._persist_current_config()
         result = RunnerAPI(config).validate_environment()
         self._handle_result(result)
 
     def _recover_doe_runs(self):
-        result = RunnerAPI(self._current_config()).recover_runs()
+        result = RunnerAPI(self._persist_current_config()).recover_runs()
         self._handle_result(result)
 
     def _start_doe(self):
-        config = self._current_config()
+        config = self._persist_current_config()
         self._run_worker(lambda callback: RunnerAPI(config).run_doe_batch(progress_callback=callback))
 
     def _resume_checkpoint(self):
-        result = ActiveLearningService(self._current_config()).resume_from_checkpoint()
+        result = ActiveLearningService(self._persist_current_config()).resume_from_checkpoint()
         self._handle_result(result)
 
     def _train_surrogate(self):
-        config = self._current_config()
+        config = self._persist_current_config()
         self._run_worker(lambda callback: ActiveLearningService(config).train_surrogate(progress_callback=callback))
 
     def _run_active_learning(self):
-        config = self._current_config()
+        config = self._persist_current_config()
         self._run_worker(lambda callback: ActiveLearningService(config).run_active_learning_iteration(config.runtime.active_learning_additional_iters, progress_callback=callback))
 
     def _compute_pareto(self):
-        result = ParetoService(self._current_config()).compute_pareto_front()
+        result = ParetoService(self._persist_current_config()).compute_pareto_front()
         self._handle_result(result)
 
     def _query_pareto(self):
@@ -378,11 +384,11 @@ class MainWindow(QMainWindow):
             selection["target_pr"] = self.target_pr.value()
         else:
             selection["curve_frac"] = self.curve_frac.value()
-        result = ParetoService(self._current_config()).query_front(selection)
+        result = ParetoService(self._persist_current_config()).query_front(selection)
         self._handle_result(result)
 
     def _export_cases(self):
-        config = self._current_config()
+        config = self._persist_current_config()
         base_cft = self.base_cft.text() or None
         batch_template = self.batch_template.text() or None
         result = ParetoService(config).export_cases(
@@ -392,6 +398,13 @@ class MainWindow(QMainWindow):
             cft_batch_template=batch_template,
         )
         self._handle_result(result)
+
+    def closeEvent(self, event):
+        try:
+            self._persist_current_config()
+        except Exception:
+            self.log.appendPlainText(traceback.format_exc())
+        super().closeEvent(event)
 
 
 def main():

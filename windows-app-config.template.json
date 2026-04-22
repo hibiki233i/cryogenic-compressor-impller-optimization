@@ -1,7 +1,7 @@
 {
   "notes": {
-    "description": "Template values for the Windows desktop GUI. These are not auto-loaded yet; use them as your deployment checklist.",
-    "usage": "Update the GUI Environment tab to match these paths on the target Windows machine."
+    "description": "Template values for the Windows desktop GUI. Copy these into %APPDATA%\\\\BOUNDYR\\\\impeller-app-config.json or set them once in the GUI and let the app auto-save them.",
+    "usage": "Update the GUI Environment tab to match these paths on the target Windows machine. The app will persist later edits automatically."
   },
   "solver": {
     "powershell_exe": "C:\\Program Files\\PowerShell\\7\\pwsh.exe",
