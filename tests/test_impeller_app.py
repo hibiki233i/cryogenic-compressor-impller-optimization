@@ -237,6 +237,71 @@ class ImpellerAppTests(unittest.TestCase):
             self.assertEqual(len(stored), 1)
             self.assertAlmostEqual(float(stored.iloc[0]["Efficiency"]), 0.7)
 
+    @mock.patch("impeller_app.runner.external.subprocess.run")
+    def test_export_cases_generates_mesh_files(self, mock_run):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = self.make_config(root)
+            mock_run.return_value = mock.Mock(returncode=0, stdout="", stderr="")
+
+            front = pd.DataFrame(
+                [
+                    {
+                        "front_index": 3,
+                        "engineering_rank": 1,
+                        "engineering_score": 0.91,
+                        "d1s": 0.35,
+                        "dH": 0.05,
+                        "beta1hb": 72.0,
+                        "beta1sb": 24.0,
+                        "d2": 0.47,
+                        "b2": 0.05,
+                        "beta2hb": 44.0,
+                        "beta2sb": 46.0,
+                        "Lz": 0.2,
+                        "t": 0.002,
+                        "TipClear": 0.001,
+                        "nBl": 11,
+                        "rake_te_s": -18.0,
+                        "P_out": 10.0,
+                        "Efficiency": 0.74,
+                        "totalpressureratio": 2.1,
+                        "Power": 118.0,
+                        "MassFlow": 4.1,
+                    }
+                ]
+            )
+            front.to_csv(root / "pareto_engineering_ranked.csv", index=False)
+            front.to_csv(root / "pareto_front_points.csv", index=False)
+            templates = root / "Templates"
+            templates.mkdir()
+            (templates / "0908-2.cft").write_text("base", encoding="utf-8")
+            (templates / "BaseModel.cft-batch").write_text(
+                """<?xml version="1.0" encoding="utf-8"?>
+<Root>
+  <dS>0</dS><d2>0</d2><b2>0</b2><DeltaZ>0</DeltaZ><nBl>0</nBl><dH>0</dH>
+  <xTipInlet>0</xTipInlet><xTipOutlet>0</xTipOutlet><sLEH>0</sLEH><sLES>0</sLES><sTEH>0</sTEH><sTES>0</sTES>
+  <Beta2><Value Index="0">0</Value><Value Index="1">0</Value></Beta2>
+  <RakeTE><Value Index="1">0</Value></RakeTE>
+  <Beta1><Value Index="0">0</Value><Value Index="1">0</Value></Beta1>
+  <mFlow>0</mFlow><nRot>0</nRot>
+</Root>
+""",
+                encoding="utf-8",
+            )
+
+            result = ParetoService(config).export_cases(top_n=1, force=True)
+
+            self.assertEqual(result.status, "succeeded")
+            self.assertEqual(result.metrics["case_count"], 1)
+            mock_run.assert_called_once()
+            case_dir = root / "pareto_cft_cases" / "ParetoCase_01_F03"
+            self.assertTrue((case_dir / "geometry_parameters.csv").exists())
+            report = json.loads((root / "pareto_cft_cases" / "export_report.json").read_text(encoding="utf-8"))
+            self.assertEqual(report["count"], 1)
+            self.assertEqual(report["failed_count"], 0)
+            self.assertTrue(report["cases"][0]["mesh_generated"])
+
 
 if __name__ == "__main__":
     unittest.main()

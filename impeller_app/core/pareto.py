@@ -7,6 +7,7 @@ from pathlib import Path
 from ..config import AppConfig
 from ..legacy import export_module, pareto_module
 from ..models import TaskResult
+from ..runner import RunnerAPI
 
 
 class ParetoService:
@@ -82,12 +83,20 @@ class ParetoService:
             artifacts={"selection_json": str(cfg.workspace.pareto_selection_json)},
         )
 
-    def export_cases(self, top_n: int = 1, force: bool = False, base_cft: str | None = None, cft_batch_template: str | None = None) -> TaskResult:
+    def export_cases(
+        self,
+        top_n: int = 1,
+        force: bool = False,
+        base_cft: str | None = None,
+        cft_batch_template: str | None = None,
+        progress_callback=None,
+    ) -> TaskResult:
         cfg = self.config
         resolved_base_cft = base_cft or str(cfg.solver.base_cft)
         resolved_batch_template = cft_batch_template or str(cfg.solver.cft_batch_template)
         engineering_df = self.exporter.load_csv(str(cfg.workspace.pareto_engineering_csv))
         front_df = self.exporter.load_csv(str(cfg.workspace.pareto_front_csv))
+        runner = RunnerAPI(cfg)
         args = type(
             "Args",
             (),
@@ -104,17 +113,45 @@ class ParetoService:
         rows = self.exporter.select_rows(args, engineering_df, front_df)
         cfg.workspace.pareto_export_dir.mkdir(parents=True, exist_ok=True)
         exported = []
+        failed = []
         for i, row in enumerate(rows, start=1):
             case_dir = cfg.workspace.pareto_export_dir / f"ParetoCase_{i:02d}_F{int(row['front_index']):02d}"
             if case_dir.exists() and force:
                 self.exporter.shutil.rmtree(case_dir)
+            if progress_callback:
+                progress_callback(
+                    f"Exporting case {i}/{len(rows)}: {case_dir.name} and generating geometry/mesh..."
+                )
             summary = self.exporter.write_case_files(case_dir, row, resolved_base_cft, resolved_batch_template)
-            exported.append(summary)
+            sample = dict(summary["geometry"])
+            if "P_out" in row.index and row["P_out"] is not None:
+                sample["P_out"] = float(row["P_out"])
+            geometry_result = runner.run_geometry_generation(case_dir, sample, run_id=case_dir.name)
+            if geometry_result.status == "succeeded":
+                summary["mesh_generated"] = True
+                exported.append(summary)
+            else:
+                summary["mesh_generated"] = False
+                summary["mesh_error"] = geometry_result.message
+                failed.append(summary)
         report_path = cfg.workspace.pareto_export_dir / "export_report.json"
-        report_path.write_text(json.dumps({"count": len(exported), "cases": exported}, ensure_ascii=False, indent=2), encoding="utf-8")
+        report_path.write_text(
+            json.dumps(
+                {
+                    "count": len(exported),
+                    "failed_count": len(failed),
+                    "cases": exported,
+                    "failed_cases": failed,
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        status = "succeeded" if not failed else ("failed" if not exported else "partial")
         return TaskResult(
-            status="succeeded",
-            message=f"Exported {len(exported)} Pareto case folders.",
-            metrics={"case_count": len(exported)},
+            status=status,
+            message=f"Exported {len(exported)} Pareto case folders and generated mesh for them." if not failed else f"Exported {len(exported)} Pareto case folders; {len(failed)} mesh generations failed.",
+            metrics={"case_count": len(exported), "failed_case_count": len(failed)},
             artifacts={"export_dir": str(cfg.workspace.pareto_export_dir), "report": str(report_path)},
         )

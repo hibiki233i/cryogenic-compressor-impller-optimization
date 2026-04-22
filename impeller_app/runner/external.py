@@ -215,6 +215,25 @@ class RunnerAPI:
         )
         return TaskResult(status="succeeded" if success else "failed", message=message, metrics=payload or {}, artifacts={"working_dir": str(working_dir)})
 
+    def run_geometry_generation(self, working_dir: Path, sample: dict, run_id: str | None = None) -> TaskResult:
+        working_dir.mkdir(parents=True, exist_ok=True)
+        cmd = self.build_geometry_command(working_dir, sample)
+        ps_result = subprocess.run(cmd, capture_output=True, text=True)
+        prefix = f"{run_id}: " if run_id else ""
+        if ps_result.returncode != 0:
+            return TaskResult(
+                status="failed",
+                message=f"{prefix}geometry generation failed with exit code {ps_result.returncode}.",
+                metrics={"stdout": ps_result.stdout, "stderr": ps_result.stderr},
+                artifacts={"working_dir": str(working_dir)},
+            )
+        return TaskResult(
+            status="succeeded",
+            message=f"{prefix}geometry and mesh generated.",
+            metrics={"stdout": ps_result.stdout, "stderr": ps_result.stderr},
+            artifacts={"working_dir": str(working_dir)},
+        )
+
     def run_doe_sample(self, index: int, sample: dict, progress_callback=None) -> TaskResult:
         run_id = f"Run_{index:03d}"
         working_dir = self.config.workspace.doe_runs_dir / run_id
@@ -225,16 +244,10 @@ class RunnerAPI:
             if row is None:
                 return TaskResult(status="failed", message=f"{run_id}: existing result diverged and was discarded.", artifacts={"working_dir": str(working_dir)})
             return TaskResult(status="succeeded", message=f"{run_id}: reused existing result.", metrics=row, artifacts={"working_dir": str(working_dir)})
-        cmd = self.build_geometry_command(working_dir, sample)
         _emit(progress_callback, f"{run_id}: generating geometry and mesh...")
-        ps_result = subprocess.run(cmd, capture_output=True, text=True)
-        if ps_result.returncode != 0:
-            return TaskResult(
-                status="failed",
-                message=f"{run_id}: geometry generation failed with exit code {ps_result.returncode}.",
-                metrics={"stdout": ps_result.stdout, "stderr": ps_result.stderr},
-                artifacts={"working_dir": str(working_dir)},
-            )
+        geometry_result = self.run_geometry_generation(working_dir, sample, run_id=run_id)
+        if geometry_result.status != "succeeded":
+            return geometry_result
         _emit(progress_callback, f"{run_id}: geometry done, launching CFX...")
         cfx_result = self.run_cfx_case(working_dir, run_id, float(sample["P_out"]), int(round(float(sample["nBl"]))))
         if cfx_result.status != "succeeded":
