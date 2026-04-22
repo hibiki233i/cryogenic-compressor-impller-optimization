@@ -65,6 +65,8 @@ The GUI and packaged app do not bundle ANSYS CFX, CFturbo, or PowerShell. The ta
 - valid template files and accessible working directories
 
 Configure these paths in the GUI `Environment` tab before running DOE or active-learning tasks.
+The desktop app now auto-saves path and runtime edits and reloads them on the next launch.
+On Windows, the default config file is `%APPDATA%\\BOUNDYR\\impeller-app-config.json`.
 
 ## Notes
 

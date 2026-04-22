@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import json
+import os
 from dataclasses import dataclass, field
+from dataclasses import fields
 from pathlib import Path
 
 
@@ -118,6 +121,68 @@ class AppConfig:
             "DESIGN_VARIABLES_PATH": str(ws.design_variables_json),
         }
 
+    def to_dict(self) -> dict:
+        return {
+            "solver": _dataclass_to_dict(self.solver),
+            "workspace": _dataclass_to_dict(self.workspace),
+            "runtime": _dataclass_to_dict(self.runtime),
+        }
+
+    def save(self, path: str | Path | None = None) -> Path:
+        target = default_config_path() if path is None else Path(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(json.dumps(self.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
+        return target
+
+    @classmethod
+    def load(cls, path: str | Path | None = None) -> "AppConfig":
+        target = default_config_path() if path is None else Path(path)
+        if not target.exists():
+            return cls()
+        payload = json.loads(target.read_text(encoding="utf-8"))
+        return cls.from_dict(payload)
+
+    @classmethod
+    def from_dict(cls, payload: dict | None) -> "AppConfig":
+        payload = payload or {}
+        return cls(
+            solver=_merge_dataclass(SolverPaths, payload.get("solver", {})),
+            workspace=_merge_dataclass(WorkspacePaths, payload.get("workspace", {})),
+            runtime=_merge_dataclass(RuntimeSettings, payload.get("runtime", {})),
+        )
+
+
+def default_config_path() -> Path:
+    override = os.environ.get("IMPELLER_APP_CONFIG")
+    if override:
+        return Path(override).expanduser()
+    if os.name == "nt":
+        root = os.environ.get("APPDATA") or str(Path.home() / "AppData" / "Roaming")
+        return Path(root) / "BOUNDYR" / "impeller-app-config.json"
+    return Path.home() / ".boundyr" / "impeller-app-config.json"
+
 
 def _resolve(root: Path, candidate: Path) -> Path:
     return candidate if candidate.is_absolute() else (root / candidate)
+
+
+def _coerce_value(field_type, value):
+    if field_type is Path or field_type == Path or field_type == "Path":
+        return Path(value)
+    return value
+
+
+def _merge_dataclass(cls, payload: dict):
+    kwargs = {}
+    for item in fields(cls):
+        if item.name in payload:
+            kwargs[item.name] = _coerce_value(item.type, payload[item.name])
+    return cls(**kwargs)
+
+
+def _dataclass_to_dict(instance) -> dict:
+    result = {}
+    for item in fields(instance):
+        value = getattr(instance, item.name)
+        result[item.name] = str(value) if isinstance(value, Path) else value
+    return result
