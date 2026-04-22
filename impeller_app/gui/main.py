@@ -661,12 +661,22 @@ class MainWindow(QMainWindow):
         )
 
     def _compute_pareto(self):
-        result = self._with_config(lambda config: ParetoService(config).compute_pareto_front())
-        if result is not None:
-            self._handle_result(result)
+        config = self._with_config(lambda cfg: cfg)
+        if config is None:
+            return
+        self._run_worker(
+            lambda callback: (
+                callback("Computing Pareto front..."),
+                ParetoService(config).compute_pareto_front(),
+            )[1]
+        )
 
     def _query_pareto(self):
-        def run(config: AppConfig):
+        config = self._with_config(lambda cfg: cfg)
+        if config is None:
+            return
+
+        def run(callback):
             selection = {}
             if self.front_index.value() >= 0:
                 selection["front_index"] = self.front_index.value()
@@ -675,23 +685,24 @@ class MainWindow(QMainWindow):
                 selection["target_pr"] = self.target_pr.value()
             else:
                 selection["curve_frac"] = self.curve_frac.value()
+            callback("Computing Pareto front and running query...")
             return ParetoService(config).query_front(selection)
 
-        result = self._with_config(run)
-        if result is not None:
-            self._handle_result(result)
+        self._run_worker(run)
 
     def _export_cases(self):
-        result = self._with_config(
-            lambda config: ParetoService(config).export_cases(
+        config = self._with_config(lambda cfg: cfg)
+        if config is None:
+            return
+        self._run_worker(
+            lambda callback: ParetoService(config).export_cases(
                 top_n=self.export_top_n.value(),
                 force=True,
                 base_cft=self.base_cft.text() or None,
                 cft_batch_template=self.batch_template.text() or None,
+                progress_callback=callback,
             )
         )
-        if result is not None:
-            self._handle_result(result)
 
     def closeEvent(self, event):
         try:
