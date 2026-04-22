@@ -230,7 +230,8 @@ class DirectoryField(PathField):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.config = AppConfig().resolved()
+        self.config_path = None
+        self.config = AppConfig.load().resolved()
         self.variable_specs = load_variable_specs(self.config.workspace.design_variables_json)
         self._workers = []
         self._language = "zh"
@@ -570,10 +571,15 @@ class MainWindow(QMainWindow):
             active_learning_additional_iters=self.al_iters.value(),
             pareto_geom_safe_threshold=self.geom_safe.value(),
         )
-        config = AppConfig(solver=solver, workspace=workspace, runtime=runtime).resolved()
-        save_variable_specs(serialized_specs, config.workspace.design_variables_json)
-        self.variable_specs = serialized_specs
-        return config
+        return AppConfig(solver=solver, workspace=workspace, runtime=runtime)
+
+    def _persist_current_config(self) -> AppConfig:
+        self.config = self._current_config()
+        resolved = self.config.resolved()
+        save_variable_specs(serialized_specs, resolved.workspace.design_variables_json)
+        self.variable_specs = load_variable_specs(resolved.workspace.design_variables_json)
+        self.config_path = self.config.save()
+        return resolved
 
     def _run_worker(self, fn):
         worker = Worker(fn)
@@ -610,7 +616,7 @@ class MainWindow(QMainWindow):
 
     def _with_config(self, fn):
         try:
-            return fn(self._current_config())
+            return fn(self._persist_current_config())
         except ValueError as exc:
             QMessageBox.warning(self, self.tr("invalid_ranges"), str(exc))
             return None
@@ -679,10 +685,19 @@ class MainWindow(QMainWindow):
             lambda config: ParetoService(config).export_cases(
                 top_n=self.export_top_n.value(),
                 force=True,
+                base_cft=self.base_cft.text() or None,
+                cft_batch_template=self.batch_template.text() or None,
             )
         )
         if result is not None:
             self._handle_result(result)
+
+    def closeEvent(self, event):
+        try:
+            self._persist_current_config()
+        except Exception:
+            self.log.appendPlainText(traceback.format_exc())
+        super().closeEvent(event)
 
 
 def main():
