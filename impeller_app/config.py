@@ -79,6 +79,9 @@ class RuntimeSettings:
     doe_target_samples: int = 300
     active_learning_additional_iters: int = 1
     pareto_geom_safe_threshold: float = 0.45
+    sobol_fixed_nbl: int = 10
+    sobol_base_n: int = 2048
+    sobol_tag: str = "default"
 
 
 @dataclass

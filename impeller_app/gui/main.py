@@ -6,7 +6,7 @@ from pathlib import Path
 
 from design_variables import load_variable_specs, save_variable_specs
 from ..config import AppConfig, RuntimeSettings, SolverPaths, WorkspacePaths
-from ..core import ActiveLearningService, ParetoService
+from ..core import ActiveLearningService, ParetoService, SobolService
 from ..models import TaskResult, TaskUpdate
 from ..runner import RunnerAPI
 
@@ -95,6 +95,12 @@ TEXTS = {
         "export_top_n": "Top N Cases",
         "export_dir": "Export Dir",
         "export_cases": "Export Cases",
+        "tab_sobol": "Sobol",
+        "sobol_group": "Sobol Sensitivity Analysis",
+        "sobol_fixed_nbl": "Fixed nBl",
+        "sobol_base_n": "Base Samples (N)",
+        "sobol_tag": "Output Tag",
+        "run_sobol": "Run Sobol Analysis",
         "task_failed": "Task Failed",
         "unhandled_error": "Unhandled Error",
         "invalid_ranges": "Invalid variable ranges",
@@ -154,6 +160,12 @@ TEXTS = {
         "export_top_n": "导出前 N 个案例",
         "export_dir": "导出目录",
         "export_cases": "导出案例",
+        "tab_sobol": "Sobol 分析",
+        "sobol_group": "Sobol 灵敏度分析",
+        "sobol_fixed_nbl": "固定叶片数 (nBl)",
+        "sobol_base_n": "基础样本数 (N)",
+        "sobol_tag": "输出标签",
+        "run_sobol": "运行 Sobol 分析",
         "task_failed": "任务失败",
         "unhandled_error": "未处理异常",
         "invalid_ranges": "变量范围无效",
@@ -260,6 +272,7 @@ class MainWindow(QMainWindow):
         self._build_doe_tab()
         self._build_active_learning_tab()
         self._build_pareto_tab()
+        self._build_sobol_tab()
         self._build_export_tab()
         self._apply_language()
 
@@ -443,6 +456,30 @@ class MainWindow(QMainWindow):
         layout.addLayout(row)
         self._tab_indexes["tab_pareto"] = self.tabs.addTab(page, "")
 
+    def _build_sobol_tab(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        self.sobol_group = QGroupBox()
+        form = QFormLayout(self.sobol_group)
+        self.sobol_fixed_nbl = QSpinBox()
+        self.sobol_fixed_nbl.setRange(9, 12)
+        self.sobol_fixed_nbl.setValue(self.config.runtime.sobol_fixed_nbl)
+        self.sobol_base_n = QSpinBox()
+        self.sobol_base_n.setRange(128, 100000)
+        self.sobol_base_n.setSingleStep(128)
+        self.sobol_base_n.setValue(self.config.runtime.sobol_base_n)
+        self.sobol_tag = QLineEdit(self.config.runtime.sobol_tag)
+        self._add_form_row(form, "sobol_fixed_nbl", self.sobol_fixed_nbl)
+        self._add_form_row(form, "sobol_base_n", self.sobol_base_n)
+        self._add_form_row(form, "sobol_tag", self.sobol_tag)
+        layout.addWidget(self.sobol_group)
+
+        self.run_sobol_button = QPushButton()
+        self.run_sobol_button.clicked.connect(self._run_sobol)
+        layout.addWidget(self.run_sobol_button, alignment=Qt.AlignmentFlag.AlignLeft)
+        layout.addStretch(1)
+        self._tab_indexes["tab_sobol"] = self.tabs.addTab(page, "")
+
     def _build_export_tab(self):
         page = QWidget()
         layout = QVBoxLayout(page)
@@ -483,6 +520,7 @@ class MainWindow(QMainWindow):
         self.variable_ranges_group.setTitle(self.tr("variable_ranges_group"))
         self.active_learning_group.setTitle(self.tr("active_learning_group"))
         self.pareto_group.setTitle(self.tr("pareto_group"))
+        self.sobol_group.setTitle(self.tr("sobol_group"))
         self.export_group.setTitle(self.tr("export_group"))
 
         self.range_header_name.setText(self.tr("variable_name"))
@@ -497,6 +535,7 @@ class MainWindow(QMainWindow):
         self.run_active_learning_button.setText(self.tr("run_active_learning"))
         self.compute_pareto_button.setText(self.tr("compute_pareto"))
         self.query_button.setText(self.tr("run_query"))
+        self.run_sobol_button.setText(self.tr("run_sobol"))
         self.export_button.setText(self.tr("export_cases"))
 
         for key, index in self._tab_indexes.items():
@@ -570,6 +609,9 @@ class MainWindow(QMainWindow):
             doe_target_samples=self.doe_target_samples.value(),
             active_learning_additional_iters=self.al_iters.value(),
             pareto_geom_safe_threshold=self.geom_safe.value(),
+            sobol_fixed_nbl=self.sobol_fixed_nbl.value(),
+            sobol_base_n=self.sobol_base_n.value(),
+            sobol_tag=self.sobol_tag.text().strip(),
         )
         return AppConfig(solver=solver, workspace=workspace, runtime=runtime)
 
@@ -689,6 +731,12 @@ class MainWindow(QMainWindow):
             return ParetoService(config).query_front(selection)
 
         self._run_worker(run)
+
+    def _run_sobol(self):
+        config = self._with_config(lambda cfg: cfg)
+        if config is None:
+            return
+        self._run_worker(lambda callback: SobolService(config).run_analysis(progress_callback=callback))
 
     def _export_cases(self):
         config = self._with_config(lambda cfg: cfg)
