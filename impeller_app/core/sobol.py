@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import warnings
 from pathlib import Path
+import tempfile
 
 import joblib
 import numpy as np
@@ -10,6 +11,12 @@ import pandas as pd
 import torch
 import torch.nn as nn
 from sklearn.preprocessing import MinMaxScaler
+
+os.environ.setdefault("MPLCONFIGDIR", os.path.join(tempfile.gettempdir(), "mplconfig"))
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 from ..config import AppConfig
 from ..models import TaskResult, TaskUpdate
@@ -147,6 +154,8 @@ class SobolService:
         Y_pred = scaler_y.inverse_transform(Y_norm)
 
         results = {}
+        csv_files = []
+        png_files = []
         for i, name in enumerate(['Efficiency', 'PressureRatio']):
             _emit(progress_callback, f"Calculating Sobol indices for {name}...")
             Si = sobol.analyze(problem, Y_pred[:, i], calc_second_order=False, print_to_console=False)
@@ -160,12 +169,17 @@ class SobolService:
             
             csv_path_out = self.config.workspace.project_root / f"{tag}_sobol_{name}_nBl{fixed_nbl}.csv"
             res_df.to_csv(csv_path_out, index=False)
+            csv_files.append(str(csv_path_out))
+
+            png_path_out = self.config.workspace.project_root / f"{tag}_sobol_{name}_nBl{fixed_nbl}.png"
+            self._plot_sobol_results(res_df, name, fixed_nbl, png_path_out)
+            png_files.append(str(png_path_out))
 
         return TaskResult(
             status="succeeded",
             message=f"Sobol analysis completed for nBl={fixed_nbl}.",
             metrics={"sobol_results": results},
-            artifacts={"csv_files": [str(self.config.workspace.project_root / f"{tag}_sobol_{n}_nBl{fixed_nbl}.csv") for n in ['Efficiency', 'PressureRatio']]}
+            artifacts={"csv_files": csv_files, "png_files": png_files}
         )
 
     def _load_analysis_data(self, progress_callback, csv_path: Path) -> pd.DataFrame:
@@ -205,3 +219,29 @@ class SobolService:
             f"(base={len(df_main)}, al={len(df_al)}, merged={len(df_merged)})"
         )
         return df_merged
+
+    def _plot_sobol_results(self, results_df: pd.DataFrame, output_name: str, fixed_nbl: int, output_path: Path):
+        plt.rcParams["font.sans-serif"] = ["SimHei", "Arial Unicode MS", "DejaVu Sans"]
+        plt.rcParams["axes.unicode_minus"] = False
+
+        fig, ax = plt.subplots(figsize=(11, 5))
+        sorted_vars = results_df["Variable"].tolist()
+        s1 = results_df["S1"].values
+        st = results_df["ST"].values
+
+        x = np.arange(len(sorted_vars))
+        width = 0.36
+
+        ax.bar(x - width / 2, s1, width, label="$S_1$(first-order)", color="steelblue", alpha=0.85)
+        ax.bar(x + width / 2, st, width, label="$S_T$(total)", color="tomato", alpha=0.85)
+        ax.axhline(y=0.01, color="gray", linestyle="--", lw=1.2, label="ST=0.01")
+        ax.set_xticks(x)
+        ax.set_xticklabels(sorted_vars, rotation=45, ha="right", fontsize=9)
+        ax.set_ylabel("Sobol sensitivity index")
+        ax.set_title(f"Sobol Analysis (nBl={fixed_nbl}, target={output_name})")
+        ax.legend()
+        ax.set_ylim(bottom=-0.02)
+
+        plt.tight_layout()
+        fig.savefig(output_path, dpi=150)
+        plt.close(fig)
