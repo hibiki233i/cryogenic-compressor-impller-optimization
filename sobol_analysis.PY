@@ -80,17 +80,27 @@ def parse_args():
     parser.add_argument("--base-n", type=int, default=N_SOBOL_BASE)
     parser.add_argument("--tag", default="default")
     parser.add_argument("--csv", default=TRAINING_CSV)
+    parser.add_argument("--use-al-samples", action="store_true",
+                        help="在主数据集基础上合并主动学习训练池样本，用于 trust region 与参考值统计。")
+    parser.add_argument("--al-csv", default=AL_TRAINING_CSV,
+                        help="主动学习训练池 CSV 路径，仅在启用 --use-al-samples 时使用。")
     parser.add_argument("--model", default=BEST_MODEL_PATH)
     parser.add_argument("--scaler-x", default=SCALER_X_PATH)
     parser.add_argument("--scaler-y", default=SCALER_Y_PATH)
     parser.add_argument("--compare-output", choices=["效率", "压比", "all"], default="all")
     parser.add_argument("--before-tag", default="DOE")
     parser.add_argument("--before-csv", default=DOE_TRAINING_CSV)
+    parser.add_argument("--before-use-al-samples", action="store_true",
+                        help="对比前一侧是否额外合并主动学习样本。")
+    parser.add_argument("--before-al-csv", default=AL_TRAINING_CSV)
     parser.add_argument("--before-model", default=DOE_MODEL_PATH)
     parser.add_argument("--before-scaler-x", default=DOE_SCALER_X_PATH)
     parser.add_argument("--before-scaler-y", default=DOE_SCALER_Y_PATH)
     parser.add_argument("--after-tag", default="AL")
     parser.add_argument("--after-csv", default=AL_TRAINING_CSV)
+    parser.add_argument("--after-use-al-samples", action="store_true",
+                        help="对比后一侧是否额外合并主动学习样本。")
+    parser.add_argument("--after-al-csv", default=AL_TRAINING_CSV)
     parser.add_argument("--after-model", default=AL_MODEL_PATH)
     parser.add_argument("--after-scaler-x", default=AL_SCALER_X_PATH)
     parser.add_argument("--after-scaler-y", default=AL_SCALER_Y_PATH)
@@ -154,6 +164,24 @@ def load_and_clean_data(csv_path: str) -> pd.DataFrame:
 
     df['nBl'] = np.clip(np.round(df['nBl']), 9, 12).astype(int)
     df = df.drop_duplicates(subset=VAR_NAMES, keep='first').reset_index(drop=True)
+    return df
+
+
+def load_analysis_data(csv_path: str,
+                       use_al_samples: bool = False,
+                       al_csv_path: str = AL_TRAINING_CSV) -> pd.DataFrame:
+    df_main = load_and_clean_data(csv_path)
+    if not use_al_samples:
+        print(f"[数据] 使用主数据集: {csv_path} (样本数={len(df_main)})")
+        return df_main
+
+    df_al = load_and_clean_data(al_csv_path)
+    df = pd.concat([df_main, df_al], ignore_index=True)
+    df = df.drop_duplicates(subset=VAR_NAMES, keep='first').reset_index(drop=True)
+    print(
+        f"[数据] 使用主数据集 + 主动学习样本: {csv_path} + {al_csv_path} "
+        f"(主={len(df_main)}, AL={len(df_al)}, 合并去重后={len(df)})"
+    )
     return df
 
 
@@ -316,13 +344,19 @@ def run_conditional_sobol(output_idx: int = 0,
                           output_name: str = "效率",
                           fixed_nBl: int = DEFAULT_FIXED_NBL,
                           csv_path: str = TRAINING_CSV,
+                          use_al_samples: bool = False,
+                          al_csv_path: str = AL_TRAINING_CSV,
                           model_path: str = BEST_MODEL_PATH,
                           scaler_x_path: str = SCALER_X_PATH,
                           scaler_y_path: str = SCALER_Y_PATH,
                           output_tag: str = "default",
                           sobol_base_n: int = N_SOBOL_BASE):
     ensure_salib_available()
-    df = load_and_clean_data(csv_path)
+    df = load_analysis_data(
+        csv_path=csv_path,
+        use_al_samples=use_al_samples,
+        al_csv_path=al_csv_path
+    )
 
     X_data = df[VAR_NAMES].values.astype(float)
     sub_mask = (X_data[:, NBL_IDX] == fixed_nBl)
@@ -350,6 +384,8 @@ def run_conditional_sobol(output_idx: int = 0,
     }
 
     print(f"\n[条件Sobol] 数据源: {csv_path}")
+    if use_al_samples:
+        print(f"[条件Sobol] 附加主动学习样本: {al_csv_path}")
     print(f"[条件Sobol] 模型源: {model_path}")
     print(f"[条件Sobol] 生成 Saltelli 样本（N={sobol_base_n}, second_order={CALC_SECOND_ORDER}）...")
     X_cont = saltelli.sample(problem, sobol_base_n, calc_second_order=CALC_SECOND_ORDER)
@@ -410,11 +446,17 @@ def run_conditional_sobol(output_idx: int = 0,
 # nBl 离散影响
 # =============================================================================
 def analyze_discrete_nBl_effect(csv_path: str,
+                                use_al_samples: bool,
+                                al_csv_path: str,
                                 model_path: str,
                                 scaler_x_path: str,
                                 scaler_y_path: str,
                                 output_tag: str):
-    df = load_and_clean_data(csv_path)
+    df = load_analysis_data(
+        csv_path=csv_path,
+        use_al_samples=use_al_samples,
+        al_csv_path=al_csv_path
+    )
     X_data = df[VAR_NAMES].values.astype(float)
 
     model, scaler_X, scaler_Y = load_surrogate_and_scalers(model_path, scaler_x_path, scaler_y_path)
@@ -537,6 +579,8 @@ def plot_sobol_comparison(compare_df: pd.DataFrame,
 
 
 def run_full_sobol_suite(csv_path: str,
+                         use_al_samples: bool,
+                         al_csv_path: str,
                          model_path: str,
                          scaler_x_path: str,
                          scaler_y_path: str,
@@ -548,6 +592,8 @@ def run_full_sobol_suite(csv_path: str,
         output_name="效率",
         fixed_nBl=fixed_nBl,
         csv_path=csv_path,
+        use_al_samples=use_al_samples,
+        al_csv_path=al_csv_path,
         model_path=model_path,
         scaler_x_path=scaler_x_path,
         scaler_y_path=scaler_y_path,
@@ -560,6 +606,8 @@ def run_full_sobol_suite(csv_path: str,
         output_name="压比",
         fixed_nBl=fixed_nBl,
         csv_path=csv_path,
+        use_al_samples=use_al_samples,
+        al_csv_path=al_csv_path,
         model_path=model_path,
         scaler_x_path=scaler_x_path,
         scaler_y_path=scaler_y_path,
@@ -576,6 +624,8 @@ def run_full_sobol_suite(csv_path: str,
 
     analyze_discrete_nBl_effect(
         csv_path=csv_path,
+        use_al_samples=use_al_samples,
+        al_csv_path=al_csv_path,
         model_path=model_path,
         scaler_x_path=scaler_x_path,
         scaler_y_path=scaler_y_path,
@@ -587,6 +637,8 @@ def run_full_sobol_suite(csv_path: str,
 def run_compare_mode(args):
     before_results = run_full_sobol_suite(
         csv_path=args.before_csv,
+        use_al_samples=args.before_use_al_samples,
+        al_csv_path=args.before_al_csv,
         model_path=args.before_model,
         scaler_x_path=args.before_scaler_x,
         scaler_y_path=args.before_scaler_y,
@@ -596,6 +648,8 @@ def run_compare_mode(args):
     )
     after_results = run_full_sobol_suite(
         csv_path=args.after_csv,
+        use_al_samples=args.after_use_al_samples,
+        al_csv_path=args.after_al_csv,
         model_path=args.after_model,
         scaler_x_path=args.after_scaler_x,
         scaler_y_path=args.after_scaler_y,
@@ -634,6 +688,8 @@ if __name__ == "__main__":
     if args.mode == "single":
         run_full_sobol_suite(
             csv_path=args.csv,
+            use_al_samples=args.use_al_samples,
+            al_csv_path=args.al_csv,
             model_path=args.model,
             scaler_x_path=args.scaler_x,
             scaler_y_path=args.scaler_y,

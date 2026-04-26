@@ -35,22 +35,22 @@ def clean_old_results(base_dir, filename="CFX_Results.txt"):
 
 CREATE_NO_WINDOW = 0x08000000 if os.name == 'nt' else 0
 
-# =====================================================================
-# 1. 定义物理边界
-# =====================================================================
+# =============================================================================
+# 1. 定义设计空间与样本阈值
+# =============================================================================
 num_samples = 300
 input_dim = 14
-MIN_VALID    = 0.1   # g/s，低于此值：CFD 数值发散，纯噪声
-MIN_NORMAL   = 3.6   # g/s，低于此值但高于 MIN_VALID：边界珍贵数据
-# 高于 MIN_NORMAL：正常工况数据
+MIN_VALID = 0.1   # g/s，低于该值视为数值发散噪声
+MIN_NORMAL = 3.6  # g/s，低于该值视为边界样本
+# 高于 MIN_NORMAL 视为正常工况数据
 
-# 定义变量名称和物理边界
+# 加载设计变量名称及上下界
 variable_specs = load_variable_specs()
 var_names = variable_names(variable_specs)
 L_BOUNDS = lower_bounds(variable_specs)
 U_BOUNDS = upper_bounds(variable_specs)
 
-# 初始化 LHS 采样器并生成 [0, 1) 范围内的样本
+# 初始化 LHS 采样器并生成样本
 sampler = qmc.LatinHypercube(d=input_dim, seed=42)
 sample_norm = sampler.random(n=num_samples)
 sample_real = qmc.scale(sample_norm, L_BOUNDS, U_BOUNDS)
