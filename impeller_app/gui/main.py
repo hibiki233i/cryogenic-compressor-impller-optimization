@@ -14,6 +14,7 @@ try:
     from PySide6.QtCore import QObject, Signal, Qt
     from PySide6.QtWidgets import (
         QApplication,
+        QCheckBox,
         QComboBox,
         QDoubleSpinBox,
         QFileDialog,
@@ -99,6 +100,7 @@ TEXTS = {
         "sobol_group": "Sobol Sensitivity Analysis",
         "sobol_fixed_nbl": "Fixed nBl",
         "sobol_base_n": "Base Samples (N)",
+        "sobol_use_al_samples": "Include active-learning samples",
         "sobol_tag": "Output Tag",
         "run_sobol": "Run Sobol Analysis",
         "task_failed": "Task Failed",
@@ -164,6 +166,7 @@ TEXTS = {
         "sobol_group": "Sobol 灵敏度分析",
         "sobol_fixed_nbl": "固定叶片数 (nBl)",
         "sobol_base_n": "基础样本数 (N)",
+        "sobol_use_al_samples": "纳入后续主动学习样本",
         "sobol_tag": "输出标签",
         "run_sobol": "运行 Sobol 分析",
         "task_failed": "任务失败",
@@ -468,9 +471,12 @@ class MainWindow(QMainWindow):
         self.sobol_base_n.setRange(128, 100000)
         self.sobol_base_n.setSingleStep(128)
         self.sobol_base_n.setValue(self.config.runtime.sobol_base_n)
+        self.sobol_use_al_samples = QCheckBox()
+        self.sobol_use_al_samples.setChecked(self.config.runtime.sobol_use_al_samples)
         self.sobol_tag = QLineEdit(self.config.runtime.sobol_tag)
         self._add_form_row(form, "sobol_fixed_nbl", self.sobol_fixed_nbl)
         self._add_form_row(form, "sobol_base_n", self.sobol_base_n)
+        self._add_form_row(form, "sobol_use_al_samples", self.sobol_use_al_samples)
         self._add_form_row(form, "sobol_tag", self.sobol_tag)
         layout.addWidget(self.sobol_group)
 
@@ -611,6 +617,7 @@ class MainWindow(QMainWindow):
             pareto_geom_safe_threshold=self.geom_safe.value(),
             sobol_fixed_nbl=self.sobol_fixed_nbl.value(),
             sobol_base_n=self.sobol_base_n.value(),
+            sobol_use_al_samples=self.sobol_use_al_samples.isChecked(),
             sobol_tag=self.sobol_tag.text().strip(),
         )
         return AppConfig(solver=solver, workspace=workspace, runtime=runtime)

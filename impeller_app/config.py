@@ -81,6 +81,7 @@ class RuntimeSettings:
     pareto_geom_safe_threshold: float = 0.45
     sobol_fixed_nbl: int = 10
     sobol_base_n: int = 2048
+    sobol_use_al_samples: bool = False
     sobol_tag: str = "default"
 
 

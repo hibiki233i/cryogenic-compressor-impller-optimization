@@ -97,8 +97,8 @@ class SobolService:
 
     def _run_single_core(self, csv_path: Path, model_path: Path, sx_path: Path, sy_path: Path, progress_callback=None) -> TaskResult:
         model, scaler_x, scaler_y = self.load_model_and_scalers(model_path, sx_path, sy_path)
-        
-        df = pd.read_csv(csv_path)
+
+        df = self._load_analysis_data(progress_callback, csv_path)
         fixed_nbl = self.config.runtime.sobol_fixed_nbl
         base_n = self.config.runtime.sobol_base_n
         tag = self.config.runtime.sobol_tag
@@ -167,3 +167,41 @@ class SobolService:
             metrics={"sobol_results": results},
             artifacts={"csv_files": [str(self.config.workspace.project_root / f"{tag}_sobol_{n}_nBl{fixed_nbl}.csv") for n in ['Efficiency', 'PressureRatio']]}
         )
+
+    def _load_analysis_data(self, progress_callback, csv_path: Path) -> pd.DataFrame:
+        if not csv_path.exists():
+            raise FileNotFoundError(f"Training CSV not found at {csv_path}")
+
+        df_main = pd.read_csv(csv_path)
+        required_cols = self.var_names + self.output_names + ["is_boundary"]
+        for col in required_cols:
+            if col not in df_main.columns:
+                raise ValueError(f"CSV missing required column: {col}")
+        df_main = df_main[required_cols].copy()
+        df_main["nBl"] = np.clip(np.round(df_main["nBl"]), 9, 12).astype(int)
+        df_main = df_main.drop_duplicates(subset=self.var_names, keep="first").reset_index(drop=True)
+
+        if not self.config.runtime.sobol_use_al_samples:
+            _emit(progress_callback, f"Using base Sobol dataset only: {csv_path.name} ({len(df_main)} samples)")
+            return df_main
+
+        pool_csv = self.config.workspace.pool_checkpoint_csv
+        if not pool_csv.exists():
+            raise FileNotFoundError(f"Active-learning pool CSV not found at {pool_csv}")
+
+        df_al = pd.read_csv(pool_csv)
+        for col in required_cols:
+            if col not in df_al.columns:
+                raise ValueError(f"AL pool CSV missing required column: {col}")
+        df_al = df_al[required_cols].copy()
+        df_al["nBl"] = np.clip(np.round(df_al["nBl"]), 9, 12).astype(int)
+        df_al = df_al.drop_duplicates(subset=self.var_names, keep="first").reset_index(drop=True)
+
+        df_merged = pd.concat([df_main, df_al], ignore_index=True)
+        df_merged = df_merged.drop_duplicates(subset=self.var_names, keep="first").reset_index(drop=True)
+        _emit(
+            progress_callback,
+            f"Using base + active-learning Sobol dataset: {csv_path.name} + {pool_csv.name} "
+            f"(base={len(df_main)}, al={len(df_al)}, merged={len(df_merged)})"
+        )
+        return df_merged
