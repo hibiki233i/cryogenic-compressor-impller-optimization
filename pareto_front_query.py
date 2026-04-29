@@ -331,9 +331,6 @@ def compute_engineering_front_scores(front: pd.DataFrame, full_df: pd.DataFrame,
     x_pool = full_df[VAR_NAMES].to_numpy(dtype=float)
     y = ranked[["Efficiency", "totalpressureratio", "MassFlow"]].to_numpy(dtype=float)
 
-    geom_v = geometry_rule_violations(x_front)
-    geom_margin = -np.max(geom_v, axis=1)
-    geom_margin = np.maximum(0.0, geom_margin)
     geom_safe_prob = predict_geometry_safe_prob(geom_warn_clf, x_front)
 
     all_dist = normalized_distance_to_dataset(x_front, x_pool)
@@ -349,7 +346,6 @@ def compute_engineering_front_scores(front: pd.DataFrame, full_df: pd.DataFrame,
     pr_margin = np.minimum(pr_upper_margin, pr_lower_margin)
 
     ranges = {
-        "geom_margin": max(float(np.max(geom_margin)), 1e-8),
         "nearest_success_dist": max(float(np.max(nearest_success_dist)), 1e-8),
         "knee_score": max(float(np.max(knee_score)), 1e-8),
         "stability_penalty": max(float(np.max(stability_penalty)), 1e-8),
@@ -360,17 +356,15 @@ def compute_engineering_front_scores(front: pd.DataFrame, full_df: pd.DataFrame,
     }
 
     engineering_score = (
-        0.26 * (geom_margin / ranges["geom_margin"])
-        + 0.18 * (geom_safe_prob / ranges["geom_safe_prob"])
-        + 0.16 * (flow_margin / ranges["flow_margin"])
-        + 0.12 * (eff_margin / ranges["eff_margin"])
-        + 0.10 * (pr_margin / ranges["pr_margin"])
+        0.28 * (eff_margin / ranges["eff_margin"])
+        + 0.26 * (flow_margin / ranges["flow_margin"])
         + 0.20 * (knee_score / ranges["knee_score"])
+        + 0.16 * (geom_safe_prob / ranges["geom_safe_prob"])
+        + 0.10 * (pr_margin / ranges["pr_margin"])
         - 0.10 * (nearest_success_dist / ranges["nearest_success_dist"])
         - 0.06 * (stability_penalty / ranges["stability_penalty"])
     )
 
-    ranked["geom_margin"] = geom_margin
     ranked["pred_geom_safe_prob"] = geom_safe_prob
     ranked["nearest_success_dist"] = nearest_success_dist
     ranked["knee_score"] = knee_score

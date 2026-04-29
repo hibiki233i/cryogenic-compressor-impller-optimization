@@ -186,7 +186,19 @@ def row_summary(row: pd.Series) -> dict:
         "engineering_score": float(row["engineering_score"]) if "engineering_score" in row.index and pd.notna(row["engineering_score"]) else None,
         "geometry": {name: (int(round(float(row[name]))) if name == "nBl" else float(row[name])) for name in VAR_NAMES},
     }
-    for col in ["Efficiency", "totalpressureratio", "Power", "MassFlow", "geom_margin", "knee_score", "stability_penalty"]:
+    for col in [
+        "Efficiency",
+        "totalpressureratio",
+        "Power",
+        "MassFlow",
+        "pred_geom_safe_prob",
+        "nearest_success_dist",
+        "knee_score",
+        "stability_penalty",
+        "flow_margin",
+        "eff_margin",
+        "pr_margin",
+    ]:
         if col in row.index and pd.notna(row[col]):
             summary[col] = float(row[col])
     return summary
