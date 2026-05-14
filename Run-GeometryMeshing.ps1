@@ -161,6 +161,78 @@ function Get-GeometrySummary {
     return $summary
 }
 
+function Set-ChildText {
+    param(
+        [xml]$Xml,
+        [System.Xml.XmlElement]$Parent,
+        [string]$Name,
+        [string]$Value,
+        [hashtable]$Attributes = @{}
+    )
+
+    $node = $Parent.SelectSingleNode($Name)
+    if ($null -eq $node) {
+        $node = $Xml.CreateElement($Name)
+        [void]$Parent.AppendChild($node)
+    }
+
+    foreach ($key in $Attributes.Keys) {
+        $node.SetAttribute($key, [string]$Attributes[$key])
+    }
+    $node.InnerText = $Value
+    return $node
+}
+
+function Ensure-TurboGridExportAction {
+    param(
+        [xml]$Xml,
+        [string]$ExportDir
+    )
+
+    $project = $Xml.SelectSingleNode("//CFturboBatchProject")
+    if ($null -eq $project) {
+        throw "CFturbo batch template missing CFturboBatchProject node."
+    }
+
+    $project.SetAttribute("InputFile", ".\input_model.cft")
+
+    $exportAction = $project.SelectSingleNode("BatchAction[@Name='Export']")
+    if ($null -eq $exportAction) {
+        $exportAction = $Xml.CreateElement("BatchAction")
+        $exportAction.SetAttribute("Type", "Object")
+        $exportAction.SetAttribute("Name", "Export")
+
+        $firstAction = $project.SelectSingleNode("BatchAction")
+        if ($null -ne $firstAction) {
+            [void]$project.InsertBefore($exportAction, $firstAction)
+        } else {
+            [void]$project.AppendChild($exportAction)
+        }
+    }
+
+    [void](Set-ChildText -Xml $Xml -Parent $exportAction -Name "WorkingDir" -Value $ExportDir)
+    [void](Set-ChildText -Xml $Xml -Parent $exportAction -Name "BaseFileName" -Value "Impeller")
+    [void](Set-ChildText -Xml $Xml -Parent $exportAction -Name "ExportInterface" -Value "TurboGrid" -Attributes @{ Type = "Enum" })
+
+    $components = $exportAction.SelectSingleNode("ExportComponents")
+    if ($null -eq $components) {
+        $components = $Xml.CreateElement("ExportComponents")
+        [void]$exportAction.AppendChild($components)
+    } else {
+        $components.RemoveAll()
+    }
+    $components.SetAttribute("Count", "1")
+    $components.SetAttribute("Type", "Array1")
+    $components.SetAttribute("Desc", "Components to be exported")
+
+    $value = $Xml.CreateElement("Value")
+    $value.SetAttribute("Type", "Integer")
+    $value.SetAttribute("Caption", "Impeller")
+    $value.SetAttribute("Index", "0")
+    $value.InnerText = "3"
+    [void]$components.AppendChild($value)
+}
+
 # ==============================================================================
 # 0. 环境与路径准备
 # ==============================================================================                                                                                                                                                                                                                            
@@ -174,6 +246,7 @@ $TGS_Template  = $TurboGridTemplate
 
 # 当前计算步的工作文件
 $Current_CFT   = Join-Path $WorkingDir "run_cfturbo.cft-batch"
+$Input_CFT_Model = Join-Path $WorkingDir "input_model.cft"
 $Current_TGS   = Join-Path $WorkingDir "run_turbogrid.tst"
 $Export_Hub     = Join-Path $WorkingDir "Impeller_hub.curve"
 $Export_Shroud  = Join-Path $WorkingDir "Impeller_shroud.curve"
@@ -181,7 +254,7 @@ $Export_Profile = Join-Path $WorkingDir "Impeller_profile.curve"
 $Export_Mesh    = Join-Path $WorkingDir "Impeller_Mesh.gtm"
 $Geometry_Summary = Join-Path $WorkingDir "geometry_summary.json"
 # 在生成网格之前，把原始 cft 复制到当前计算目录
-Copy-Item -Path $BaseCft -Destination $WorkingDir -Force
+Copy-Item -Path $BaseCft -Destination $Input_CFT_Model -Force
 
 
 Write-Host ">>> 开始执行几何与网格生成流水线..." -ForegroundColor Cyan
@@ -242,6 +315,7 @@ Write-Host "--> [1/3] 解析并修改 CFturbo XML 参数..."
     $xml.SelectSingleNode("//nRot").'#text' = $nRot_Hz.ToString("F6")
 
     # 最终保存为新的工作文件
+    Ensure-TurboGridExportAction -Xml $xml -ExportDir $WorkingDir
     $xml.Save($Current_CFT)
 
     # ==============================================================================
@@ -279,7 +353,8 @@ if ($cftProcess.ExitCode -eq 2) {
 if (-not (Test-Path $Export_Hub) -or 
     -not (Test-Path $Export_Shroud) -or 
     -not (Test-Path $Export_Profile)) {
-    Write-Warning "CFturbo 未生成 curve 文件，真正失败。"
+    Write-Warning "CFturbo 未生成 TurboGrid curve 文件。请检查 batch Export 动作、CFturbo 许可证/导出接口，以及当前工作目录写入权限。"
+    Write-Warning "期望文件: $Export_Hub | $Export_Shroud | $Export_Profile"
     exit 1
 }
 Write-Host "CFturbo curve 文件验证通过，继续网格划分..."

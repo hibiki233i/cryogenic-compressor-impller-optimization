@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import os
 import sys
 import threading
 import traceback
 from pathlib import Path
+
+os.environ.setdefault("QT_LOGGING_RULES", "qt.text.font.db=false")
 
 from design_variables import load_variable_specs, save_variable_specs
 from ..config import AppConfig, RuntimeSettings, SolverPaths, WorkspacePaths
