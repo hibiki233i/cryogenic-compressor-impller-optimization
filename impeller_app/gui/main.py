@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import threading
 import traceback
 from pathlib import Path
 
@@ -60,11 +61,14 @@ TEXTS = {
         "project_root": "Project Root",
         "powershell": "PowerShell",
         "geometry_script": "Geometry Script",
+        "cfturbo_exe": "CFturbo Executable",
+        "turbogrid_exe": "TurboGrid Executable",
         "cfx_bin_dir": "CFX Bin Dir",
         "template_cfx": "BaseModel.cfx",
         "template_cse": "Extract_Results.cse",
         "base_cft": "Base .cft",
         "batch_template": "CFturbo Batch Template",
+        "turbogrid_template": "TurboGrid State Template",
         "training_csv": "Training CSV",
         "cfx_cores": "CFX Cores",
         "validate_environment": "Validate Environment",
@@ -119,6 +123,7 @@ TEXTS = {
         "sobol_use_al_samples": "Include active-learning samples",
         "sobol_tag": "Output Tag",
         "run_sobol": "Run Sobol Analysis",
+        "stop_task": "Stop Current Task",
         "task_failed": "Task Failed",
         "unhandled_error": "Unhandled Error",
         "invalid_ranges": "Invalid variable ranges",
@@ -142,11 +147,14 @@ TEXTS = {
         "project_root": "项目根目录",
         "powershell": "PowerShell",
         "geometry_script": "几何脚本",
+        "cfturbo_exe": "CFturbo 可执行文件",
+        "turbogrid_exe": "TurboGrid 可执行文件",
         "cfx_bin_dir": "CFX 可执行目录",
         "template_cfx": "BaseModel.cfx",
         "template_cse": "Extract_Results.cse",
         "base_cft": "基础 .cft",
         "batch_template": "CFturbo 批处理模板",
+        "turbogrid_template": "TurboGrid 状态模板",
         "training_csv": "训练数据 CSV",
         "cfx_cores": "CFX 核心数",
         "validate_environment": "校验环境",
@@ -201,6 +209,7 @@ TEXTS = {
         "sobol_use_al_samples": "纳入后续主动学习样本",
         "sobol_tag": "输出标签",
         "run_sobol": "运行 Sobol 分析",
+        "stop_task": "停止当前任务",
         "task_failed": "任务失败",
         "unhandled_error": "未处理异常",
         "invalid_ranges": "变量范围无效",
@@ -220,17 +229,22 @@ class Worker(QObject):
     def __init__(self, fn):
         super().__init__()
         self._fn = fn
+        self.cancel_event = threading.Event()
+        self.done = False
 
     def start(self):
-        import threading
-
         threading.Thread(target=self._run, daemon=True).start()
+
+    def stop(self):
+        self.cancel_event.set()
 
     def _run(self):
         try:
-            result = self._fn(self.update.emit)
+            result = self._fn(self.update.emit, self.cancel_event)
+            self.done = True
             self.finished.emit(result)
         except Exception:
+            self.done = True
             self.failed.emit(traceback.format_exc())
 
 
@@ -303,6 +317,14 @@ class MainWindow(QMainWindow):
         self.log.setMaximumBlockCount(5000)
         layout.addWidget(self.log, 1)
 
+        task_row = QHBoxLayout()
+        self.stop_button = QPushButton()
+        self.stop_button.clicked.connect(self._stop_current_tasks)
+        self.stop_button.setEnabled(False)
+        task_row.addStretch(1)
+        task_row.addWidget(self.stop_button)
+        layout.addLayout(task_row)
+
         self._build_environment_tab()
         self._build_doe_tab()
         self._build_active_learning_tab()
@@ -344,11 +366,14 @@ class MainWindow(QMainWindow):
         self.project_root = self._register_field(DirectoryField(str(self.config.workspace.project_root)))
         self.powershell = self._register_field(PathField(str(self.config.solver.powershell_exe)))
         self.geometry_script = self._register_field(PathField(str(self.config.solver.geometry_script_path)))
+        self.cfturbo_exe = self._register_field(PathField(str(self.config.solver.cfturbo_exe)))
+        self.turbogrid_exe = self._register_field(PathField(str(self.config.solver.turbogrid_exe)))
         self.cfx_bin_dir = self._register_field(DirectoryField(str(self.config.solver.cfx_bin_dir)))
         self.template_cfx = self._register_field(PathField(str(self.config.solver.template_cfx)))
         self.template_cse = self._register_field(PathField(str(self.config.solver.template_cse)))
         self.base_cft = self._register_field(PathField(str(self.config.solver.base_cft)))
         self.batch_template = self._register_field(PathField(str(self.config.solver.cft_batch_template)))
+        self.turbogrid_template = self._register_field(PathField(str(self.config.solver.turbogrid_template)))
         self.training_csv = self._register_field(PathField(str(self.config.workspace.training_csv)))
         self.cfx_cores = QSpinBox()
         self.cfx_cores.setRange(1, 128)
@@ -358,11 +383,14 @@ class MainWindow(QMainWindow):
         self._add_form_row(solver_form, "project_root", self.project_root)
         self._add_form_row(solver_form, "powershell", self.powershell)
         self._add_form_row(solver_form, "geometry_script", self.geometry_script)
+        self._add_form_row(solver_form, "cfturbo_exe", self.cfturbo_exe)
+        self._add_form_row(solver_form, "turbogrid_exe", self.turbogrid_exe)
         self._add_form_row(solver_form, "cfx_bin_dir", self.cfx_bin_dir)
         self._add_form_row(solver_form, "template_cfx", self.template_cfx)
         self._add_form_row(solver_form, "template_cse", self.template_cse)
         self._add_form_row(solver_form, "base_cft", self.base_cft)
         self._add_form_row(solver_form, "batch_template", self.batch_template)
+        self._add_form_row(solver_form, "turbogrid_template", self.turbogrid_template)
         self._add_form_row(solver_form, "training_csv", self.training_csv)
         self._add_form_row(solver_form, "cfx_cores", self.cfx_cores)
         wrapper.addWidget(self.environment_group)
@@ -622,6 +650,7 @@ class MainWindow(QMainWindow):
         self.query_button.setText(self.tr("run_query"))
         self.run_sobol_button.setText(self.tr("run_sobol"))
         self.export_button.setText(self.tr("export_cases"))
+        self.stop_button.setText(self.tr("stop_task"))
 
         for key, index in self._tab_indexes.items():
             self.tabs.setTabText(index, self.tr(key))
@@ -681,11 +710,14 @@ class MainWindow(QMainWindow):
         solver = SolverPaths(
             powershell_exe=Path(self.powershell.text()),
             geometry_script_path=Path(self.geometry_script.text()),
+            cfturbo_exe=Path(self.cfturbo_exe.text()),
+            turbogrid_exe=Path(self.turbogrid_exe.text()),
             cfx_bin_dir=Path(self.cfx_bin_dir.text()),
             template_cfx=Path(self.template_cfx.text()),
             template_cse=Path(self.template_cse.text()),
             base_cft=Path(self.base_cft.text()),
             cft_batch_template=Path(self.batch_template.text()),
+            turbogrid_template=Path(self.turbogrid_template.text()),
         )
         runtime = RuntimeSettings(
             cfx_cores=self.cfx_cores.value(),
@@ -736,7 +768,19 @@ class MainWindow(QMainWindow):
         worker.finished.connect(self._handle_result)
         worker.failed.connect(self._handle_failure)
         self._workers.append(worker)
+        self.stop_button.setEnabled(True)
         worker.start()
+
+    def _cleanup_workers(self):
+        self._workers = [worker for worker in self._workers if not worker.done]
+        self.stop_button.setEnabled(bool(self._workers))
+
+    def _stop_current_tasks(self):
+        for worker in self._workers:
+            if not worker.done:
+                worker.stop()
+        self.log.appendPlainText("[running] Stop requested; waiting for external processes to terminate...")
+        self.stop_button.setEnabled(False)
 
     def _handle_update(self, payload):
         if isinstance(payload, TaskUpdate):
@@ -748,6 +792,7 @@ class MainWindow(QMainWindow):
         self.log.appendPlainText(line)
 
     def _handle_result(self, result):
+        self._cleanup_workers()
         if isinstance(result, TaskResult):
             self.log.appendPlainText(f"[{result.status}] {result.message}")
             if result.metrics:
@@ -760,6 +805,7 @@ class MainWindow(QMainWindow):
             self.log.appendPlainText(str(result))
 
     def _handle_failure(self, text):
+        self._cleanup_workers()
         self.log.appendPlainText(text)
         QMessageBox.critical(self, self.tr("unhandled_error"), text)
 
@@ -784,7 +830,7 @@ class MainWindow(QMainWindow):
         config = self._with_config(lambda cfg: cfg)
         if config is None:
             return
-        self._run_worker(lambda callback: RunnerAPI(config).run_doe_batch(progress_callback=callback))
+        self._run_worker(lambda callback, cancel_event: RunnerAPI(config).run_doe_batch(progress_callback=callback, cancel_event=cancel_event))
 
     def _resume_checkpoint(self):
         result = self._with_config(lambda config: ActiveLearningService(config).resume_from_checkpoint())
@@ -795,20 +841,20 @@ class MainWindow(QMainWindow):
         config = self._with_config(lambda cfg: cfg)
         if config is None:
             return
-        self._run_worker(lambda callback: ActiveLearningService(config).train_surrogate(progress_callback=callback))
+        self._run_worker(lambda callback, cancel_event: ActiveLearningService(config).train_surrogate(progress_callback=callback))
 
     def _run_nsga2_only(self):
         config = self._with_config(lambda cfg: cfg)
         if config is None:
             return
-        self._run_worker(lambda callback: ActiveLearningService(config).run_nsga2_only(progress_callback=callback))
+        self._run_worker(lambda callback, cancel_event: ActiveLearningService(config).run_nsga2_only(progress_callback=callback))
 
     def _run_active_learning(self):
         config = self._with_config(lambda cfg: cfg)
         if config is None:
             return
         self._run_worker(
-            lambda callback: ActiveLearningService(config).run_active_learning_iteration(
+            lambda callback, cancel_event: ActiveLearningService(config).run_active_learning_iteration(
                 config.runtime.active_learning_additional_iters,
                 progress_callback=callback,
             )
@@ -819,7 +865,7 @@ class MainWindow(QMainWindow):
         if config is None:
             return
         self._run_worker(
-            lambda callback: (
+            lambda callback, cancel_event: (
                 callback("Computing Pareto front..."),
                 ParetoService(config).compute_pareto_front(),
             )[1]
@@ -830,7 +876,7 @@ class MainWindow(QMainWindow):
         if config is None:
             return
 
-        def run(callback):
+        def run(callback, cancel_event):
             selection = {}
             if self.front_index.value() >= 0:
                 selection["front_index"] = self.front_index.value()
@@ -848,14 +894,14 @@ class MainWindow(QMainWindow):
         config = self._with_config(lambda cfg: cfg)
         if config is None:
             return
-        self._run_worker(lambda callback: SobolService(config).run_analysis(progress_callback=callback))
+        self._run_worker(lambda callback, cancel_event: SobolService(config).run_analysis(progress_callback=callback))
 
     def _export_cases(self):
         config = self._with_config(lambda cfg: cfg)
         if config is None:
             return
         self._run_worker(
-            lambda callback: ParetoService(config).export_cases(
+            lambda callback, cancel_event: ParetoService(config).export_cases(
                 top_n=self.export_top_n.value(),
                 force=True,
                 base_cft=self.base_cft.text() or None,
@@ -865,6 +911,9 @@ class MainWindow(QMainWindow):
         )
 
     def closeEvent(self, event):
+        for worker in self._workers:
+            if not worker.done:
+                worker.stop()
         try:
             self._persist_current_config()
         except Exception:

@@ -11,6 +11,7 @@ import pandas as pd
 from impeller_app.config import AppConfig, RuntimeSettings, SolverPaths, WorkspacePaths
 from impeller_app.core.active_learning import ActiveLearningService
 from impeller_app.core.pareto import ParetoService
+from impeller_app.models import TaskResult
 from impeller_app.runner.external import RunnerAPI
 import NN_NSGA2_ActiveLearning_refactored as legacy_al
 
@@ -251,28 +252,28 @@ class ImpellerAppTests(unittest.TestCase):
             self.assertTrue((root / "pareto_front_points.csv").exists())
 
     @mock.patch("impeller_app.runner.external.run_cfx_pipeline")
-    @mock.patch("impeller_app.runner.external.subprocess.run")
-    def test_run_doe_sample_uses_mocked_subprocess_and_cfx(self, mock_run, mock_cfx):
+    @mock.patch.object(RunnerAPI, "run_geometry_generation")
+    def test_run_doe_sample_uses_mocked_subprocess_and_cfx(self, mock_geometry, mock_cfx):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             config = self.make_config(root)
-            mock_run.return_value = mock.Mock(returncode=0, stdout="", stderr="")
+            mock_geometry.return_value = TaskResult(status="succeeded", message="geometry ok")
             mock_cfx.return_value = (True, {"Efficiency": 0.7, "PressureRatio": 1.8, "Power": 100.0, "MassFlow": 4.0, "totalpressureratio": 2.0}, "Success")
             sample = RunnerAPI(config).generate_lhs_samples(1)[0]
             result = RunnerAPI(config).run_doe_sample(0, sample)
             self.assertEqual(result.status, "succeeded")
-            mock_run.assert_called_once()
+            mock_geometry.assert_called_once()
             mock_cfx.assert_called_once()
             stored = pd.read_csv(root / "Compressor_Training_Data.csv")
             self.assertEqual(len(stored), 1)
             self.assertAlmostEqual(float(stored.iloc[0]["Efficiency"]), 0.7)
 
-    @mock.patch("impeller_app.runner.external.subprocess.run")
-    def test_export_cases_generates_mesh_files(self, mock_run):
+    @mock.patch.object(RunnerAPI, "run_geometry_generation")
+    def test_export_cases_generates_mesh_files(self, mock_geometry):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             config = self.make_config(root)
-            mock_run.return_value = mock.Mock(returncode=0, stdout="", stderr="")
+            mock_geometry.return_value = TaskResult(status="succeeded", message="geometry ok")
 
             front = pd.DataFrame(
                 [
@@ -324,7 +325,7 @@ class ImpellerAppTests(unittest.TestCase):
 
             self.assertEqual(result.status, "succeeded")
             self.assertEqual(result.metrics["case_count"], 1)
-            mock_run.assert_called_once()
+            mock_geometry.assert_called_once()
             case_dir = root / "pareto_cft_cases" / "ParetoCase_01_F03"
             self.assertTrue((case_dir / "geometry_parameters.csv").exists())
             report = json.loads((root / "pareto_cft_cases" / "export_report.json").read_text(encoding="utf-8"))

@@ -14,6 +14,43 @@ def _env_or_default(name, default):
     return value if value else default
 
 
+def _is_cancelled(cancel_event=None):
+    return bool(cancel_event is not None and cancel_event.is_set())
+
+
+def _kill_process_tree(pid: int):
+    killed = []
+    try:
+        root = psutil.Process(pid)
+        targets = root.children(recursive=True) + [root]
+    except psutil.NoSuchProcess:
+        return killed
+    for proc in targets:
+        try:
+            proc.kill()
+            killed.append(proc.pid)
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+    return killed
+
+
+def _run_cancellable_process(cmd, cwd, cancel_event=None, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL):
+    proc = subprocess.Popen(
+        cmd,
+        cwd=cwd,
+        stdout=stdout,
+        stderr=stderr,
+        text=True,
+        creationflags=CREATE_NO_WINDOW,
+    )
+    while proc.poll() is None:
+        if _is_cancelled(cancel_event):
+            _kill_process_tree(proc.pid)
+            return -999
+        time.sleep(0.5)
+    return int(proc.returncode or 0)
+
+
 def run_cfx_pipeline(
     working_dir,
     run_id,
@@ -23,6 +60,7 @@ def run_cfx_pipeline(
     cfx_bin_dir=None,
     template_cfx=None,
     template_cse=None,
+    cancel_event=None,
 ):
     """
     完整的 CFX 自动化流水线：网格替换 -> 求解 -> 结果提取
@@ -115,11 +153,15 @@ write def file
         with open(pre_script, "w", encoding="utf-8") as f:
             f.write(pre_content.strip())
             
-        try:
-            subprocess.run([cfx5pre_exe, "-batch", pre_script], 
-                           cwd=working_dir, check=True, capture_output=True, text=True) 
-        except Exception as e:
-            return False, None, f"CFX-Pre 失败，无法生成 .def 文件: {e}"
+        pre_ret = _run_cancellable_process(
+            [cfx5pre_exe, "-batch", pre_script],
+            cwd=working_dir,
+            cancel_event=cancel_event,
+        )
+        if pre_ret == -999:
+            return False, None, "canceled"
+        if pre_ret != 0:
+            return False, None, f"CFX-Pre 失败，无法生成 .def 文件。Exit Code: {pre_ret}"
 
         if not os.path.exists(def_file):
             return False, None, "CFX-Pre 运行结束但未找到 .def 文件"
@@ -272,6 +314,11 @@ write def file
                                 pass
                     return False, None, "进出口持续100%堵塞，提前终止"
 
+                if _is_cancelled(cancel_event):
+                    print(f"[{run_id}] 收到取消请求，正在终止 CFX 求解器...")
+                    kill_cfx_tree(solve_proc.pid, run_id)
+                    return False, None, "canceled"
+
                 if ret is not None:
                     break  # 求解器自然退出
 
@@ -307,10 +354,15 @@ write def file
         "-res", res_file
     ]
     
-    try:
-        subprocess.run(post_cmd, cwd=working_dir, check=True, capture_output=True, text=True,encoding='utf-8', errors='ignore') # 移除 timeout
-    except Exception as e:
-        return False, None, f"CFX-Post 后处理失败: {e}"
+    post_ret = _run_cancellable_process(
+        post_cmd,
+        cwd=working_dir,
+        cancel_event=cancel_event,
+    )
+    if post_ret == -999:
+        return False, None, "canceled"
+    if post_ret != 0:
+        return False, None, f"CFX-Post 后处理失败。Exit Code: {post_ret}"
 
     # ==========================================
     # 4. 读取结果与清理空间

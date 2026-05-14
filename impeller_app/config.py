@@ -11,11 +11,14 @@ from pathlib import Path
 class SolverPaths:
     powershell_exe: Path = Path(r"C:\Program Files\PowerShell\7\pwsh.exe")
     geometry_script_path: Path = Path("Run-GeometryMeshing.ps1")
+    cfturbo_exe: Path = Path(r"C:\Program Files\CFturbo 2025.2.2\CFturbo.exe")
+    turbogrid_exe: Path = Path(r"D:\ANSYS Inc\v251\TurboGrid\bin\cfxtg.exe")
     cfx_bin_dir: Path = Path(r"D:\ANSYS Inc\v251\CFX\bin")
     template_cfx: Path = Path("Templates/BaseModel.cfx")
     template_cse: Path = Path("Templates/Extract_Results.cse")
     base_cft: Path = Path("Templates/0908-2.cft")
     cft_batch_template: Path = Path("Templates/BaseModel.cft-batch")
+    turbogrid_template: Path = Path("Templates/BaseMeshing.tst")
 
 
 @dataclass
@@ -114,11 +117,14 @@ class AppConfig:
             solver=SolverPaths(
                 powershell_exe=self.solver.powershell_exe,
                 geometry_script_path=_resolve(self.workspace.project_root, self.solver.geometry_script_path),
+                cfturbo_exe=self.solver.cfturbo_exe,
+                turbogrid_exe=self.solver.turbogrid_exe,
                 cfx_bin_dir=self.solver.cfx_bin_dir,
                 template_cfx=_resolve(self.workspace.project_root, self.solver.template_cfx),
                 template_cse=_resolve(self.workspace.project_root, self.solver.template_cse),
                 base_cft=_resolve(self.workspace.project_root, self.solver.base_cft),
                 cft_batch_template=_resolve(self.workspace.project_root, self.solver.cft_batch_template),
+                turbogrid_template=_resolve(self.workspace.project_root, self.solver.turbogrid_template),
             ),
             workspace=self.workspace.resolve_all(),
             runtime=self.runtime,

@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 import json
+import os
+import queue
 import subprocess
+import threading
+import time
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import psutil
 from scipy.stats import qmc
 
 from ..config import AppConfig
@@ -13,10 +18,29 @@ from ..models import TaskResult, TaskUpdate
 from cfx_runner import run_cfx_pipeline
 from design_variables import ensure_training_csv, load_variable_specs, lower_bounds, training_csv_columns, upper_bounds, variable_names
 
+CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
+
 
 def _emit(progress_callback, message: str, progress=None, metrics=None):
     if progress_callback:
         progress_callback(TaskUpdate(status="running", message=message, progress=progress, metrics=metrics or {}))
+
+
+def _is_cancelled(cancel_event=None) -> bool:
+    return bool(cancel_event is not None and cancel_event.is_set())
+
+
+def _kill_process_tree(pid: int) -> None:
+    try:
+        root = psutil.Process(pid)
+        targets = root.children(recursive=True) + [root]
+    except psutil.NoSuchProcess:
+        return
+    for proc in targets:
+        try:
+            proc.kill()
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
 
 
 class RunnerAPI:
@@ -34,10 +58,13 @@ class RunnerAPI:
         checks = {
             "powershell_exe": cfg.solver.powershell_exe,
             "geometry_script": cfg.solver.geometry_script_path,
+            "cfturbo_exe": cfg.solver.cfturbo_exe,
+            "turbogrid_exe": cfg.solver.turbogrid_exe,
             "template_cfx": cfg.solver.template_cfx,
             "template_cse": cfg.solver.template_cse,
             "base_cft": cfg.solver.base_cft,
             "cft_batch_template": cfg.solver.cft_batch_template,
+            "turbogrid_template": cfg.solver.turbogrid_template,
         }
         cfx_execs = [
             cfg.solver.cfx_bin_dir / "cfx5pre.exe",
@@ -193,6 +220,16 @@ class RunnerAPI:
             str(self.config.solver.geometry_script_path),
             "-WorkingDir",
             str(working_dir),
+            "-CFturboExe",
+            str(self.config.solver.cfturbo_exe),
+            "-TurboGridExe",
+            str(self.config.solver.turbogrid_exe),
+            "-CftBatchTemplate",
+            str(self.config.solver.cft_batch_template),
+            "-BaseCft",
+            str(self.config.solver.base_cft),
+            "-TurboGridTemplate",
+            str(self.config.solver.turbogrid_template),
         ]
         for name in self.variable_names:
             if name == "P_out":
@@ -202,7 +239,7 @@ class RunnerAPI:
         cmd.extend(["-mFlow", str(self.config.runtime.mass_flow), "-N_rpm", str(self.config.runtime.rpm), "-alpha0", str(self.config.runtime.alpha0)])
         return cmd
 
-    def run_cfx_case(self, working_dir: Path, run_id: str, p_out: float, n_blades: int) -> TaskResult:
+    def run_cfx_case(self, working_dir: Path, run_id: str, p_out: float, n_blades: int, cancel_event=None) -> TaskResult:
         success, payload, message = run_cfx_pipeline(
             str(working_dir),
             run_id,
@@ -212,32 +249,101 @@ class RunnerAPI:
             cfx_bin_dir=str(self.config.solver.cfx_bin_dir),
             template_cfx=str(self.config.solver.template_cfx),
             template_cse=str(self.config.solver.template_cse),
+            cancel_event=cancel_event,
         )
-        return TaskResult(status="succeeded" if success else "failed", message=message, metrics=payload or {}, artifacts={"working_dir": str(working_dir)})
+        status = "succeeded" if success else ("canceled" if message == "canceled" else "failed")
+        return TaskResult(status=status, message=message, metrics=payload or {}, artifacts={"working_dir": str(working_dir)})
 
-    def run_geometry_generation(self, working_dir: Path, sample: dict, run_id: str | None = None) -> TaskResult:
+    def _run_streamed_command(self, cmd: list[str], working_dir: Path, progress_callback=None, cancel_event=None) -> tuple[str, str, int]:
+        proc = subprocess.Popen(
+            cmd,
+            cwd=str(working_dir),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="ignore",
+            bufsize=1,
+            creationflags=CREATE_NO_WINDOW,
+        )
+        lines: list[str] = []
+        line_queue: queue.Queue[str | None] = queue.Queue()
+
+        def read_output():
+            try:
+                assert proc.stdout is not None
+                for line in proc.stdout:
+                    line_queue.put(line.rstrip())
+            finally:
+                line_queue.put(None)
+
+        reader = threading.Thread(target=read_output, daemon=True)
+        reader.start()
+        reader_done = False
+
+        while proc.poll() is None:
+            while True:
+                try:
+                    line = line_queue.get_nowait()
+                except queue.Empty:
+                    break
+                if line is None:
+                    reader_done = True
+                    continue
+                if line:
+                    lines.append(line)
+                    _emit(progress_callback, line)
+            if _is_cancelled(cancel_event):
+                _kill_process_tree(proc.pid)
+                reader.join(timeout=2)
+                return "\n".join(lines), "", -999
+            time.sleep(0.2)
+
+        reader.join(timeout=2)
+        while not reader_done:
+            try:
+                line = line_queue.get_nowait()
+            except queue.Empty:
+                break
+            if line is None:
+                reader_done = True
+            elif line:
+                lines.append(line)
+                _emit(progress_callback, line)
+        return "\n".join(lines), "", int(proc.returncode or 0)
+
+    def run_geometry_generation(self, working_dir: Path, sample: dict, run_id: str | None = None, progress_callback=None, cancel_event=None) -> TaskResult:
         working_dir.mkdir(parents=True, exist_ok=True)
         cmd = self.build_geometry_command(working_dir, sample)
-        ps_result = subprocess.run(cmd, capture_output=True, text=True)
         prefix = f"{run_id}: " if run_id else ""
-        if ps_result.returncode != 0:
+        stdout, stderr, returncode = self._run_streamed_command(cmd, working_dir, progress_callback=progress_callback, cancel_event=cancel_event)
+        if returncode == -999:
+            return TaskResult(
+                status="canceled",
+                message=f"{prefix}geometry generation canceled.",
+                metrics={"stdout": stdout, "stderr": stderr},
+                artifacts={"working_dir": str(working_dir)},
+            )
+        if returncode != 0:
             return TaskResult(
                 status="failed",
-                message=f"{prefix}geometry generation failed with exit code {ps_result.returncode}.",
-                metrics={"stdout": ps_result.stdout, "stderr": ps_result.stderr},
+                message=f"{prefix}geometry generation failed with exit code {returncode}.",
+                metrics={"stdout": stdout, "stderr": stderr},
                 artifacts={"working_dir": str(working_dir)},
             )
         return TaskResult(
             status="succeeded",
             message=f"{prefix}geometry and mesh generated.",
-            metrics={"stdout": ps_result.stdout, "stderr": ps_result.stderr},
+            metrics={"stdout": stdout, "stderr": stderr},
             artifacts={"working_dir": str(working_dir)},
         )
 
-    def run_doe_sample(self, index: int, sample: dict, progress_callback=None) -> TaskResult:
+    def run_doe_sample(self, index: int, sample: dict, progress_callback=None, cancel_event=None) -> TaskResult:
         run_id = f"Run_{index:03d}"
         working_dir = self.config.workspace.doe_runs_dir / run_id
         working_dir.mkdir(parents=True, exist_ok=True)
+        if _is_cancelled(cancel_event):
+            return TaskResult(status="canceled", message=f"{run_id}: canceled before start.", artifacts={"working_dir": str(working_dir)})
         result_txt = working_dir / "CFX_Results.txt"
         if result_txt.exists():
             row = self._read_result_file(result_txt, sample)
@@ -245,11 +351,13 @@ class RunnerAPI:
                 return TaskResult(status="failed", message=f"{run_id}: existing result diverged and was discarded.", artifacts={"working_dir": str(working_dir)})
             return TaskResult(status="succeeded", message=f"{run_id}: reused existing result.", metrics=row, artifacts={"working_dir": str(working_dir)})
         _emit(progress_callback, f"{run_id}: generating geometry and mesh...")
-        geometry_result = self.run_geometry_generation(working_dir, sample, run_id=run_id)
+        geometry_result = self.run_geometry_generation(working_dir, sample, run_id=run_id, progress_callback=progress_callback, cancel_event=cancel_event)
         if geometry_result.status != "succeeded":
             return geometry_result
+        if _is_cancelled(cancel_event):
+            return TaskResult(status="canceled", message=f"{run_id}: canceled before CFX.", artifacts={"working_dir": str(working_dir)})
         _emit(progress_callback, f"{run_id}: geometry done, launching CFX...")
-        cfx_result = self.run_cfx_case(working_dir, run_id, float(sample["P_out"]), int(round(float(sample["nBl"]))))
+        cfx_result = self.run_cfx_case(working_dir, run_id, float(sample["P_out"]), int(round(float(sample["nBl"]))), cancel_event=cancel_event)
         if cfx_result.status != "succeeded":
             return cfx_result
         row = {
@@ -267,7 +375,7 @@ class RunnerAPI:
         self._append_training_row(row)
         return TaskResult(status="succeeded", message=f"{run_id}: DOE sample completed.", metrics=row, artifacts={"working_dir": str(working_dir)})
 
-    def run_doe_batch(self, progress_callback=None) -> TaskResult:
+    def run_doe_batch(self, progress_callback=None, cancel_event=None) -> TaskResult:
         self.config.workspace.doe_runs_dir.mkdir(parents=True, exist_ok=True)
         recovery = self._recover_doe_progress()
         samples = recovery["base_samples"]
@@ -277,6 +385,8 @@ class RunnerAPI:
         completed = len(recovery["rows"])
         extra_ptr = max(0, current_index - len(samples))
         while completed < target:
+            if _is_cancelled(cancel_event):
+                return TaskResult(status="canceled", message="DOE batch canceled.", metrics={"completed_runs": completed, "target_runs": target})
             if current_index < len(samples):
                 sample = dict(samples[current_index])
             elif extra_ptr < len(extra_samples):
@@ -286,8 +396,10 @@ class RunnerAPI:
                 sample = self._new_extra_sample()
                 extra_samples.append(sample)
                 extra_ptr += 1
-            result = self.run_doe_sample(current_index, sample, progress_callback=progress_callback)
+            result = self.run_doe_sample(current_index, sample, progress_callback=progress_callback, cancel_event=cancel_event)
             current_index += 1
+            if result.status == "canceled":
+                return TaskResult(status="canceled", message=result.message, metrics={"completed_runs": completed, "target_runs": target}, artifacts=result.artifacts)
             if result.status == "succeeded":
                 completed += 1
                 _emit(progress_callback, result.message, progress=completed / max(1, target), metrics={"completed_runs": completed, "target_runs": target})

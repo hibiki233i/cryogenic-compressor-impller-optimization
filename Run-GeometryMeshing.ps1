@@ -4,6 +4,11 @@
 
 param (
     [string]$WorkingDir = "F:\optimazition\Runs\Run_001",
+    [string]$CFturboExe = "C:\Program Files\CFturbo 2025.2.2\CFturbo.exe",
+    [string]$TurboGridExe = "D:\ANSYS Inc\v251\TurboGrid\bin\cfxtg.exe",
+    [string]$CftBatchTemplate = "F:\optimazition\Templates\BaseModel.cft-batch",
+    [string]$BaseCft = "F:\optimazition\Templates\0908-2.cft",
+    [string]$TurboGridTemplate = "F:\optimazition\Templates\BaseMeshing.tst",
    [double]$d1s, [double]$dH, [double]$beta1hb, [double]$beta1sb, [double]$d2, 
     [double]$b2, [double]$beta2hb, [double]$beta2sb, [double]$Lz, [double]$t, 
     [double]$TipClear, [double]$nBl, [double]$rake_te_s,
@@ -160,12 +165,12 @@ function Get-GeometrySummary {
 # 0. 环境与路径准备
 # ==============================================================================                                                                                                                                                                                                                            
 # 软件执行路径
-$CFTurbo_Exe   = "C:\Program Files\CFturbo 2025.2.2\CFturbo.exe"
-$TurboGrid_Exe = "D:\ANSYS Inc\v251\TurboGrid\bin\cfxtg.exe"
+$CFTurbo_Exe   = $CFturboExe
+$TurboGrid_Exe = $TurboGridExe
 
 # 模板文件路径 (直接使用 CFturbo 和 TurboGrid 原生导出的文件)
-$CFT_Template  = "F:\optimazition\Templates\BaseModel.cft-batch" 
-$TGS_Template  = "F:\optimazition\Templates\BaseMeshing.tst"
+$CFT_Template  = $CftBatchTemplate
+$TGS_Template  = $TurboGridTemplate
 
 # 当前计算步的工作文件
 $Current_CFT   = Join-Path $WorkingDir "run_cfturbo.cft-batch"
@@ -176,7 +181,7 @@ $Export_Profile = Join-Path $WorkingDir "Impeller_profile.curve"
 $Export_Mesh    = Join-Path $WorkingDir "Impeller_Mesh.gtm"
 $Geometry_Summary = Join-Path $WorkingDir "geometry_summary.json"
 # 在生成网格之前，把原始 cft 复制到当前计算目录
-Copy-Item -Path "F:\optimazition\Templates\0908-2.cft" -Destination $WorkingDir -Force
+Copy-Item -Path $BaseCft -Destination $WorkingDir -Force
 
 
 Write-Host ">>> 开始执行几何与网格生成流水线..." -ForegroundColor Cyan
@@ -246,7 +251,7 @@ Write-Host "--> [2/3] 准备运行 CFturbo..."
 
 # 1. 强制将你 Templates 目录下的母本 .cft 文件复制到当前的 Run_xxx 文件夹里
 # (注意：请确认你的母本文件是不是叫这个名字，如果不是请修改)
-$Source_CFT_Model = "F:\optimazition\Templates\0908-2.cft"
+$Source_CFT_Model = $BaseCft
 $Target_CFT_Model = Join-Path $WorkingDir "0908-2.cft"
 
 if (Test-Path $Source_CFT_Model) {
