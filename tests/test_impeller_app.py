@@ -203,6 +203,32 @@ class ImpellerAppTests(unittest.TestCase):
             self.assertEqual(result.status, "failed")
             self.assertIn("TRAINING_CSV 中没有可用于主动学习的样本", result.message)
 
+    def test_run_nsga2_only_returns_artifacts(self):
+        class FakeLegacy:
+            def run_nsga2_only_from_lhs(self, output_csv=None, summary_json=None, use_pool_checkpoint=False):
+                Path(output_csv).write_text("front_index,pred_Efficiency\n1,0.72\n", encoding="utf-8")
+                Path(summary_json).write_text(json.dumps({"front_size": 1}), encoding="utf-8")
+                return {
+                    "train_samples": 20,
+                    "test_samples": 4,
+                    "front_size": 1,
+                    "surrogate_hv": 0.12,
+                    "mse_eff": 0.001,
+                    "mse_pr": 0.002,
+                    "mse_mf": 0.003,
+                }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = self.make_config(root)
+            service = ActiveLearningService(config)
+            service._legacy = FakeLegacy()
+            result = service.run_nsga2_only()
+            self.assertEqual(result.status, "succeeded")
+            self.assertEqual(result.metrics["front_size"], 1)
+            self.assertTrue((root / "nsga2_surrogate_pareto.csv").exists())
+            self.assertTrue((root / "nsga2_surrogate_summary.json").exists())
+
     def test_compute_pareto_front_without_solver(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

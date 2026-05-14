@@ -180,6 +180,21 @@ def parse_runtime_args():
         default=0,
         help="Continue for N extra iterations beyond the completed checkpoint.",
     )
+    parser.add_argument(
+        "--nsga2-only",
+        action="store_true",
+        help="Train the surrogate from the current LHS/DOE data and run NSGA-II without EHVI/CFD active-learning updates.",
+    )
+    parser.add_argument(
+        "--nsga2-output-csv",
+        default="nsga2_surrogate_pareto.csv",
+        help="Output CSV for the NSGA-II surrogate Pareto front.",
+    )
+    parser.add_argument(
+        "--nsga2-use-pool-checkpoint",
+        action="store_true",
+        help="Use al_training_pool_checkpoint.csv as the NSGA-II training source when it exists. Defaults to pure TRAINING_CSV/LHS data.",
+    )
     return parser.parse_args()
 
 
@@ -1377,6 +1392,143 @@ def select_candidates_diverse(
 
     return selected[:n_pick], labels[:n_pick]
 
+
+def _load_nsga2_training_dataframe(use_pool_checkpoint: bool = False) -> pd.DataFrame:
+    """
+    NSGA-II-only mode defaults to TRAINING_CSV so an LHS/DOE baseline is not
+    silently contaminated by active-learning checkpoint samples.
+    """
+    if use_pool_checkpoint and os.path.exists(POOL_CHECKPOINT_CSV):
+        print(f"[NSGA-II] 使用主动学习训练池 checkpoint: {POOL_CHECKPOINT_CSV}")
+        return load_and_clean_data(POOL_CHECKPOINT_CSV)
+
+    print(f"[NSGA-II] 使用训练数据 CSV: {TRAINING_CSV}")
+    return load_and_clean_data(TRAINING_CSV)
+
+
+def run_nsga2_only_from_lhs(
+    output_csv: str = "nsga2_surrogate_pareto.csv",
+    summary_json: str | None = None,
+    use_pool_checkpoint: bool = False,
+) -> dict:
+    """
+    Continue the LHS/DOE workflow into surrogate-assisted NSGA-II optimization.
+
+    This path intentionally stops before EHVI acquisition and CFD execution. It
+    trains the surrogate on the current data, runs NSGA-II on that surrogate, and
+    writes the predicted Pareto set for later engineering review or CFD replay.
+    """
+    os.makedirs(os.path.dirname(os.path.abspath(output_csv)), exist_ok=True)
+    if summary_json:
+        os.makedirs(os.path.dirname(os.path.abspath(summary_json)), exist_ok=True)
+
+    df = _load_nsga2_training_dataframe(use_pool_checkpoint=use_pool_checkpoint)
+    X_pool, X_test_fixed, Y_pool, Y_test_fixed, W_pool, W_test_fixed = split_with_fixed_testset(df)
+    X_pool = snap_discrete_vars(X_pool)
+    X_test_fixed = snap_discrete_vars(X_test_fixed)
+
+    scaler_X = MinMaxScaler()
+    scaler_Y = MinMaxScaler()
+    X_pool_norm = scaler_X.fit_transform(X_pool)
+    Y_pool_surr = Y_pool[:, SURROGATE_OUTPUT_IDX]
+    Y_test_fixed_surr = Y_test_fixed[:, SURROGATE_OUTPUT_IDX]
+    Y_pool_norm = scaler_Y.fit_transform(Y_pool_surr)
+
+    stratify_labels = W_pool if len(np.unique(W_pool)) > 1 else None
+    X_tr, X_val, Y_tr, Y_val, W_tr, W_val = train_test_split(
+        X_pool_norm,
+        Y_pool_norm,
+        W_pool,
+        test_size=0.2,
+        random_state=42,
+        stratify=stratify_labels,
+    )
+
+    print(f"[NSGA-II] 训练 surrogate | 训练池: {len(X_pool)} | 固定测试集: {len(X_test_fixed)}")
+    reg_model, reg_hist = train_regressor(X_tr, Y_tr, W_tr, X_val, Y_val, W_val)
+    joblib.dump(scaler_X, SCALER_X_PATH)
+    joblib.dump(scaler_Y, SCALER_Y_PATH)
+
+    X_test_norm = scaler_X.transform(X_test_fixed)
+    Y_test_pred = deterministic_predict(reg_model, X_test_norm, scaler_Y)
+    mse_eff = mean_squared_error(Y_test_fixed_surr[:, 0], Y_test_pred[:, 0])
+    mse_pr = mean_squared_error(Y_test_fixed_surr[:, 1], Y_test_pred[:, 1])
+    mse_mf = mean_squared_error(Y_test_fixed_surr[:, 2], Y_test_pred[:, 2])
+    print(f"[NSGA-II] 固定测试误差 Eff={mse_eff:.6f}, PR={mse_pr:.6f}, MF={mse_mf:.6f}")
+
+    if os.path.exists(FAILED_POINTS_PATH):
+        failed_points = list(np.load(FAILED_POINTS_PATH, allow_pickle=True))
+    else:
+        failed_points = []
+    feas_clf = train_feasibility_classifier(
+        X_pool,
+        np.array(failed_points) if len(failed_points) > 0 else np.empty((0, len(VAR_NAMES))),
+    )
+
+    X_geom_warn, y_geom_warn = load_geometry_warning_dataset()
+    geom_warn_clf = train_geometry_warning_classifier(X_geom_warn, y_geom_warn)
+    if geom_warn_clf is not None:
+        joblib.dump(geom_warn_clf, GEOM_WARN_CLF_PATH)
+
+    print(f"[NSGA-II] 开始优化 | pop_size={CFG.pop_size} | n_gen={CFG.n_gen}")
+    problem = CompressorMOOProblem(
+        reg_model=reg_model,
+        feas_clf=feas_clf,
+        geom_warn_clf=geom_warn_clf,
+        scaler_X=scaler_X,
+        scaler_Y=scaler_Y,
+        X_pool_raw=X_pool,
+        Y_pool_raw=Y_pool,
+        cfg=CFG,
+    )
+    algorithm = NSGA2(pop_size=CFG.pop_size, eliminate_duplicates=True)
+    res = minimize(problem, algorithm, ("n_gen", CFG.n_gen), verbose=False)
+
+    pareto_X, pareto_Y, surrogate_hv = extract_surrogate_front_and_hv(
+        res=res,
+        reg_model=reg_model,
+        scaler_X=scaler_X,
+        scaler_Y=scaler_Y,
+        ref_eff=TRUE_HV_REF_EFF,
+        ref_pr=TRUE_HV_REF_PR,
+    )
+    if pareto_X is None or pareto_Y is None or len(pareto_X) == 0:
+        raise ValueError("NSGA-II 未能生成可用的 surrogate Pareto 前沿。")
+
+    pareto_X_norm = scaler_X.transform(pareto_X)
+    pred_mean, pred_std_norm = mc_dropout_predict(reg_model, pareto_X_norm, scaler_Y, n_samples=CFG.mc_samples)
+    out = pd.DataFrame(pareto_X, columns=VAR_NAMES)
+    out.insert(0, "front_index", np.arange(1, len(out) + 1))
+    out["pred_Efficiency"] = pred_mean[:, 0]
+    out[f"pred_{TARGET_PR_NAME}"] = pred_mean[:, 1]
+    out["pred_MassFlow"] = pred_mean[:, 2]
+    out["uncertainty_norm"] = pred_std_norm[:, :2].mean(axis=1)
+    out["surrogate_hv"] = surrogate_hv
+    out.to_csv(output_csv, index=False)
+
+    summary = {
+        "mode": "nsga2_only",
+        "training_csv": TRAINING_CSV,
+        "used_pool_checkpoint": bool(use_pool_checkpoint and os.path.exists(POOL_CHECKPOINT_CSV)),
+        "train_samples": int(len(X_pool)),
+        "test_samples": int(len(X_test_fixed)),
+        "front_size": int(len(out)),
+        "surrogate_hv": float(surrogate_hv),
+        "mse_eff": float(mse_eff),
+        "mse_pr": float(mse_pr),
+        "mse_mf": float(mse_mf),
+        "epochs": int(len(reg_hist)),
+        "output_csv": output_csv,
+    }
+    if summary_json:
+        with open(summary_json, "w", encoding="utf-8") as f:
+            json.dump(summary, f, ensure_ascii=False, indent=2)
+
+    print(f"[NSGA-II] surrogate Pareto 已保存: {output_csv}")
+    if summary_json:
+        print(f"[NSGA-II] 摘要已保存: {summary_json}")
+    return summary
+
 # =============================================================================
 # 主流程
 # =============================================================================
@@ -1755,6 +1907,15 @@ def main_multiobjective_active_learning(max_al_iters: int | None = None):
 
 if __name__ == "__main__":
     runtime_args = parse_runtime_args()
+    if runtime_args.nsga2_only:
+        summary_path = os.path.splitext(runtime_args.nsga2_output_csv)[0] + "_summary.json"
+        run_nsga2_only_from_lhs(
+            output_csv=runtime_args.nsga2_output_csv,
+            summary_json=summary_path,
+            use_pool_checkpoint=runtime_args.nsga2_use_pool_checkpoint,
+        )
+        raise SystemExit(0)
+
     checkpoint_completed = get_resume_iter()
     if runtime_args.max_al_iters is not None:
         target_max_iters = runtime_args.max_al_iters

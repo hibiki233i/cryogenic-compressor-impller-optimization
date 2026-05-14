@@ -17,6 +17,10 @@ def start_active_learning(config: AppConfig, progress_callback=None):
     )
 
 
+def run_nsga2_only(config: AppConfig, progress_callback=None):
+    return ActiveLearningService(config).run_nsga2_only(progress_callback=progress_callback)
+
+
 def query_pareto(config: AppConfig, selection: dict, progress_callback=None):
     if progress_callback:
         progress_callback("Computing Pareto front...")

@@ -191,3 +191,44 @@ class ActiveLearningService:
                     "pool_checkpoint": str(self.config.workspace.pool_checkpoint_csv),
                 },
             )
+
+    def run_nsga2_only(self, progress_callback=None, use_pool_checkpoint: bool = False) -> TaskResult:
+        try:
+            _emit(progress_callback, "running", "Starting NSGA-II from current DOE/LHS training data...")
+            emitter = _LineEmitter(progress_callback)
+            with contextlib.redirect_stdout(emitter), contextlib.redirect_stderr(emitter):
+                summary = self.legacy.run_nsga2_only_from_lhs(
+                    output_csv=str(self.config.workspace.nsga2_surrogate_pareto_csv),
+                    summary_json=str(self.config.workspace.nsga2_surrogate_summary_json),
+                    use_pool_checkpoint=use_pool_checkpoint,
+                )
+            metrics = {
+                "train_samples": int(summary.get("train_samples", 0)),
+                "test_samples": int(summary.get("test_samples", 0)),
+                "front_size": int(summary.get("front_size", 0)),
+                "surrogate_hv": float(summary.get("surrogate_hv", 0.0)),
+                "mse_eff": float(summary.get("mse_eff", 0.0)),
+                "mse_pr": float(summary.get("mse_pr", 0.0)),
+                "mse_mf": float(summary.get("mse_mf", 0.0)),
+            }
+            return TaskResult(
+                status="succeeded",
+                message="NSGA-II surrogate optimization completed.",
+                metrics=metrics,
+                artifacts={
+                    "surrogate_pareto_csv": str(self.config.workspace.nsga2_surrogate_pareto_csv),
+                    "summary_json": str(self.config.workspace.nsga2_surrogate_summary_json),
+                    "model": str(self.config.workspace.best_regressor_pth),
+                    "scaler_x": str(self.config.workspace.scaler_x_pkl),
+                    "scaler_y": str(self.config.workspace.scaler_y_pkl),
+                },
+            )
+        except ValueError as exc:
+            return TaskResult(
+                status="failed",
+                message=str(exc),
+                artifacts={
+                    "training_csv": str(self.config.workspace.training_csv),
+                    "surrogate_pareto_csv": str(self.config.workspace.nsga2_surrogate_pareto_csv),
+                },
+            )

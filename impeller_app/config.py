@@ -41,6 +41,8 @@ class WorkspacePaths:
     pareto_engineering_csv: Path = Path("pareto_engineering_ranked.csv")
     pareto_engineering_json: Path = Path("pareto_engineering_report.json")
     pareto_export_dir: Path = Path("pareto_cft_cases")
+    nsga2_surrogate_pareto_csv: Path = Path("nsga2_surrogate_pareto.csv")
+    nsga2_surrogate_summary_json: Path = Path("nsga2_surrogate_summary.json")
 
     def resolve_all(self) -> "WorkspacePaths":
         root = self.project_root.resolve()
@@ -66,6 +68,8 @@ class WorkspacePaths:
             pareto_engineering_csv=_resolve(root, self.pareto_engineering_csv),
             pareto_engineering_json=_resolve(root, self.pareto_engineering_json),
             pareto_export_dir=_resolve(root, self.pareto_export_dir),
+            nsga2_surrogate_pareto_csv=_resolve(root, self.nsga2_surrogate_pareto_csv),
+            nsga2_surrogate_summary_json=_resolve(root, self.nsga2_surrogate_summary_json),
         )
 
 

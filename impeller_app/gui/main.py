@@ -98,6 +98,7 @@ TEXTS = {
         "al_iters": "Additional Iterations",
         "resume_checkpoint": "Resume Checkpoint",
         "train_surrogate": "Train Surrogate",
+        "run_nsga2_only": "Run NSGA-II from LHS",
         "run_active_learning": "Run Active Learning",
         "pareto_group": "Pareto Front Query and Inverse Design",
         "geom_safe": "Geom Safe Threshold",
@@ -179,6 +180,7 @@ TEXTS = {
         "al_iters": "额外迭代次数",
         "resume_checkpoint": "恢复检查点",
         "train_surrogate": "训练代理模型",
+        "run_nsga2_only": "基于 LHS 运行 NSGA-II",
         "run_active_learning": "运行主动学习",
         "pareto_group": "帕累托前沿查询与逆向设计",
         "geom_safe": "几何安全阈值",
@@ -478,10 +480,13 @@ class MainWindow(QMainWindow):
         self.resume_button.clicked.connect(self._resume_checkpoint)
         self.train_button = QPushButton()
         self.train_button.clicked.connect(self._train_surrogate)
+        self.run_nsga2_button = QPushButton()
+        self.run_nsga2_button.clicked.connect(self._run_nsga2_only)
         self.run_active_learning_button = QPushButton()
         self.run_active_learning_button.clicked.connect(self._run_active_learning)
         row.addWidget(self.resume_button)
         row.addWidget(self.train_button)
+        row.addWidget(self.run_nsga2_button)
         row.addWidget(self.run_active_learning_button)
         row.addStretch(1)
         layout.addLayout(row)
@@ -611,6 +616,7 @@ class MainWindow(QMainWindow):
         self.start_doe_button.setText(self.tr("start_doe"))
         self.resume_button.setText(self.tr("resume_checkpoint"))
         self.train_button.setText(self.tr("train_surrogate"))
+        self.run_nsga2_button.setText(self.tr("run_nsga2_only"))
         self.run_active_learning_button.setText(self.tr("run_active_learning"))
         self.compute_pareto_button.setText(self.tr("compute_pareto"))
         self.query_button.setText(self.tr("run_query"))
@@ -669,6 +675,8 @@ class MainWindow(QMainWindow):
             pareto_engineering_csv=Path("pareto_engineering_ranked.csv"),
             pareto_engineering_json=Path("pareto_engineering_report.json"),
             pareto_export_dir=Path(self.export_dir.text() or "pareto_cft_cases"),
+            nsga2_surrogate_pareto_csv=Path("nsga2_surrogate_pareto.csv"),
+            nsga2_surrogate_summary_json=Path("nsga2_surrogate_summary.json"),
         )
         solver = SolverPaths(
             powershell_exe=Path(self.powershell.text()),
@@ -788,6 +796,12 @@ class MainWindow(QMainWindow):
         if config is None:
             return
         self._run_worker(lambda callback: ActiveLearningService(config).train_surrogate(progress_callback=callback))
+
+    def _run_nsga2_only(self):
+        config = self._with_config(lambda cfg: cfg)
+        if config is None:
+            return
+        self._run_worker(lambda callback: ActiveLearningService(config).run_nsga2_only(progress_callback=callback))
 
     def _run_active_learning(self):
         config = self._with_config(lambda cfg: cfg)
