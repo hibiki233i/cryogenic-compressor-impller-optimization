@@ -61,6 +61,8 @@ class ImpellerAppTests(unittest.TestCase):
                     doe_target_samples=128,
                     active_learning_additional_iters=3,
                     pareto_geom_safe_threshold=0.55,
+                    default_boundary_flow_g_s=4.2,
+                    default_min_d2_d1s_gap=0.08,
                 ),
             )
 
@@ -73,6 +75,8 @@ class ImpellerAppTests(unittest.TestCase):
             self.assertEqual(restored.workspace.pareto_export_dir, Path(r"D:\BOUNDYR\pareto_cft_cases"))
             self.assertEqual(restored.runtime.cfx_cores, 12)
             self.assertEqual(restored.runtime.doe_target_samples, 128)
+            self.assertEqual(restored.runtime.default_boundary_flow_g_s, 4.2)
+            self.assertEqual(restored.runtime.default_min_d2_d1s_gap, 0.08)
 
     def test_recover_runs_rebuilds_training_csv(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -56,11 +56,18 @@ VAR_NAMES = variable_names(_VARIABLE_SPECS)
 L_BOUNDS = lower_bounds(_VARIABLE_SPECS)
 U_BOUNDS = upper_bounds(_VARIABLE_SPECS)
 
-# 基于当前设计变量范围和叶轮几何经验的保守几何阈值。
-# beta1hb - beta1sb 的理论上限约为 64 deg，原 62 deg 基本不起筛选作用；
-# 这里先收紧到 52 deg，避免像 45 deg 那样一下子把大半搜索空间全部切掉，
-# 同时比原 62 deg 更能抑制明显过高的前缘切向 sweep。
-MAX_LE_SWEEP_DIFF = 52.0
+MIN_VALID_FLOW_G_S = float(_env_or_default("IMPELLER_MIN_VALID_FLOW_G_S", 0.1))
+MIN_DISCARD_FLOW_G_S = float(_env_or_default("IMPELLER_MIN_DISCARD_FLOW_G_S", 0.0001))
+BOUNDARY_FLOW_G_S = float(_env_or_default("IMPELLER_BOUNDARY_FLOW_G_S", 3.60))
+MIN_EFFICIENCY = float(_env_or_default("IMPELLER_MIN_EFFICIENCY", 0.60))
+MIN_POWER = float(_env_or_default("IMPELLER_MIN_POWER", 60.0))
+MIN_PRESSURE_RATIO = float(_env_or_default("IMPELLER_MIN_PRESSURE_RATIO", 1.60))
+MAX_PRESSURE_RATIO = float(_env_or_default("IMPELLER_MAX_PRESSURE_RATIO", 2.85))
+
+# 默认工程几何阈值，可由 GUI/配置文件覆盖，用于当前叶轮族的可行域筛选。
+MIN_D2_D1S_GAP = float(_env_or_default("IMPELLER_MIN_D2_D1S_GAP", 0.070))
+MAX_LE_SWEEP_DIFF = float(_env_or_default("IMPELLER_MAX_LE_SWEEP_DIFF", 52.0))
+MAX_EXIT_ANGLE_DIFF = float(_env_or_default("IMPELLER_MAX_EXIT_ANGLE_DIFF", 13.5))
 
 # 相邻叶片 overlap 的代理约束：
 # nBl 越少，节距角 360/nBl 越大，同样的后掠越容易造成 overlap 不足，
@@ -71,6 +78,13 @@ MIN_RAKE_TE_S_BY_NBL = {
     11: -20.0,
     12: -21.0,
 }
+
+
+def min_rake_te_s_for_nbl(n_bl: int) -> float:
+    if n_bl in MIN_RAKE_TE_S_BY_NBL:
+        return MIN_RAKE_TE_S_BY_NBL[n_bl]
+    nearest = min(MIN_RAKE_TE_S_BY_NBL, key=lambda value: abs(value - n_bl))
+    return MIN_RAKE_TE_S_BY_NBL[nearest]
 
 # overlap 先作为软惩罚而不是硬约束处理，避免直接把大量已算出的 DOE/训练点全部判死。
 OVERLAP_PENALTY_COEFF = 0.035
@@ -210,7 +224,8 @@ def load_pool_checkpoint(pool_csv=None):
         raise ValueError(f"训练池 checkpoint 缺少必要列: {missing_cols}")
 
     df_pool = df_pool[expected_cols].copy()
-    df_pool['nBl'] = np.clip(np.round(df_pool['nBl']), 9, 12).astype(int)
+    nbl_idx = VAR_NAMES.index("nBl")
+    df_pool['nBl'] = np.clip(np.round(df_pool['nBl']), L_BOUNDS[nbl_idx], U_BOUNDS[nbl_idx]).astype(int)
     df_pool = df_pool.drop_duplicates(subset=VAR_NAMES, keep='first').reset_index(drop=True)
     return df_pool
 
@@ -273,7 +288,8 @@ def snap_discrete_vars(X: np.ndarray) -> np.ndarray:
     X = np.array(X, dtype=float, copy=True)
     if X.ndim == 1:
         X = X[None, :]
-    X[:, 11] = np.clip(np.round(X[:, 11]), 9, 12)
+    nbl_idx = VAR_NAMES.index("nBl")
+    X[:, nbl_idx] = np.clip(np.round(X[:, nbl_idx]), L_BOUNDS[nbl_idx], U_BOUNDS[nbl_idx])
     return X
 
 
@@ -290,9 +306,9 @@ def calc_distance_to_set(X_norm: np.ndarray, ref_norm: np.ndarray) -> np.ndarray
 def infer_boundary_from_outputs(y: np.ndarray) -> float:
     eff, pr, power, mf = y
     return float(
-        (mf < 3.60) or      # 质量流量不足，接近失速
-        (eff < 0.60) or     # 效率过低
-        (power < 60.0)      # 功率异常低
+        (mf < BOUNDARY_FLOW_G_S) or
+        (eff < MIN_EFFICIENCY) or
+        (power < MIN_POWER)
     )
 
 
@@ -304,18 +320,20 @@ def geometry_rule_violations(X: np.ndarray) -> np.ndarray:
     """
     X = snap_discrete_vars(X)
     d1s, dH, beta1hb, beta1sb, d2, b2, beta2hb, beta2sb, Lz, t, TipClear, nBl, rake_te_s, P_out = X.T
+    lower = {name: L_BOUNDS[idx] for idx, name in enumerate(VAR_NAMES)}
+    upper = {name: U_BOUNDS[idx] for idx, name in enumerate(VAR_NAMES)}
 
-    g1 = 0.070 - (d2 - d1s)                 # d2 至少比 d1s 大 0.010
-    g2 = 0.044 - b2                         # b2 
-    g3 = t - 0.0035                         # 厚度
-    g4 = 0.0007 - TipClear                 # 间隙
-    g5 = TipClear - 0.0015                 # 间隙
+    g1 = MIN_D2_D1S_GAP - (d2 - d1s)
+    g2 = lower["b2"] - b2
+    g3 = t - upper["t"]
+    g4 = lower["TipClear"] - TipClear
+    g5 = TipClear - upper["TipClear"]
     g6 = (beta1hb - beta1sb) - MAX_LE_SWEEP_DIFF
-    g7 = np.abs(beta2hb - beta2sb) - 13.5   # 出口角差
-    g8 = 0.185 - Lz                         # Lz 
-    g9 = Lz - 0.215                         # Lz 
-    g10 = rake_te_s + 15.0                  # rake_te_s <= -15 -> rake+15 <=0
-    g11 = -25.0 - rake_te_s                 # rake_te_s >= -25 -> -25-rake <=0
+    g7 = np.abs(beta2hb - beta2sb) - MAX_EXIT_ANGLE_DIFF
+    g8 = lower["Lz"] - Lz
+    g9 = Lz - upper["Lz"]
+    g10 = rake_te_s - upper["rake_te_s"]
+    g11 = lower["rake_te_s"] - rake_te_s
 
     return np.column_stack([g1, g2, g3, g4, g5, g6, g7, g8, g9, g10, g11])
 
@@ -326,10 +344,11 @@ def overlap_proxy_violation(X: np.ndarray) -> np.ndarray:
     目前只作为软惩罚使用，不直接判为硬不可行。
     """
     X = snap_discrete_vars(X)
-    nBl = np.clip(np.round(X[:, 11]), 9, 12).astype(int)
+    nbl_idx = VAR_NAMES.index("nBl")
+    nBl = np.clip(np.round(X[:, nbl_idx]), L_BOUNDS[nbl_idx], U_BOUNDS[nbl_idx]).astype(int)
     rake_te_s = X[:, 12]
     min_rake_for_overlap = np.array(
-        [MIN_RAKE_TE_S_BY_NBL[int(n_bl)] for n_bl in nBl],
+        [min_rake_te_s_for_nbl(int(n_bl)) for n_bl in nBl],
         dtype=float
     )
     return np.maximum(0.0, min_rake_for_overlap - rake_te_s)
@@ -377,7 +396,8 @@ def load_and_clean_data(csv_path: str):
     df = df[use_cols].copy()
 
     # 保证 nBl 是整数
-    df['nBl'] = np.clip(np.round(df['nBl']), 9, 12).astype(int)
+    nbl_idx = VAR_NAMES.index("nBl")
+    df['nBl'] = np.clip(np.round(df['nBl']), L_BOUNDS[nbl_idx], U_BOUNDS[nbl_idx]).astype(int)
 
     # 简单去重
     df = df.drop_duplicates(subset=VAR_NAMES, keep='first').reset_index(drop=True)
@@ -573,10 +593,10 @@ def compute_true_cumulative_hv(
 
     feas_mask = (
         geom_ok &
-        (Y_pool[:, 0] >= 0.45) &
-        (Y_pool[:, 1] >= 1.60) &
-        (Y_pool[:, 1] <= 2.85) &
-        (Y_pool[:, 3] >= 3.60)
+        (Y_pool[:, 0] >= MIN_EFFICIENCY) &
+        (Y_pool[:, 1] >= MIN_PRESSURE_RATIO) &
+        (Y_pool[:, 1] <= MAX_PRESSURE_RATIO) &
+        (Y_pool[:, 3] >= BOUNDARY_FLOW_G_S)
     )
 
     Y_feas = Y_pool[feas_mask][:, :2]
@@ -1132,10 +1152,10 @@ def compute_ehvi_acquisition(
         (p_feas >= cfg.feasible_prob_threshold_pick) &
         (p_geom_safe >= cfg.geom_safe_prob_threshold_pick) &
         (~invalid_geom) &
-        (pred_mf_q >= 3.55) &
-        (pred_eff_q >= 0.60) &
+        (pred_mf_q >= max(MIN_DISCARD_FLOW_G_S, BOUNDARY_FLOW_G_S - 0.05)) &
+        (pred_eff_q >= MIN_EFFICIENCY) &
         (pred_eff_q <= 0.85) &
-        (pred_pr_q  <= 2.85)
+        (pred_pr_q  <= MAX_PRESSURE_RATIO)
     )
 
     # 失败点距离过滤（太近的直接排除）
@@ -1273,16 +1293,16 @@ class CompressorMOOProblem(Problem):
         p_geom_safe = predict_geometry_safe_prob(self.geom_warn_clf, X)
         overlap_violation = overlap_proxy_violation(X)
         eff_obj = np.clip(eff_raw, 0.45, 0.84)
-        pr_obj  = np.clip(pr_raw, 1.60, 2.85)
+        pr_obj  = np.clip(pr_raw, MIN_PRESSURE_RATIO, MAX_PRESSURE_RATIO)
         out["F"] = np.column_stack([
             -eff_obj + 0.12 * unc + OVERLAP_PENALTY_COEFF * overlap_violation + GEOM_WARN_PENALTY_COEFF * (1.0 - p_geom_safe),
             -pr_obj  + 0.12 * unc + OVERLAP_PENALTY_COEFF * overlap_violation + GEOM_WARN_PENALTY_COEFF * (1.0 - p_geom_safe)
         ])
         g_basic = np.column_stack([
-            3.60 - mf,
+            BOUNDARY_FLOW_G_S - mf,
             eff_raw - self.eff_max_phys,
             self.eff_min_phys - eff_raw,
-            pr_raw - 2.85,                  
+            pr_raw - MAX_PRESSURE_RATIO,
             self.pr_min_phys - pr_raw,
             self.cfg.feasible_prob_threshold_opt - p_feas,
             self.cfg.geom_safe_prob_threshold_opt - p_geom_safe,

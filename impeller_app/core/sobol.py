@@ -192,7 +192,8 @@ class SobolService:
             if col not in df_main.columns:
                 raise ValueError(f"CSV missing required column: {col}")
         df_main = df_main[required_cols].copy()
-        df_main["nBl"] = np.clip(np.round(df_main["nBl"]), 9, 12).astype(int)
+        nbl_idx = self.var_names.index("nBl")
+        df_main["nBl"] = np.clip(np.round(df_main["nBl"]), self.l_bounds[nbl_idx], self.u_bounds[nbl_idx]).astype(int)
         df_main = df_main.drop_duplicates(subset=self.var_names, keep="first").reset_index(drop=True)
 
         if not self.config.runtime.sobol_use_al_samples:
@@ -208,7 +209,7 @@ class SobolService:
             if col not in df_al.columns:
                 raise ValueError(f"AL pool CSV missing required column: {col}")
         df_al = df_al[required_cols].copy()
-        df_al["nBl"] = np.clip(np.round(df_al["nBl"]), 9, 12).astype(int)
+        df_al["nBl"] = np.clip(np.round(df_al["nBl"]), self.l_bounds[nbl_idx], self.u_bounds[nbl_idx]).astype(int)
         df_al = df_al.drop_duplicates(subset=self.var_names, keep="first").reset_index(drop=True)
 
         df_merged = pd.concat([df_main, df_al], ignore_index=True)

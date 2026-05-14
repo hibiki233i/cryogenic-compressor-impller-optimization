@@ -56,13 +56,29 @@ VAR_NAMES = variable_names(_VARIABLE_SPECS)
 L_BOUNDS = lower_bounds(_VARIABLE_SPECS)
 U_BOUNDS = upper_bounds(_VARIABLE_SPECS)
 
-MAX_LE_SWEEP_DIFF = 52.0
+MIN_VALID_FLOW_G_S = float(os.environ.get("IMPELLER_MIN_VALID_FLOW_G_S", 0.1))
+MIN_DISCARD_FLOW_G_S = float(os.environ.get("IMPELLER_MIN_DISCARD_FLOW_G_S", 0.0001))
+BOUNDARY_FLOW_G_S = float(os.environ.get("IMPELLER_BOUNDARY_FLOW_G_S", 3.60))
+MIN_EFFICIENCY = float(os.environ.get("IMPELLER_MIN_EFFICIENCY", 0.60))
+MIN_POWER = float(os.environ.get("IMPELLER_MIN_POWER", 60.0))
+MIN_PRESSURE_RATIO = float(os.environ.get("IMPELLER_MIN_PRESSURE_RATIO", 1.60))
+MAX_PRESSURE_RATIO = float(os.environ.get("IMPELLER_MAX_PRESSURE_RATIO", 2.85))
+MIN_D2_D1S_GAP = float(os.environ.get("IMPELLER_MIN_D2_D1S_GAP", 0.070))
+MAX_LE_SWEEP_DIFF = float(os.environ.get("IMPELLER_MAX_LE_SWEEP_DIFF", 52.0))
+MAX_EXIT_ANGLE_DIFF = float(os.environ.get("IMPELLER_MAX_EXIT_ANGLE_DIFF", 13.5))
 MIN_RAKE_TE_S_BY_NBL = {
     9: -18.0,
     10: -19.0,
     11: -20.0,
     12: -21.0,
 }
+
+
+def min_rake_te_s_for_nbl(n_bl: int) -> float:
+    if n_bl in MIN_RAKE_TE_S_BY_NBL:
+        return MIN_RAKE_TE_S_BY_NBL[n_bl]
+    nearest = min(MIN_RAKE_TE_S_BY_NBL, key=lambda value: abs(value - n_bl))
+    return MIN_RAKE_TE_S_BY_NBL[nearest]
 
 DEFAULT_POOL_CSV = "al_training_pool_checkpoint.csv"
 DEFAULT_TRAINING_CSV = "Compressor_Training_Data.csv"
@@ -76,8 +92,11 @@ DEFAULT_ENGINEERING_JSON = "pareto_engineering_report.json"
 GEOM_WARN_FEATURE_NAMES = [name for name in VAR_NAMES if name != "P_out"]
 
 
-def configure_runtime(design_variables_path: str | None = None):
+def configure_runtime(design_variables_path: str | None = None, **overrides):
     globals_dict = globals()
+    for key, value in overrides.items():
+        if key in globals_dict and value is not None:
+            globals_dict[key] = value
     specs = load_variable_specs(design_variables_path) if design_variables_path else load_variable_specs()
     globals_dict["_VARIABLE_SPECS"] = specs
     globals_dict["VAR_NAMES"] = variable_names(specs)
@@ -134,7 +153,8 @@ def snap_discrete_vars(x: np.ndarray) -> np.ndarray:
     x = np.array(x, dtype=float, copy=True)
     if x.ndim == 1:
         x = x[None, :]
-    x[:, 11] = np.clip(np.round(x[:, 11]), 9, 12)
+    nbl_idx = VAR_NAMES.index("nBl")
+    x[:, nbl_idx] = np.clip(np.round(x[:, nbl_idx]), L_BOUNDS[nbl_idx], U_BOUNDS[nbl_idx])
     return x
 
 
@@ -156,28 +176,31 @@ def geometry_rule_violations(x: np.ndarray) -> np.ndarray:
         rake_te_s,
         p_out,
     ) = x.T
+    lower = {name: L_BOUNDS[idx] for idx, name in enumerate(VAR_NAMES)}
+    upper = {name: U_BOUNDS[idx] for idx, name in enumerate(VAR_NAMES)}
 
-    g1 = 0.070 - (d2 - d1s)
-    g2 = 0.044 - b2
-    g3 = t - 0.0035
-    g4 = 0.0007 - tip_clear
-    g5 = tip_clear - 0.0015
+    g1 = MIN_D2_D1S_GAP - (d2 - d1s)
+    g2 = lower["b2"] - b2
+    g3 = t - upper["t"]
+    g4 = lower["TipClear"] - tip_clear
+    g5 = tip_clear - upper["TipClear"]
     g6 = (beta1hb - beta1sb) - MAX_LE_SWEEP_DIFF
-    g7 = np.abs(beta2hb - beta2sb) - 13.5
-    g8 = 0.185 - Lz
-    g9 = Lz - 0.215
-    g10 = rake_te_s + 15.0
-    g11 = -25.0 - rake_te_s
+    g7 = np.abs(beta2hb - beta2sb) - MAX_EXIT_ANGLE_DIFF
+    g8 = lower["Lz"] - Lz
+    g9 = Lz - upper["Lz"]
+    g10 = rake_te_s - upper["rake_te_s"]
+    g11 = lower["rake_te_s"] - rake_te_s
 
     return np.column_stack([g1, g2, g3, g4, g5, g6, g7, g8, g9, g10, g11])
 
 
 def overlap_proxy_violation(x: np.ndarray) -> np.ndarray:
     x = snap_discrete_vars(x)
-    n_bl = np.clip(np.round(x[:, 11]), 9, 12).astype(int)
+    nbl_idx = VAR_NAMES.index("nBl")
+    n_bl = np.clip(np.round(x[:, nbl_idx]), L_BOUNDS[nbl_idx], U_BOUNDS[nbl_idx]).astype(int)
     rake_te_s = x[:, 12]
     min_rake_for_overlap = np.array(
-        [MIN_RAKE_TE_S_BY_NBL[int(v)] for v in n_bl],
+        [min_rake_te_s_for_nbl(int(v)) for v in n_bl],
         dtype=float,
     )
     return np.maximum(0.0, min_rake_for_overlap - rake_te_s)
@@ -238,7 +261,8 @@ def load_dataset(csv_path: str) -> pd.DataFrame:
     if "is_boundary" not in df.columns:
         df["is_boundary"] = 0.0
     df = df[VAR_NAMES + ALL_OUTPUT_NAMES + ["is_boundary"]].copy()
-    df["nBl"] = np.clip(np.round(df["nBl"]), 9, 12).astype(int)
+    nbl_idx = VAR_NAMES.index("nBl")
+    df["nBl"] = np.clip(np.round(df["nBl"]), L_BOUNDS[nbl_idx], U_BOUNDS[nbl_idx]).astype(int)
     df = df.drop_duplicates(subset=VAR_NAMES, keep="first").reset_index(drop=True)
     return df
 
@@ -253,9 +277,9 @@ def build_front_dataframe(df: pd.DataFrame, geom_warn_clf=None, geom_safe_thresh
         geom_ok
         & (p_geom_safe >= geom_safe_threshold)
         & (y_pool[:, 0] >= 0.45)
-        & (y_pool[:, 1] >= 1.60)
-        & (y_pool[:, 1] <= 2.85)
-        & (y_pool[:, 3] >= 3.60)
+        & (y_pool[:, 1] >= MIN_PRESSURE_RATIO)
+        & (y_pool[:, 1] <= MAX_PRESSURE_RATIO)
+        & (y_pool[:, 3] >= BOUNDARY_FLOW_G_S)
     )
 
     df_feas = df.loc[feas_mask].copy().reset_index(drop=True)
@@ -339,10 +363,10 @@ def compute_engineering_front_scores(front: pd.DataFrame, full_df: pd.DataFrame,
     knee_score = front_knee_scores(ranked)
     stability_penalty = local_output_stability(ranked, full_df)
 
-    flow_margin = np.maximum(0.0, y[:, 2] - 3.60)
-    eff_margin = np.maximum(0.0, y[:, 0] - 0.60)
-    pr_upper_margin = np.maximum(0.0, 2.85 - y[:, 1])
-    pr_lower_margin = np.maximum(0.0, y[:, 1] - 1.60)
+    flow_margin = np.maximum(0.0, y[:, 2] - BOUNDARY_FLOW_G_S)
+    eff_margin = np.maximum(0.0, y[:, 0] - MIN_EFFICIENCY)
+    pr_upper_margin = np.maximum(0.0, MAX_PRESSURE_RATIO - y[:, 1])
+    pr_lower_margin = np.maximum(0.0, y[:, 1] - MIN_PRESSURE_RATIO)
     pr_margin = np.minimum(pr_upper_margin, pr_lower_margin)
 
     ranges = {
@@ -468,10 +492,10 @@ def score_inverse_candidates(
     geom_penalty = 200.0 * np.sum(np.maximum(0.0, geom_v) ** 2, axis=1)
     geom_margin_bonus = -0.15 * np.maximum(0.0, -np.max(geom_v, axis=1))
 
-    mf_penalty = 80.0 * np.maximum(0.0, 3.60 - mf) ** 2
-    eff_low_penalty = 80.0 * np.maximum(0.0, 0.60 - eff) ** 2
-    pr_low_penalty = 60.0 * np.maximum(0.0, 1.60 - pr) ** 2
-    pr_high_penalty = 60.0 * np.maximum(0.0, pr - 2.85) ** 2
+    mf_penalty = 80.0 * np.maximum(0.0, BOUNDARY_FLOW_G_S - mf) ** 2
+    eff_low_penalty = 80.0 * np.maximum(0.0, MIN_EFFICIENCY - eff) ** 2
+    pr_low_penalty = 60.0 * np.maximum(0.0, MIN_PRESSURE_RATIO - pr) ** 2
+    pr_high_penalty = 60.0 * np.maximum(0.0, pr - MAX_PRESSURE_RATIO) ** 2
 
     x_norm = scaler_x.transform(x_raw)
     train_x_norm = scaler_x.transform(train_x_raw)

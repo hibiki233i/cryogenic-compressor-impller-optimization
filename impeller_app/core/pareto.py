@@ -16,7 +16,7 @@ class ParetoService:
         os.environ["IMPELLER_DESIGN_VARIABLES_PATH"] = str(self.config.workspace.design_variables_json)
         self.pareto = pareto_module()
         if hasattr(self.pareto, "configure_runtime"):
-            self.pareto.configure_runtime(str(self.config.workspace.design_variables_json))
+            self.pareto.configure_runtime(str(self.config.workspace.design_variables_json), **self.config.legacy_overrides())
         self.exporter = export_module()
 
     def compute_pareto_front(self) -> TaskResult:

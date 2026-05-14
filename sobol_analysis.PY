@@ -13,6 +13,7 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from design_variables import lower_bounds, load_variable_specs, upper_bounds, variable_names
 
 try:
     from SALib.sample import saltelli
@@ -26,25 +27,20 @@ warnings.filterwarnings("ignore", category=UserWarning)
 # =============================================================================
 # 与主程序统一配置
 # =============================================================================
-VAR_NAMES = [
-    'd1s', 'dH', 'beta1hb', 'beta1sb', 'd2', 'b2', 'beta2hb', 'beta2sb',
-    'Lz', 't', 'TipClear', 'nBl', 'rake_te_s', 'P_out'
-]
+DESIGN_VARIABLES_PATH = os.environ.get("IMPELLER_DESIGN_VARIABLES_PATH", "design_variables.json")
+_VARIABLE_SPECS = load_variable_specs(DESIGN_VARIABLES_PATH)
+VAR_NAMES = variable_names(_VARIABLE_SPECS)
 NBL_IDX = VAR_NAMES.index('nBl')
 P_OUT_IDX = VAR_NAMES.index('P_out')
 
 TARGET_PR_NAME = "totalpressureratio"
 OUTPUT_NAMES = ['Efficiency', TARGET_PR_NAME, 'MassFlow']
 
-L_BOUNDS = np.array([
-    0.34, 0.044, 70.0, 20.0, 0.45, 0.044, 40.0, 40.0,
-    0.185, 0.0015, 0.0007, 9, -25.0, 8.0
-], dtype=float)
-
-U_BOUNDS = np.array([
-    0.42, 0.056, 84.0, 35.0, 0.53, 0.056, 54.0, 55.0,
-    0.215, 0.0035, 0.0015, 12, -15.0, 13.0
-], dtype=float)
+L_BOUNDS = lower_bounds(_VARIABLE_SPECS)
+U_BOUNDS = upper_bounds(_VARIABLE_SPECS)
+MIN_D2_D1S_GAP = float(os.environ.get("IMPELLER_MIN_D2_D1S_GAP", 0.070))
+MAX_LE_SWEEP_DIFF = float(os.environ.get("IMPELLER_MAX_LE_SWEEP_DIFF", 52.0))
+MAX_EXIT_ANGLE_DIFF = float(os.environ.get("IMPELLER_MAX_EXIT_ANGLE_DIFF", 13.5))
 
 TRAINING_CSV = "Compressor_Training_Data.csv"
 BEST_MODEL_PATH = "best_regressor.pth"
@@ -127,25 +123,27 @@ def snap_discrete_vars(X: np.ndarray) -> np.ndarray:
     X = np.array(X, dtype=float, copy=True)
     if X.ndim == 1:
         X = X[None, :]
-    X[:, 11] = np.clip(np.round(X[:, 11]), 9, 12)
+    X[:, NBL_IDX] = np.clip(np.round(X[:, NBL_IDX]), L_BOUNDS[NBL_IDX], U_BOUNDS[NBL_IDX])
     return X
 
 
 def geometry_rule_violations(X: np.ndarray) -> np.ndarray:
     X = snap_discrete_vars(X)
     d1s, dH, beta1hb, beta1sb, d2, b2, beta2hb, beta2sb, Lz, t, TipClear, nBl, rake_te_s, P_out = X.T
+    lower = {name: L_BOUNDS[idx] for idx, name in enumerate(VAR_NAMES)}
+    upper = {name: U_BOUNDS[idx] for idx, name in enumerate(VAR_NAMES)}
 
-    g1 = 0.070 - (d2 - d1s)
-    g2 = 0.044 - b2
-    g3 = t - 0.0035
-    g4 = 0.0007 - TipClear
-    g5 = TipClear - 0.0015
-    g6 = (beta1hb - beta1sb) - 62.0
-    g7 = np.abs(beta2hb - beta2sb) - 13.5
-    g8 = 0.185 - Lz
-    g9 = Lz - 0.215
-    g10 = rake_te_s + 15.0
-    g11 = -25.0 - rake_te_s
+    g1 = MIN_D2_D1S_GAP - (d2 - d1s)
+    g2 = lower["b2"] - b2
+    g3 = t - upper["t"]
+    g4 = lower["TipClear"] - TipClear
+    g5 = TipClear - upper["TipClear"]
+    g6 = (beta1hb - beta1sb) - MAX_LE_SWEEP_DIFF
+    g7 = np.abs(beta2hb - beta2sb) - MAX_EXIT_ANGLE_DIFF
+    g8 = lower["Lz"] - Lz
+    g9 = Lz - upper["Lz"]
+    g10 = rake_te_s - upper["rake_te_s"]
+    g11 = lower["rake_te_s"] - rake_te_s
 
     return np.column_stack([g1, g2, g3, g4, g5, g6, g7, g8, g9, g10, g11])
 
@@ -162,7 +160,7 @@ def load_and_clean_data(csv_path: str) -> pd.DataFrame:
     use_cols = VAR_NAMES + OUTPUT_NAMES + ['is_boundary']
     df = df[use_cols].copy()
 
-    df['nBl'] = np.clip(np.round(df['nBl']), 9, 12).astype(int)
+    df['nBl'] = np.clip(np.round(df['nBl']), L_BOUNDS[NBL_IDX], U_BOUNDS[NBL_IDX]).astype(int)
     df = df.drop_duplicates(subset=VAR_NAMES, keep='first').reset_index(drop=True)
     return df
 

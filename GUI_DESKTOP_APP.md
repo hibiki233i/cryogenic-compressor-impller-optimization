@@ -55,11 +55,12 @@ Notes:
 - `impeller_app/runner/`
   External runner API for PowerShell geometry generation, CFX execution, DOE recovery, and batch DOE execution.
 - `impeller_app/gui/`
-  PySide6 desktop GUI with 5 tabs:
+  PySide6 desktop GUI with workflow tabs:
   - Environment
   - DOE
   - Active Learning
   - Pareto
+  - Sobol
   - Export
 
 ## Current Capabilities
@@ -67,6 +68,7 @@ Notes:
 - Environment validation for PowerShell, geometry script, CFX executables, templates, and training CSV
 - DOE run recovery by scanning `Run_*` folders and rebuilding `Compressor_Training_Data.csv`
 - DOE batch execution with persistent `extra_samples.json`
+- Configurable default engineering parameters for flow filtering, performance limits, and geometry feasibility rules
 - Surrogate training from the desktop app
 - Active-learning resume and iterative execution
 - Pareto front generation, query, and case export
@@ -78,3 +80,4 @@ Notes:
 - `NN_NSGA2_ActiveLearning_refactored.py` and `cfx_runner.py` now accept configuration overrides so the GUI is no longer blocked on hardcoded paths.
 - `windows-app-config.template.json` is included as a deployment checklist for Windows target machines.
 - The GUI now persists edited paths and runtime parameters to `%APPDATA%\BOUNDYR\impeller-app-config.json` on Windows and reloads them automatically at startup.
+- DOE, active learning, and Pareto ranking use configurable default engineering thresholds instead of single-case hardcoded constants.

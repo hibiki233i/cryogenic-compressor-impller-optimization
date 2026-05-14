@@ -75,6 +75,20 @@ class RuntimeSettings:
     rpm: float = 10000.0
     mass_flow: float = 0.0036
     alpha0: float = 0.0
+    default_invalid_flow_g_s: float = 0.1
+    default_discard_flow_g_s: float = 0.0001
+    default_boundary_flow_g_s: float = 3.6
+    default_min_efficiency: float = 0.60
+    default_min_power: float = 60.0
+    default_min_pressure_ratio: float = 1.60
+    default_max_pressure_ratio: float = 2.85
+    default_min_d2_d1s_gap: float = 0.070
+    default_max_le_sweep_diff: float = 52.0
+    default_max_exit_angle_diff: float = 13.5
+    default_min_rake_te_s_nbl_9: float = -18.0
+    default_min_rake_te_s_nbl_10: float = -19.0
+    default_min_rake_te_s_nbl_11: float = -20.0
+    default_min_rake_te_s_nbl_12: float = -21.0
     doe_initial_samples: int = 300
     doe_target_samples: int = 300
     active_learning_additional_iters: int = 1
@@ -106,9 +120,10 @@ class AppConfig:
             runtime=self.runtime,
         )
 
-    def legacy_overrides(self) -> dict[str, str]:
+    def legacy_overrides(self) -> dict:
         cfg = self.resolved()
         ws = cfg.workspace
+        runtime = cfg.runtime
         return {
             "PS_SCRIPT_PATH": str(cfg.solver.geometry_script_path),
             "AL_WORKING_BASE": str(ws.active_learning_runs_dir),
@@ -123,6 +138,22 @@ class AppConfig:
             "POOL_CHECKPOINT_CSV": str(ws.pool_checkpoint_csv),
             "CHECKPOINT_META_PATH": str(ws.checkpoint_meta_json),
             "DESIGN_VARIABLES_PATH": str(ws.design_variables_json),
+            "MIN_VALID_FLOW_G_S": float(runtime.default_invalid_flow_g_s),
+            "MIN_DISCARD_FLOW_G_S": float(runtime.default_discard_flow_g_s),
+            "BOUNDARY_FLOW_G_S": float(runtime.default_boundary_flow_g_s),
+            "MIN_EFFICIENCY": float(runtime.default_min_efficiency),
+            "MIN_POWER": float(runtime.default_min_power),
+            "MIN_PRESSURE_RATIO": float(runtime.default_min_pressure_ratio),
+            "MAX_PRESSURE_RATIO": float(runtime.default_max_pressure_ratio),
+            "MIN_D2_D1S_GAP": float(runtime.default_min_d2_d1s_gap),
+            "MAX_LE_SWEEP_DIFF": float(runtime.default_max_le_sweep_diff),
+            "MAX_EXIT_ANGLE_DIFF": float(runtime.default_max_exit_angle_diff),
+            "MIN_RAKE_TE_S_BY_NBL": {
+                9: float(runtime.default_min_rake_te_s_nbl_9),
+                10: float(runtime.default_min_rake_te_s_nbl_10),
+                11: float(runtime.default_min_rake_te_s_nbl_11),
+                12: float(runtime.default_min_rake_te_s_nbl_12),
+            },
         }
 
     def to_dict(self) -> dict:

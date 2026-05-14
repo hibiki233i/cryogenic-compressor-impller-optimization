@@ -72,6 +72,21 @@ TEXTS = {
         "doe_initial_samples": "Initial LHS Samples",
         "doe_target_samples": "Target Samples",
         "doe_runs_dir": "DOE Runs Dir",
+        "engineering_defaults_group": "Default Engineering Parameters",
+        "default_invalid_flow_g_s": "Invalid Flow (g/s)",
+        "default_discard_flow_g_s": "Discard Flow (g/s)",
+        "default_boundary_flow_g_s": "Boundary Flow (g/s)",
+        "default_min_efficiency": "Minimum Efficiency",
+        "default_min_power": "Minimum Power",
+        "default_min_pressure_ratio": "Minimum Pressure Ratio",
+        "default_max_pressure_ratio": "Maximum Pressure Ratio",
+        "default_min_d2_d1s_gap": "Minimum d2-d1s Gap",
+        "default_max_le_sweep_diff": "Maximum LE Sweep Diff",
+        "default_max_exit_angle_diff": "Maximum Exit Angle Diff",
+        "default_min_rake_te_s_nbl_9": "Minimum rake_te_s (nBl=9)",
+        "default_min_rake_te_s_nbl_10": "Minimum rake_te_s (nBl=10)",
+        "default_min_rake_te_s_nbl_11": "Minimum rake_te_s (nBl=11)",
+        "default_min_rake_te_s_nbl_12": "Minimum rake_te_s (nBl=12)",
         "variable_ranges_group": "Design Variable Ranges",
         "variable_name": "Variable",
         "lower_bound": "Lower",
@@ -138,6 +153,21 @@ TEXTS = {
         "doe_initial_samples": "初始 LHS 样本数",
         "doe_target_samples": "目标样本数",
         "doe_runs_dir": "DOE 运行目录",
+        "engineering_defaults_group": "默认工程参数",
+        "default_invalid_flow_g_s": "无效流量阈值 (g/s)",
+        "default_discard_flow_g_s": "丢弃流量阈值 (g/s)",
+        "default_boundary_flow_g_s": "边界流量阈值 (g/s)",
+        "default_min_efficiency": "最低效率",
+        "default_min_power": "最低功率",
+        "default_min_pressure_ratio": "最低压比",
+        "default_max_pressure_ratio": "最高压比",
+        "default_min_d2_d1s_gap": "最小 d2-d1s 差值",
+        "default_max_le_sweep_diff": "最大前缘角差",
+        "default_max_exit_angle_diff": "最大出口角差",
+        "default_min_rake_te_s_nbl_9": "最小 rake_te_s (nBl=9)",
+        "default_min_rake_te_s_nbl_10": "最小 rake_te_s (nBl=10)",
+        "default_min_rake_te_s_nbl_11": "最小 rake_te_s (nBl=11)",
+        "default_min_rake_te_s_nbl_12": "最小 rake_te_s (nBl=12)",
         "variable_ranges_group": "设计变量范围",
         "variable_name": "变量",
         "lower_bound": "下界",
@@ -291,6 +321,14 @@ class MainWindow(QMainWindow):
         self._form_labels[key] = label
         form.addRow(label, field)
 
+    def _double_spin(self, value: float, decimals: int, minimum: float, maximum: float, step: float) -> QDoubleSpinBox:
+        spin = QDoubleSpinBox()
+        spin.setDecimals(decimals)
+        spin.setRange(minimum, maximum)
+        spin.setSingleStep(step)
+        spin.setValue(value)
+        return spin
+
     def _build_environment_tab(self):
         page = QWidget()
         wrapper = QVBoxLayout(page)
@@ -348,6 +386,39 @@ class MainWindow(QMainWindow):
         self._add_form_row(form, "doe_target_samples", self.doe_target_samples)
         self._add_form_row(form, "doe_runs_dir", self.doe_runs_dir)
         layout.addWidget(self.doe_group)
+
+        self.engineering_defaults_group = QGroupBox()
+        defaults_form = QFormLayout(self.engineering_defaults_group)
+        runtime = self.config.runtime
+        self.default_invalid_flow_g_s = self._double_spin(runtime.default_invalid_flow_g_s, 4, 0.0, 1_000_000.0, 0.1)
+        self.default_discard_flow_g_s = self._double_spin(runtime.default_discard_flow_g_s, 6, 0.0, 1_000_000.0, 0.0001)
+        self.default_boundary_flow_g_s = self._double_spin(runtime.default_boundary_flow_g_s, 4, 0.0, 1_000_000.0, 0.1)
+        self.default_min_efficiency = self._double_spin(runtime.default_min_efficiency, 4, 0.0, 1.0, 0.01)
+        self.default_min_power = self._double_spin(runtime.default_min_power, 4, 0.0, 1_000_000.0, 1.0)
+        self.default_min_pressure_ratio = self._double_spin(runtime.default_min_pressure_ratio, 4, 0.0, 100.0, 0.05)
+        self.default_max_pressure_ratio = self._double_spin(runtime.default_max_pressure_ratio, 4, 0.0, 100.0, 0.05)
+        self.default_min_d2_d1s_gap = self._double_spin(runtime.default_min_d2_d1s_gap, 6, -1_000.0, 1_000.0, 0.001)
+        self.default_max_le_sweep_diff = self._double_spin(runtime.default_max_le_sweep_diff, 3, 0.0, 180.0, 1.0)
+        self.default_max_exit_angle_diff = self._double_spin(runtime.default_max_exit_angle_diff, 3, 0.0, 180.0, 1.0)
+        self.default_min_rake_te_s_nbl_9 = self._double_spin(runtime.default_min_rake_te_s_nbl_9, 3, -180.0, 180.0, 1.0)
+        self.default_min_rake_te_s_nbl_10 = self._double_spin(runtime.default_min_rake_te_s_nbl_10, 3, -180.0, 180.0, 1.0)
+        self.default_min_rake_te_s_nbl_11 = self._double_spin(runtime.default_min_rake_te_s_nbl_11, 3, -180.0, 180.0, 1.0)
+        self.default_min_rake_te_s_nbl_12 = self._double_spin(runtime.default_min_rake_te_s_nbl_12, 3, -180.0, 180.0, 1.0)
+        self._add_form_row(defaults_form, "default_invalid_flow_g_s", self.default_invalid_flow_g_s)
+        self._add_form_row(defaults_form, "default_discard_flow_g_s", self.default_discard_flow_g_s)
+        self._add_form_row(defaults_form, "default_boundary_flow_g_s", self.default_boundary_flow_g_s)
+        self._add_form_row(defaults_form, "default_min_efficiency", self.default_min_efficiency)
+        self._add_form_row(defaults_form, "default_min_power", self.default_min_power)
+        self._add_form_row(defaults_form, "default_min_pressure_ratio", self.default_min_pressure_ratio)
+        self._add_form_row(defaults_form, "default_max_pressure_ratio", self.default_max_pressure_ratio)
+        self._add_form_row(defaults_form, "default_min_d2_d1s_gap", self.default_min_d2_d1s_gap)
+        self._add_form_row(defaults_form, "default_max_le_sweep_diff", self.default_max_le_sweep_diff)
+        self._add_form_row(defaults_form, "default_max_exit_angle_diff", self.default_max_exit_angle_diff)
+        self._add_form_row(defaults_form, "default_min_rake_te_s_nbl_9", self.default_min_rake_te_s_nbl_9)
+        self._add_form_row(defaults_form, "default_min_rake_te_s_nbl_10", self.default_min_rake_te_s_nbl_10)
+        self._add_form_row(defaults_form, "default_min_rake_te_s_nbl_11", self.default_min_rake_te_s_nbl_11)
+        self._add_form_row(defaults_form, "default_min_rake_te_s_nbl_12", self.default_min_rake_te_s_nbl_12)
+        layout.addWidget(self.engineering_defaults_group)
 
         self.variable_ranges_group = QGroupBox()
         range_layout = QGridLayout(self.variable_ranges_group)
@@ -465,7 +536,8 @@ class MainWindow(QMainWindow):
         self.sobol_group = QGroupBox()
         form = QFormLayout(self.sobol_group)
         self.sobol_fixed_nbl = QSpinBox()
-        self.sobol_fixed_nbl.setRange(9, 12)
+        nbl_spec = next((spec for spec in self.variable_specs if spec["name"] == "nBl"), {"lower": 9, "upper": 12})
+        self.sobol_fixed_nbl.setRange(int(round(float(nbl_spec["lower"]))), int(round(float(nbl_spec["upper"]))))
         self.sobol_fixed_nbl.setValue(self.config.runtime.sobol_fixed_nbl)
         self.sobol_base_n = QSpinBox()
         self.sobol_base_n.setRange(128, 100000)
@@ -523,6 +595,7 @@ class MainWindow(QMainWindow):
 
         self.environment_group.setTitle(self.tr("environment_group"))
         self.doe_group.setTitle(self.tr("doe_group"))
+        self.engineering_defaults_group.setTitle(self.tr("engineering_defaults_group"))
         self.variable_ranges_group.setTitle(self.tr("variable_ranges_group"))
         self.active_learning_group.setTitle(self.tr("active_learning_group"))
         self.pareto_group.setTitle(self.tr("pareto_group"))
@@ -611,6 +684,20 @@ class MainWindow(QMainWindow):
             rpm=self.config.runtime.rpm,
             mass_flow=self.config.runtime.mass_flow,
             alpha0=self.config.runtime.alpha0,
+            default_invalid_flow_g_s=self.default_invalid_flow_g_s.value(),
+            default_discard_flow_g_s=self.default_discard_flow_g_s.value(),
+            default_boundary_flow_g_s=self.default_boundary_flow_g_s.value(),
+            default_min_efficiency=self.default_min_efficiency.value(),
+            default_min_power=self.default_min_power.value(),
+            default_min_pressure_ratio=self.default_min_pressure_ratio.value(),
+            default_max_pressure_ratio=self.default_max_pressure_ratio.value(),
+            default_min_d2_d1s_gap=self.default_min_d2_d1s_gap.value(),
+            default_max_le_sweep_diff=self.default_max_le_sweep_diff.value(),
+            default_max_exit_angle_diff=self.default_max_exit_angle_diff.value(),
+            default_min_rake_te_s_nbl_9=self.default_min_rake_te_s_nbl_9.value(),
+            default_min_rake_te_s_nbl_10=self.default_min_rake_te_s_nbl_10.value(),
+            default_min_rake_te_s_nbl_11=self.default_min_rake_te_s_nbl_11.value(),
+            default_min_rake_te_s_nbl_12=self.default_min_rake_te_s_nbl_12.value(),
             doe_initial_samples=self.doe_initial_samples.value(),
             doe_target_samples=self.doe_target_samples.value(),
             active_learning_additional_iters=self.al_iters.value(),
@@ -620,6 +707,10 @@ class MainWindow(QMainWindow):
             sobol_use_al_samples=self.sobol_use_al_samples.isChecked(),
             sobol_tag=self.sobol_tag.text().strip(),
         )
+        if runtime.default_min_pressure_ratio >= runtime.default_max_pressure_ratio:
+            raise ValueError("default_min_pressure_ratio must be lower than default_max_pressure_ratio")
+        if runtime.default_discard_flow_g_s > runtime.default_boundary_flow_g_s:
+            raise ValueError("default_discard_flow_g_s must not exceed default_boundary_flow_g_s")
         return AppConfig(solver=solver, workspace=workspace, runtime=runtime)
 
     def _persist_current_config(self) -> AppConfig:

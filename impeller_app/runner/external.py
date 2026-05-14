@@ -12,8 +12,6 @@ from ..config import AppConfig
 from ..models import TaskResult, TaskUpdate
 from cfx_runner import run_cfx_pipeline
 from design_variables import ensure_training_csv, load_variable_specs, lower_bounds, training_csv_columns, upper_bounds, variable_names
-MIN_NORMAL = 3.6
-MIN_DISCARD = 0.0001
 
 
 def _emit(progress_callback, message: str, progress=None, metrics=None):
@@ -28,6 +26,8 @@ class RunnerAPI:
         self.variable_names = variable_names(self.variable_specs)
         self.l_bounds = lower_bounds(self.variable_specs)
         self.u_bounds = upper_bounds(self.variable_specs)
+        self.min_discard_flow_g_s = float(self.config.runtime.default_discard_flow_g_s)
+        self.boundary_flow_g_s = float(self.config.runtime.default_boundary_flow_g_s)
 
     def validate_environment(self) -> TaskResult:
         cfg = self.config
@@ -117,7 +117,7 @@ class RunnerAPI:
         row = dict(sample)
         nbl = int(round(float(row["nBl"])))
         mass_flow = float(raw_values[3]) * nbl
-        if mass_flow < MIN_DISCARD:
+        if mass_flow < self.min_discard_flow_g_s:
             return None
         row["nBl"] = nbl
         row["Efficiency"] = float(raw_values[0])
@@ -125,7 +125,7 @@ class RunnerAPI:
         row["Power"] = float(raw_values[2]) * nbl
         row["MassFlow"] = mass_flow
         row["totalpressureratio"] = float(raw_values[4])
-        row["is_boundary"] = 1 if mass_flow < MIN_NORMAL else 0
+        row["is_boundary"] = 1 if mass_flow < self.boundary_flow_g_s else 0
         return row
 
     def _read_result_file(self, result_txt: Path, sample: dict) -> dict | None:
@@ -260,9 +260,9 @@ class RunnerAPI:
             "Power": float(cfx_result.metrics["Power"]),
             "MassFlow": float(cfx_result.metrics["MassFlow"]),
             "totalpressureratio": float(cfx_result.metrics["totalpressureratio"]),
-            "is_boundary": 1 if float(cfx_result.metrics["MassFlow"]) < MIN_NORMAL else 0,
+            "is_boundary": 1 if float(cfx_result.metrics["MassFlow"]) < self.boundary_flow_g_s else 0,
         }
-        if float(row["MassFlow"]) < MIN_DISCARD:
+        if float(row["MassFlow"]) < self.min_discard_flow_g_s:
             return TaskResult(status="failed", message=f"{run_id}: divergent MassFlow, discarded.", metrics=row, artifacts={"working_dir": str(working_dir)})
         self._append_training_row(row)
         return TaskResult(status="succeeded", message=f"{run_id}: DOE sample completed.", metrics=row, artifacts={"working_dir": str(working_dir)})

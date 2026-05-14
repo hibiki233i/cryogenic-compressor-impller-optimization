@@ -5,11 +5,19 @@ import os
 import re
 import json
 import time
+from pathlib import Path
 from scipy.stats import qmc
 from cfx_runner import run_cfx_pipeline
-import os
 import glob
 from design_variables import ensure_training_csv, load_variable_specs, lower_bounds, training_csv_columns, upper_bounds, variable_names
+
+
+PROJECT_ROOT = Path(os.environ.get("IMPELLER_PROJECT_ROOT", Path.cwd()))
+
+
+def _env_float(name, default):
+    value = os.environ.get(name)
+    return float(value) if value not in (None, "") else float(default)
 
 def clean_old_results(base_dir, filename="CFX_Results.txt"):
     """
@@ -17,8 +25,7 @@ def clean_old_results(base_dir, filename="CFX_Results.txt"):
     """
     print(f"=== 开始清理历史结果文件 ({filename}) ===")
     
-    # 构造递归搜索路径，例如：F:/optimazition/**/*.txt
-    # 注意：recursive=True 需要 Python 3.5+
+    # 构造递归搜索路径，清理当前 DOE 工作目录下的历史结果。
     search_pattern = os.path.join(base_dir, '**', filename)
     old_files = glob.glob(search_pattern, recursive=True)
     
@@ -40,9 +47,10 @@ CREATE_NO_WINDOW = 0x08000000 if os.name == 'nt' else 0
 # =============================================================================
 num_samples = 300
 input_dim = 14
-MIN_VALID = 0.1   # g/s，低于该值视为数值发散噪声
-MIN_NORMAL = 3.6  # g/s，低于该值视为边界样本
-# 高于 MIN_NORMAL 视为正常工况数据
+MIN_VALID = _env_float("IMPELLER_MIN_VALID_FLOW_G_S", 0.1)
+MIN_DISCARD = _env_float("IMPELLER_MIN_DISCARD_FLOW_G_S", 0.0001)
+MIN_NORMAL = _env_float("IMPELLER_BOUNDARY_FLOW_G_S", 3.6)
+# 以上为默认工程参数，可通过环境变量或 GUI 配置覆盖。
 
 # 加载设计变量名称及上下界
 variable_specs = load_variable_specs()
@@ -58,8 +66,8 @@ samples = [dict(zip(var_names, row)) for row in sample_real]
 # =====================================================================
 # 2. Python 循环驱动 PowerShell
 # =====================================================================
-ps_script_path = r"F:\optimazition\Run-GeometryMeshing.ps1"
-working_dir_base = r"F:\optimazition\Runs"
+ps_script_path = os.environ.get("IMPELLER_PS_SCRIPT_PATH", str(PROJECT_ROOT / "Run-GeometryMeshing.ps1"))
+working_dir_base = os.environ.get("IMPELLER_DOE_WORKING_BASE", str(PROJECT_ROOT / "Runs"))
 output_csv = "Compressor_Training_Data.csv"
 EXTRA_SAMPLES_FILE = "extra_samples.json"
 # =====================================================================
@@ -102,7 +110,6 @@ def recover_progress(working_dir_base, output_csv,samples, extra_samples):
         successful_count : int  —— CSV 中已有的有效行数
         current_idx      : int  —— 下一个待运行的样本索引
     """
-    MIN_DISCARD = 0.0001 
     columns = var_names + ['Efficiency', 'PressureRatio', 'Power', 'MassFlow', 'totalpressureratio', 'is_boundary']
 
     recovered_rows = []     # 完整可写入 CSV 的数据行
@@ -368,14 +375,13 @@ def run_single_sample(i, p):
             # 未知异常保守处理：继续重试
 
     return False, run_id, last_error
-doe_working_dir = r"F:\optimazition\Runs"
+doe_working_dir = working_dir_base
 clean_old_results(doe_working_dir, filename="CFX_Results.txt")
 
 # =====================================================================
 # 6. 主循环：串行驱动，含喘振点过滤
 # =====================================================================
 target_samples = 300  
-MIN_DISCARD    = 0.0001   
 
 # 加载上次已生成的动态补充点（用于断点续跑时的索引对齐）
 extra_ptr = max(0, current_idx - len(samples))
