@@ -233,6 +233,38 @@ function Ensure-TurboGridExportAction {
     [void]$components.AppendChild($value)
 }
 
+function Set-TurboGridExportSettings {
+    param(
+        [string]$CftPath,
+        [string]$ExportDir
+    )
+
+    if (-not (Test-Path $CftPath)) {
+        throw "CFturbo project file not found: $CftPath"
+    }
+
+    $cftXml = [xml](Get-Content -Path $CftPath -Raw)
+    $tgInterface = $cftXml.SelectSingleNode("//TTurboGridExportInterface")
+    if ($null -eq $tgInterface) {
+        Write-Warning "当前 .cft 文件没有 TTurboGridExportInterface，无法预设 TurboGrid 导出目录。"
+        return
+    }
+
+    [void](Set-ChildText -Xml $cftXml -Parent $tgInterface -Name "BaseFileName" -Value "Impeller")
+    [void](Set-ChildText -Xml $cftXml -Parent $tgInterface -Name "ExportDir" -Value $ExportDir)
+    [void](Set-ChildText -Xml $cftXml -Parent $tgInterface -Name "TurboGridFormat" -Value "tgfTSE" -Attributes @{ Type = "Enum" })
+    $cftXml.Save($CftPath)
+}
+
+function Test-CurveExport {
+    param(
+        [string]$Hub,
+        [string]$Shroud,
+        [string]$Profile
+    )
+    return ((Test-Path $Hub) -and (Test-Path $Shroud) -and (Test-Path $Profile))
+}
+
 # ==============================================================================
 # 0. 环境与路径准备
 # ==============================================================================                                                                                                                                                                                                                            
@@ -253,8 +285,12 @@ $Export_Shroud  = Join-Path $WorkingDir "Impeller_shroud.curve"
 $Export_Profile = Join-Path $WorkingDir "Impeller_profile.curve"
 $Export_Mesh    = Join-Path $WorkingDir "Impeller_Mesh.gtm"
 $Geometry_Summary = Join-Path $WorkingDir "geometry_summary.json"
+$cftLogPath = Join-Path $WorkingDir "run_cfturbo.log"
+$cftExportLogPath = Join-Path $WorkingDir "run_cfturbo_export.log"
+$Modified_CFT_Model = Join-Path $WorkingDir "0908-2_modified.cft"
 # 在生成网格之前，把原始 cft 复制到当前计算目录
 Copy-Item -Path $BaseCft -Destination $Input_CFT_Model -Force
+Set-TurboGridExportSettings -CftPath $Input_CFT_Model -ExportDir $WorkingDir
 
 
 Write-Host ">>> 开始执行几何与网格生成流水线..." -ForegroundColor Cyan
@@ -336,7 +372,7 @@ if (Test-Path $Source_CFT_Model) {
 }
 
 # 2. 启动 CFturbo
-$cftProcess = Start-Process -FilePath $CFturbo_Exe -ArgumentList "-batch `"$Current_CFT`"" -WorkingDirectory $WorkingDir -Wait -PassThru -NoNewWindow
+$cftProcess = Start-Process -FilePath $CFturbo_Exe -ArgumentList "-batch `"$Current_CFT`" -verbose -log `"$cftLogPath`"" -WorkingDirectory $WorkingDir -Wait -PassThru -NoNewWindow
 
 if ($cftProcess.ExitCode -eq 2) {
     Write-Warning "CFturbo 几何生成失败 (ExitCode=2)，退出。"
@@ -349,17 +385,33 @@ if ($cftProcess.ExitCode -eq 2) {
     exit 1
 }
 
-# 不管 exit code 是 0 还是 1，验证关键输出文件
-if (-not (Test-Path $Export_Hub) -or 
-    -not (Test-Path $Export_Shroud) -or 
-    -not (Test-Path $Export_Profile)) {
+# 不管 exit code 是 0 还是 1，先验证关键输出文件。
+# 某些 CFturbo 模板只保存 .cft/.cft-res，不执行 batch Export；
+# 此时用保存后的 .cft 按官方 batch project-file 导出方式再试一次。
+if (-not (Test-CurveExport -Hub $Export_Hub -Shroud $Export_Shroud -Profile $Export_Profile)) {
+    if (Test-Path $Modified_CFT_Model) {
+        Write-Warning "CFturbo batch 未直接生成 curve，尝试用保存后的 .cft 执行 -export TurboGrid..."
+        Set-TurboGridExportSettings -CftPath $Modified_CFT_Model -ExportDir $WorkingDir
+        $exportProcess = Start-Process -FilePath $CFturbo_Exe -ArgumentList "-batch `"$Modified_CFT_Model`" -export TurboGrid -verbose -log `"$cftExportLogPath`"" -WorkingDirectory $WorkingDir -Wait -PassThru -NoNewWindow
+        if ($exportProcess.ExitCode -ne 0 -and $exportProcess.ExitCode -ne 1) {
+            Write-Warning "CFturbo 二次导出失败 (ExitCode=$($exportProcess.ExitCode))。"
+        }
+    } else {
+        Write-Warning "未找到保存后的 CFturbo 工程文件，无法执行二次 TurboGrid 导出: $Modified_CFT_Model"
+    }
+}
+
+if (-not (Test-CurveExport -Hub $Export_Hub -Shroud $Export_Shroud -Profile $Export_Profile)) {
     Write-Warning "CFturbo 未生成 TurboGrid curve 文件。请检查 batch Export 动作、CFturbo 许可证/导出接口，以及当前工作目录写入权限。"
     Write-Warning "期望文件: $Export_Hub | $Export_Shroud | $Export_Profile"
+    Write-Warning "CFturbo 日志: $cftLogPath"
+    Write-Warning "CFturbo 二次导出日志: $cftExportLogPath"
+    Write-Warning "当前目录文件:"
+    Get-ChildItem -Path $WorkingDir | ForEach-Object { Write-Warning ("    " + $_.Name) }
     exit 1
 }
 Write-Host "CFturbo curve 文件验证通过，继续网格划分..."
 # ===== CFturbo 运行完成后，解析 log 文件 =====
-$cftLogPath = Join-Path $WorkingDir "run_cfturbo.log"
 $cftResPath = Join-Path $WorkingDir "0908-2.cft-res"
 
 # 定义致命警告关键词（出现任意一个即拦截）
