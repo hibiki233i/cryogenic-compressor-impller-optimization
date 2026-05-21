@@ -42,6 +42,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--case-prefix", default="ParetoCase", help="Per-folder name prefix.")
     parser.add_argument("--base-cft", default=None, help="Optional base .cft file to copy into each case folder.")
     parser.add_argument("--cft-batch-template", default=None, help="Optional CFturbo XML batch template to modify into run_cfturbo.cft-batch.")
+    parser.add_argument("--mass-flow", type=float, default=0.0036, help="Mass flow written to generated CFturbo batch files.")
+    parser.add_argument("--rpm", type=float, default=10000.0, help="Rotational speed in rpm written to generated CFturbo batch files.")
     parser.add_argument("--force", action="store_true", help="Overwrite existing case folders if they already exist.")
     return parser.parse_args()
 
@@ -143,7 +145,13 @@ def set_xml_text(root: ET.Element, xpath: str, value: str) -> None:
     node.text = value
 
 
-def create_cft_batch_from_template(template_path: str, dest_path: str, row: pd.Series) -> None:
+def create_cft_batch_from_template(
+    template_path: str,
+    dest_path: str,
+    row: pd.Series,
+    mass_flow: float = 0.0036,
+    rpm: float = 10000.0,
+) -> None:
     tree = ET.parse(template_path)
     root = tree.getroot()
 
@@ -172,9 +180,8 @@ def create_cft_batch_from_template(template_path: str, dest_path: str, row: pd.S
     set_xml_text(root, ".//Beta1/Value[@Index='0']", f"{beta1hb_rad:.6f}")
     set_xml_text(root, ".//Beta1/Value[@Index='1']", f"{beta1sb_rad:.6f}")
 
-    # keep the same constants as Run-GeometryMeshing.ps1
-    set_xml_text(root, ".//mFlow", f"{0.0036:.6f}")
-    set_xml_text(root, ".//nRot", f"{(10000.0 / 60.0):.6f}")
+    set_xml_text(root, ".//mFlow", f"{float(mass_flow):.6f}")
+    set_xml_text(root, ".//nRot", f"{(float(rpm) / 60.0):.6f}")
 
     tree.write(dest_path, encoding="utf-8", xml_declaration=True)
 
@@ -204,7 +211,14 @@ def row_summary(row: pd.Series) -> dict:
     return summary
 
 
-def write_case_files(case_dir: Path, row: pd.Series, base_cft: str | None, cft_batch_template: str | None) -> dict:
+def write_case_files(
+    case_dir: Path,
+    row: pd.Series,
+    base_cft: str | None,
+    cft_batch_template: str | None,
+    mass_flow: float = 0.0036,
+    rpm: float = 10000.0,
+) -> dict:
     case_dir.mkdir(parents=True, exist_ok=True)
 
     summary = row_summary(row)
@@ -217,7 +231,13 @@ def write_case_files(case_dir: Path, row: pd.Series, base_cft: str | None, cft_b
         shutil.copy2(base_cft, case_dir / Path(base_cft).name)
 
     if cft_batch_template:
-        create_cft_batch_from_template(cft_batch_template, str(case_dir / "run_cfturbo.cft-batch"), row)
+        create_cft_batch_from_template(
+            cft_batch_template,
+            str(case_dir / "run_cfturbo.cft-batch"),
+            row,
+            mass_flow=mass_flow,
+            rpm=rpm,
+        )
 
     return summary
 
@@ -261,7 +281,14 @@ def main() -> int:
         if case_dir.exists() and args.force:
             shutil.rmtree(case_dir)
 
-        summary = write_case_files(case_dir, row, args.base_cft, args.cft_batch_template)
+        summary = write_case_files(
+            case_dir,
+            row,
+            args.base_cft,
+            args.cft_batch_template,
+            mass_flow=args.mass_flow,
+            rpm=args.rpm,
+        )
         summary["case_dir"] = str(case_dir.resolve())
         report["cases"].append(summary)
 

@@ -122,7 +122,10 @@ class ParetoService:
                 progress_callback(
                     f"Exporting case {i}/{len(rows)}: {case_dir.name} and generating geometry/mesh..."
                 )
-            summary = self.exporter.write_case_files(case_dir, row, resolved_base_cft, resolved_batch_template)
+            # The geometry runner invokes Run-GeometryMeshing.ps1, which generates
+            # run_cfturbo.cft-batch from the configured template and runtime values.
+            # Do not pre-generate the same file here, otherwise rpm/mFlow can drift.
+            summary = self.exporter.write_case_files(case_dir, row, resolved_base_cft, None)
             sample = dict(summary["geometry"])
             if "P_out" in row.index and row["P_out"] is not None:
                 sample["P_out"] = float(row["P_out"])

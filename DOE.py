@@ -375,9 +375,6 @@ def run_single_sample(i, p):
             # 未知异常保守处理：继续重试
 
     return False, run_id, last_error
-doe_working_dir = working_dir_base
-clean_old_results(doe_working_dir, filename="CFX_Results.txt")
-
 # =====================================================================
 # 6. 主循环：串行驱动，含喘振点过滤
 # =====================================================================

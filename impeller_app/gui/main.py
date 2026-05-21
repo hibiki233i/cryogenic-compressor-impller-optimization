@@ -822,9 +822,10 @@ class MainWindow(QMainWindow):
             self._handle_result(result)
 
     def _recover_doe_runs(self):
-        result = self._with_config(lambda config: RunnerAPI(config).recover_runs())
-        if result is not None:
-            self._handle_result(result)
+        config = self._with_config(lambda cfg: cfg)
+        if config is None:
+            return
+        self._run_worker(lambda callback, cancel_event: RunnerAPI(config).recover_runs(progress_callback=callback, cancel_event=cancel_event))
 
     def _start_doe(self):
         config = self._with_config(lambda cfg: cfg)

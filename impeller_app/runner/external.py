@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from datetime import datetime
 import json
 import os
 import queue
+import shutil
 import subprocess
 import threading
 import time
@@ -101,8 +103,22 @@ class RunnerAPI:
             metrics={"checked": checked, "created_training_csv": created_training_csv},
         )
 
-    def recover_runs(self) -> TaskResult:
-        recovery = self._recover_doe_progress()
+    def recover_runs(self, progress_callback=None, cancel_event=None) -> TaskResult:
+        recovery = self._recover_doe_progress(progress_callback=progress_callback, cancel_event=cancel_event)
+        if recovery.get("canceled"):
+            return TaskResult(
+                status="canceled",
+                message="DOE run recovery canceled.",
+                metrics={
+                    "run_dirs": recovery["run_dirs"],
+                    "completed_runs": len(recovery["rows"]),
+                    "partial_runs": recovery["partial_runs"],
+                    "reposted_runs": recovery["reposted_runs"],
+                    "repost_failed_runs": recovery["repost_failed_runs"],
+                    "training_csv_backup": recovery["training_csv_backup"],
+                    "next_index": recovery["next_index"],
+                },
+            )
         return TaskResult(
             status="succeeded",
             message="DOE run recovery scan completed.",
@@ -110,6 +126,9 @@ class RunnerAPI:
                 "run_dirs": recovery["run_dirs"],
                 "completed_runs": len(recovery["rows"]),
                 "partial_runs": recovery["partial_runs"],
+                "reposted_runs": recovery["reposted_runs"],
+                "repost_failed_runs": recovery["repost_failed_runs"],
+                "training_csv_backup": recovery["training_csv_backup"],
                 "next_index": recovery["next_index"],
             },
         )
@@ -130,6 +149,15 @@ class RunnerAPI:
 
     def _save_extra_samples(self, payload: list[dict]) -> None:
         self.config.workspace.extra_samples_json.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def _backup_training_csv(self) -> str | None:
+        training_csv = self.config.workspace.training_csv
+        if not training_csv.exists() or training_csv.stat().st_size == 0:
+            return None
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        backup = training_csv.with_name(f"{training_csv.stem}.before_recover_{stamp}{training_csv.suffix}")
+        shutil.copy2(training_csv, backup)
+        return str(backup)
 
     def _new_extra_sample(self) -> dict:
         norm = qmc.LatinHypercube(d=len(self.variable_names)).random(1)
@@ -159,6 +187,19 @@ class RunnerAPI:
         data = result_txt.read_text(encoding="utf-8").strip().split(",")
         return self._result_row_from_sample(sample, data)
 
+    def _result_row_from_cfx_metrics(self, sample: dict, metrics: dict) -> dict | None:
+        row = dict(sample)
+        row["nBl"] = int(round(float(row["nBl"])))
+        row["Efficiency"] = float(metrics["Efficiency"])
+        row["PressureRatio"] = float(metrics["PressureRatio"])
+        row["Power"] = float(metrics["Power"])
+        row["MassFlow"] = float(metrics["MassFlow"])
+        row["totalpressureratio"] = float(metrics["totalpressureratio"])
+        if float(row["MassFlow"]) < self.min_discard_flow_g_s:
+            return None
+        row["is_boundary"] = 1 if float(row["MassFlow"]) < self.boundary_flow_g_s else 0
+        return row
+
     def _sample_for_index(self, index: int, base_samples: list[dict], extra_samples: list[dict]) -> dict | None:
         if index < len(base_samples):
             return dict(base_samples[index])
@@ -167,16 +208,20 @@ class RunnerAPI:
             return dict(extra_samples[extra_index])
         return None
 
-    def _recover_doe_progress(self) -> dict:
+    def _recover_doe_progress(self, progress_callback=None, cancel_event=None) -> dict:
         runs_dir = self.config.workspace.doe_runs_dir
         runs_dir.mkdir(parents=True, exist_ok=True)
         base_samples = self.generate_lhs_samples(self.config.runtime.doe_initial_samples)
         extra_samples = self._load_extra_samples()
         rows: list[dict] = []
         partial_runs = 0
+        reposted_runs = 0
+        repost_failed_runs = 0
         max_run_idx = -1
         run_dirs = sorted([p for p in runs_dir.glob("Run_*") if p.is_dir()], key=lambda p: int(p.name.split("_")[1]))
         for run_dir in run_dirs:
+            if _is_cancelled(cancel_event):
+                break
             idx = int(run_dir.name.split("_")[1])
             max_run_idx = max(max_run_idx, idx)
             sample = self._sample_for_index(idx, base_samples, extra_samples)
@@ -191,13 +236,37 @@ class RunnerAPI:
                 except Exception:
                     pass
             elif list(run_dir.glob("*.res")):
-                partial_runs += 1
+                _emit(progress_callback, f"{run_dir.name}: found .res without CFX_Results.txt; running CFX-Post recovery...")
+                cfx_result = self.run_cfx_case(
+                    run_dir,
+                    f"Recovery-{run_dir.name}",
+                    float(sample["P_out"]),
+                    int(round(float(sample["nBl"]))),
+                    cancel_event=cancel_event,
+                )
+                if cfx_result.status == "canceled":
+                    break
+                if cfx_result.status == "succeeded":
+                    row = self._result_row_from_cfx_metrics(sample, cfx_result.metrics)
+                    if row is not None:
+                        rows.append(row)
+                        reposted_runs += 1
+                    else:
+                        partial_runs += 1
+                else:
+                    partial_runs += 1
+                    repost_failed_runs += 1
+        backup_path = self._backup_training_csv()
         df = pd.DataFrame(rows, columns=self._columns()) if rows else pd.DataFrame(columns=self._columns())
         df.to_csv(self.config.workspace.training_csv, index=False)
         return {
+            "canceled": _is_cancelled(cancel_event),
             "rows": rows,
             "run_dirs": len(run_dirs),
             "partial_runs": partial_runs,
+            "reposted_runs": reposted_runs,
+            "repost_failed_runs": repost_failed_runs,
+            "training_csv_backup": backup_path,
             "next_index": max_run_idx + 1,
             "base_samples": base_samples,
             "extra_samples": extra_samples,
@@ -360,18 +429,9 @@ class RunnerAPI:
         cfx_result = self.run_cfx_case(working_dir, run_id, float(sample["P_out"]), int(round(float(sample["nBl"]))), cancel_event=cancel_event)
         if cfx_result.status != "succeeded":
             return cfx_result
-        row = {
-            **sample,
-            "nBl": int(round(float(sample["nBl"]))),
-            "Efficiency": float(cfx_result.metrics["Efficiency"]),
-            "PressureRatio": float(cfx_result.metrics["PressureRatio"]),
-            "Power": float(cfx_result.metrics["Power"]),
-            "MassFlow": float(cfx_result.metrics["MassFlow"]),
-            "totalpressureratio": float(cfx_result.metrics["totalpressureratio"]),
-            "is_boundary": 1 if float(cfx_result.metrics["MassFlow"]) < self.boundary_flow_g_s else 0,
-        }
-        if float(row["MassFlow"]) < self.min_discard_flow_g_s:
-            return TaskResult(status="failed", message=f"{run_id}: divergent MassFlow, discarded.", metrics=row, artifacts={"working_dir": str(working_dir)})
+        row = self._result_row_from_cfx_metrics(sample, cfx_result.metrics)
+        if row is None:
+            return TaskResult(status="failed", message=f"{run_id}: divergent MassFlow, discarded.", artifacts={"working_dir": str(working_dir)})
         self._append_training_row(row)
         return TaskResult(status="succeeded", message=f"{run_id}: DOE sample completed.", metrics=row, artifacts={"working_dir": str(working_dir)})
 
