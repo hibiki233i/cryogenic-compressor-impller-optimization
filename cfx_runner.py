@@ -1,12 +1,75 @@
 import subprocess
 import os
 import glob
+import json
 import threading
 import time
 import signal
 import psutil 
 
 CREATE_NO_WINDOW = 0x08000000 if os.name == 'nt' else 0
+PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_TEMPLATE_CSE = os.path.join(PROJECT_DIR, "cfx_post", "Extract_Results.cse")
+RESULT_SCHEMA_VERSION = 2
+RESULT_METADATA_FILENAME = "CFX_Results.meta.json"
+
+
+def solver_exit_failure_message(out_file, exit_code):
+    """Preserve fatal-overflow evidence from the CFX output file."""
+    tail = ""
+    try:
+        if out_file and os.path.exists(out_file):
+            with open(out_file, "r", encoding="utf-8", errors="ignore") as stream:
+                stream.seek(max(0, os.path.getsize(out_file) - 512 * 1024))
+                tail = stream.read().lower()
+    except OSError:
+        tail = ""
+
+    fatal_overflow_tokens = (
+        "fatal overflow",
+        "floating point overflow",
+        "overflow error",
+    )
+    if any(token in tail for token in fatal_overflow_tokens):
+        return (
+            "CFX FATAL OVERFLOW（按批处理策略标记为设计不可行）。"
+            f"Exit Code: {exit_code}"
+        )
+    return f"CFD 计算发散或崩溃。Exit Code: {exit_code}"
+
+
+def _result_metadata_path(result_txt):
+    return os.path.join(os.path.dirname(os.path.abspath(result_txt)), RESULT_METADATA_FILENAME)
+
+
+def is_current_cfx_result(result_txt):
+    """Return True only for stationary-frame total-pressure-ratio results."""
+    if not os.path.exists(result_txt):
+        return False
+    metadata_path = _result_metadata_path(result_txt)
+    if not os.path.exists(metadata_path):
+        return False
+    try:
+        with open(metadata_path, "r", encoding="utf-8") as f:
+            metadata = json.load(f)
+    except (OSError, ValueError, TypeError):
+        return False
+    return (
+        int(metadata.get("schema_version", 0)) == RESULT_SCHEMA_VERSION
+        and metadata.get("total_pressure_frame") == "stationary"
+        and metadata.get("total_pressure_averaging") == "massFlowAve"
+    )
+
+
+def _write_result_metadata(result_txt):
+    metadata = {
+        "schema_version": RESULT_SCHEMA_VERSION,
+        "total_pressure_frame": "stationary",
+        "total_pressure_averaging": "massFlowAve",
+        "total_pressure_ratio": "outlet_total_pressure / inlet_total_pressure",
+    }
+    with open(_result_metadata_path(result_txt), "w", encoding="utf-8") as f:
+        json.dump(metadata, f, ensure_ascii=False, indent=2)
 
 
 def _env_or_default(name, default):
@@ -71,7 +134,7 @@ def run_cfx_pipeline(
     cfx5solve_exe = os.path.join(cfx_bin_dir, "cfx5solve.exe")
     cfx5post_exe  = os.path.join(cfx_bin_dir, "cfx5post.exe")
     template_cfx = template_cfx or _env_or_default("IMPELLER_TEMPLATE_CFX", r"F:\optimazition\Templates\BaseModel.cfx")
-    template_cse = template_cse or _env_or_default("IMPELLER_TEMPLATE_CSE", r"F:\optimazition\Templates\Extract_Results.cse")
+    template_cse = template_cse or _env_or_default("IMPELLER_TEMPLATE_CSE", DEFAULT_TEMPLATE_CSE)
     
     gtm_file = os.path.join(working_dir, "Impeller_Mesh.gtm").replace("\\", "/")
     def_file = os.path.join(working_dir, "Impeller.def").replace("\\", "/")
@@ -82,7 +145,7 @@ def run_cfx_pipeline(
     # 0-A. 若结果文件已存在，则直接读取返回
     # 与 DOE.py 中的已完成检测配合，避免重复求解。
     # =============================================================================
-    if os.path.exists(output_txt):
+    if is_current_cfx_result(output_txt):
         try:
             with open(output_txt, 'r') as f:
                 data = f.read().strip().split(',')
@@ -98,6 +161,11 @@ def run_cfx_pipeline(
         except Exception as e:
             # 结果文件损坏或格式异常，继续往下重新走完整流程
             print(f"[{run_id}] 结果文件存在但读取失败（{e}），将重新执行后处理。")
+    elif os.path.exists(output_txt):
+        print(
+            f"[{run_id}] 发现旧版结果文件（缺少 stationary-frame v{RESULT_SCHEMA_VERSION} "
+            "元数据），将使用现有 .res 重新执行 CFX-Post。"
+        )
  
 
     # ==========================================
@@ -325,7 +393,10 @@ write def file
                 time.sleep(5)
 
             if solve_proc.returncode != 0:
-                return False, None, f"CFD 计算发散或崩溃。Exit Code: {solve_proc.returncode}"
+                return False, None, solver_exit_failure_message(
+                    out_file,
+                    solve_proc.returncode,
+                )
 
         # ✅ 修复后
         except Exception as e:
@@ -379,6 +450,7 @@ write def file
                     'MassFlow': float(data[3]) * n_blades,   # 整机流量 = 单流道 × nBl
                     'totalpressureratio': float(data[4])      # 总压比
                 }
+            _write_result_metadata(output_txt)
         
             for f_path in [gtm_file, def_file]:
                 try:

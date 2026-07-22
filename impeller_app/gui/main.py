@@ -85,8 +85,8 @@ TEXTS = {
         "default_boundary_flow_g_s": "Boundary Flow (g/s)",
         "default_min_efficiency": "Minimum Efficiency",
         "default_min_power": "Minimum Power",
-        "default_min_pressure_ratio": "Minimum Pressure Ratio",
-        "default_max_pressure_ratio": "Maximum Pressure Ratio",
+        "optimization_outlet_static_pressure_pa": "NSGA-II Fixed Outlet Static Pressure (Pa)",
+        "operating_point_pressure_tolerance_pa": "Observed-Data Pressure Band (Pa)",
         "default_min_d2_d1s_gap": "Minimum d2-d1s Gap",
         "default_max_le_sweep_diff": "Maximum LE Sweep Diff",
         "default_max_exit_angle_diff": "Maximum Exit Angle Diff",
@@ -94,7 +94,7 @@ TEXTS = {
         "default_min_rake_te_s_nbl_10": "Minimum rake_te_s (nBl=10)",
         "default_min_rake_te_s_nbl_11": "Minimum rake_te_s (nBl=11)",
         "default_min_rake_te_s_nbl_12": "Minimum rake_te_s (nBl=12)",
-        "variable_ranges_group": "Design Variable Ranges",
+        "variable_ranges_group": "Surrogate Input Ranges (Geometry + Operating Condition)",
         "variable_name": "Variable",
         "lower_bound": "Lower",
         "upper_bound": "Upper",
@@ -171,8 +171,8 @@ TEXTS = {
         "default_boundary_flow_g_s": "边界流量阈值 (g/s)",
         "default_min_efficiency": "最低效率",
         "default_min_power": "最低功率",
-        "default_min_pressure_ratio": "最低压比",
-        "default_max_pressure_ratio": "最高压比",
+        "optimization_outlet_static_pressure_pa": "NSGA-II 固定出口静压 (Pa)",
+        "operating_point_pressure_tolerance_pa": "观测数据工况压力带宽 (Pa)",
         "default_min_d2_d1s_gap": "最小 d2-d1s 差值",
         "default_max_le_sweep_diff": "最大前缘角差",
         "default_max_exit_angle_diff": "最大出口角差",
@@ -180,7 +180,7 @@ TEXTS = {
         "default_min_rake_te_s_nbl_10": "最小 rake_te_s (nBl=10)",
         "default_min_rake_te_s_nbl_11": "最小 rake_te_s (nBl=11)",
         "default_min_rake_te_s_nbl_12": "最小 rake_te_s (nBl=12)",
-        "variable_ranges_group": "设计变量范围",
+        "variable_ranges_group": "代理模型输入范围（几何 + 运行工况）",
         "variable_name": "变量",
         "lower_bound": "下界",
         "upper_bound": "上界",
@@ -428,8 +428,8 @@ class MainWindow(QMainWindow):
         self.default_boundary_flow_g_s = self._double_spin(runtime.default_boundary_flow_g_s, 4, 0.0, 1_000_000.0, 0.1)
         self.default_min_efficiency = self._double_spin(runtime.default_min_efficiency, 4, 0.0, 1.0, 0.01)
         self.default_min_power = self._double_spin(runtime.default_min_power, 4, 0.0, 1_000_000.0, 1.0)
-        self.default_min_pressure_ratio = self._double_spin(runtime.default_min_pressure_ratio, 4, 0.0, 100.0, 0.05)
-        self.default_max_pressure_ratio = self._double_spin(runtime.default_max_pressure_ratio, 4, 0.0, 100.0, 0.05)
+        self.optimization_outlet_static_pressure_pa = self._double_spin(runtime.optimization_outlet_static_pressure_pa, 4, 0.0, 1_000_000.0, 0.1)
+        self.operating_point_pressure_tolerance_pa = self._double_spin(runtime.operating_point_pressure_tolerance_pa, 4, 0.0, 1_000_000.0, 0.05)
         self.default_min_d2_d1s_gap = self._double_spin(runtime.default_min_d2_d1s_gap, 6, -1_000.0, 1_000.0, 0.001)
         self.default_max_le_sweep_diff = self._double_spin(runtime.default_max_le_sweep_diff, 3, 0.0, 180.0, 1.0)
         self.default_max_exit_angle_diff = self._double_spin(runtime.default_max_exit_angle_diff, 3, 0.0, 180.0, 1.0)
@@ -442,8 +442,8 @@ class MainWindow(QMainWindow):
         self._add_form_row(defaults_form, "default_boundary_flow_g_s", self.default_boundary_flow_g_s)
         self._add_form_row(defaults_form, "default_min_efficiency", self.default_min_efficiency)
         self._add_form_row(defaults_form, "default_min_power", self.default_min_power)
-        self._add_form_row(defaults_form, "default_min_pressure_ratio", self.default_min_pressure_ratio)
-        self._add_form_row(defaults_form, "default_max_pressure_ratio", self.default_max_pressure_ratio)
+        self._add_form_row(defaults_form, "optimization_outlet_static_pressure_pa", self.optimization_outlet_static_pressure_pa)
+        self._add_form_row(defaults_form, "operating_point_pressure_tolerance_pa", self.operating_point_pressure_tolerance_pa)
         self._add_form_row(defaults_form, "default_min_d2_d1s_gap", self.default_min_d2_d1s_gap)
         self._add_form_row(defaults_form, "default_max_le_sweep_diff", self.default_max_le_sweep_diff)
         self._add_form_row(defaults_form, "default_max_exit_angle_diff", self.default_max_exit_angle_diff)
@@ -727,13 +727,13 @@ class MainWindow(QMainWindow):
             rpm=self.config.runtime.rpm,
             mass_flow=self.config.runtime.mass_flow,
             alpha0=self.config.runtime.alpha0,
+            optimization_outlet_static_pressure_pa=self.optimization_outlet_static_pressure_pa.value(),
+            operating_point_pressure_tolerance_pa=self.operating_point_pressure_tolerance_pa.value(),
             default_invalid_flow_g_s=self.default_invalid_flow_g_s.value(),
             default_discard_flow_g_s=self.default_discard_flow_g_s.value(),
             default_boundary_flow_g_s=self.default_boundary_flow_g_s.value(),
             default_min_efficiency=self.default_min_efficiency.value(),
             default_min_power=self.default_min_power.value(),
-            default_min_pressure_ratio=self.default_min_pressure_ratio.value(),
-            default_max_pressure_ratio=self.default_max_pressure_ratio.value(),
             default_min_d2_d1s_gap=self.default_min_d2_d1s_gap.value(),
             default_max_le_sweep_diff=self.default_max_le_sweep_diff.value(),
             default_max_exit_angle_diff=self.default_max_exit_angle_diff.value(),
@@ -750,8 +750,6 @@ class MainWindow(QMainWindow):
             sobol_use_al_samples=self.sobol_use_al_samples.isChecked(),
             sobol_tag=self.sobol_tag.text().strip(),
         )
-        if runtime.default_min_pressure_ratio >= runtime.default_max_pressure_ratio:
-            raise ValueError("default_min_pressure_ratio must be lower than default_max_pressure_ratio")
         if runtime.default_discard_flow_g_s > runtime.default_boundary_flow_g_s:
             raise ValueError("default_discard_flow_g_s must not exceed default_boundary_flow_g_s")
         return AppConfig(solver=solver, workspace=workspace, runtime=runtime)

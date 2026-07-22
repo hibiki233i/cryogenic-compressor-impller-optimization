@@ -7,9 +7,23 @@ import json
 import time
 from pathlib import Path
 from scipy.stats import qmc
-from cfx_runner import run_cfx_pipeline
+from cfx_runner import is_current_cfx_result, run_cfx_pipeline
 import glob
-from design_variables import ensure_training_csv, load_variable_specs, lower_bounds, training_csv_columns, upper_bounds, variable_names
+from design_variables import (
+    ensure_training_csv,
+    load_variable_specs,
+    lower_bounds,
+    training_csv_columns,
+    upper_bounds,
+    variable_names,
+    write_performance_data_metadata,
+)
+from failure_records import (
+    classify_cfx_failure_stage,
+    classify_geometry_failure_stage,
+    load_structured_failure_status,
+    record_run_outcome,
+)
 
 
 PROJECT_ROOT = Path(os.environ.get("IMPELLER_PROJECT_ROOT", Path.cwd()))
@@ -70,6 +84,9 @@ ps_script_path = os.environ.get("IMPELLER_PS_SCRIPT_PATH", str(PROJECT_ROOT / "R
 working_dir_base = os.environ.get("IMPELLER_DOE_WORKING_BASE", str(PROJECT_ROOT / "Runs"))
 output_csv = "Compressor_Training_Data.csv"
 EXTRA_SAMPLES_FILE = "extra_samples.json"
+FAILURE_RECORDS_CSV = os.environ.get(
+    "IMPELLER_FAILURE_RECORDS_CSV", "failure_records.csv"
+)
 # =====================================================================
 # 3. 动态补充点（超出初始 LHS 后）：生成并持久化
 # =====================================================================
@@ -112,6 +129,21 @@ def recover_progress(working_dir_base, output_csv,samples, extra_samples):
     """
     columns = var_names + ['Efficiency', 'PressureRatio', 'Power', 'MassFlow', 'totalpressureratio', 'is_boundary']
 
+    def sample_for_run(full_path, idx):
+        input_path = os.path.join(full_path, "input_parameters.json")
+        if os.path.exists(input_path):
+            try:
+                with open(input_path, "r", encoding="utf-8") as f:
+                    payload = json.load(f)
+                return {name: float(payload[name]) for name in var_names}
+            except (OSError, ValueError, TypeError, KeyError):
+                pass
+        if idx < len(samples):
+            return samples[idx].copy()
+        if (idx - len(samples)) < len(extra_samples):
+            return dict(extra_samples[idx - len(samples)])
+        return None
+
     recovered_rows = []     # 完整可写入 CSV 的数据行
     repost_count   = 0      # ②类：重新提取 Post 的成功数量
     max_run_idx    = -1
@@ -134,18 +166,15 @@ def recover_progress(working_dir_base, output_csv,samples, extra_samples):
         result_txt   = os.path.join(full_path, "CFX_Results.txt")
         res_files    = glob.glob(os.path.join(full_path, "*.res"))
 
-        if os.path.exists(result_txt):
+        if is_current_cfx_result(result_txt):
             # ── ① 结果完整，重建数据行 ──────────────────────────────────
             try:
                 with open(result_txt, 'r') as f:
                     data = f.read().strip().split(',')
 
                 # 恢复输入参数：LHS 点直接从 samples[] 取，动态补充点从 extra_samples 取
-                if idx < len(samples):
-                    p = samples[idx].copy()
-                elif (idx - len(samples)) < len(extra_samples):
-                    p = dict(extra_samples[idx - len(samples)])
-                else:
+                p = sample_for_run(full_path, idx)
+                if p is None:
                     print(f"  [警告] {run_dir} 索引超出已知样本范围，跳过。")
                     continue
 
@@ -179,11 +208,8 @@ def recover_progress(working_dir_base, output_csv,samples, extra_samples):
             print(f"  [重新提取] {run_dir}：发现 .res 但无 CFX_Results.txt，"
                   f"正在重新运行 CFX-Post...")
             try:
-                if idx < len(samples):
-                    p = samples[idx].copy()
-                elif (idx - len(samples)) < len(extra_samples):
-                    p = dict(extra_samples[idx - len(samples)])
-                else:
+                p = sample_for_run(full_path, idx)
+                if p is None:
                     print(f"  [警告] {run_dir} 索引超出已知样本范围，跳过。")
                     continue
 
@@ -224,6 +250,7 @@ def recover_progress(working_dir_base, output_csv,samples, extra_samples):
     rebuilt_df = pd.DataFrame(recovered_rows, columns=columns) \
                  if recovered_rows else pd.DataFrame(columns=columns)
     rebuilt_df.to_csv(output_csv, index=False)
+    write_performance_data_metadata(output_csv)
 
     successful_count = len(recovered_rows)
 
@@ -260,7 +287,7 @@ def run_single_sample(i, p):
         硬失败：参数畸形 / CFD 发散 → 不重试，直接丢弃
         软失败：CFturbo/TurboGrid 偶发崩溃 → 最多重试 MAX_RETRIES 次
 
-    返回：(success: bool, run_id: str, data: dict | str)
+    返回：(success: bool, run_id: str, data: dict | str, attempts: int)
     """
     run_id          = f"Run_{i:03d}"
     current_work_dir = os.path.join(working_dir_base, run_id)
@@ -270,7 +297,7 @@ def run_single_sample(i, p):
     # ------------------------------------------------------------------
     # 5-A  已完成检测：若结果文件已存在，直接读取返回，无需重跑
     # ------------------------------------------------------------------
-    if os.path.exists(result_txt):
+    if is_current_cfx_result(result_txt):
         try:
             with open(result_txt, 'r') as f:
                 data = f.read().strip().split(',')
@@ -280,7 +307,7 @@ def run_single_sample(i, p):
             p['MassFlow']      = float(data[3])
             p['totalpressureratio'] = float(data[4])  # 总压比
             print(f"[{run_id}] 已有结果文件，直接读取，跳过计算。")
-            return True, run_id, p
+            return True, run_id, p, 0
         except Exception as e:
             print(f"[{run_id}] 结果文件读取失败（{e}），将重新计算。")
 
@@ -289,8 +316,10 @@ def run_single_sample(i, p):
     # ------------------------------------------------------------------
     d1s_d2_ratio = p['d1s'] / p['d2']
     if d1s_d2_ratio < 0.50 or d1s_d2_ratio > 0.85:
-        return False, run_id, f"[硬失败] d1s/d2={d1s_d2_ratio:.3f} 超出[0.50,0.85]，跳过"
+        return False, run_id, f"[硬失败] d1s/d2={d1s_d2_ratio:.3f} 超出[0.50,0.85]，跳过", 1
     os.makedirs(current_work_dir, exist_ok=True)
+    with open(os.path.join(current_work_dir, "input_parameters.json"), "w", encoding="utf-8") as f:
+        json.dump({name: float(p[name]) for name in var_names}, f, ensure_ascii=False, indent=2)
 
     # ------------------------------------------------------------------
     # 5-C  构建 PowerShell 命令（叶片数取整）
@@ -357,7 +386,7 @@ def run_single_sample(i, p):
                 p['MassFlow']      = cfx_res['MassFlow']
                 p['totalpressureratio'] = cfx_res['totalpressureratio']
 
-                return True, run_id, p
+                return True, run_id, p, attempt + 1
             else:
                 # CFD 发散或崩溃：硬失败，不再重试
                 last_error = f"[硬失败] CFD 计算失败：{msg}"
@@ -374,7 +403,7 @@ def run_single_sample(i, p):
             print(f"[{run_id}] {last_error}")
             # 未知异常保守处理：继续重试
 
-    return False, run_id, last_error
+    return False, run_id, last_error, attempt + 1
 # =====================================================================
 # 6. 主循环：串行驱动，含喘振点过滤
 # =====================================================================
@@ -399,7 +428,7 @@ while successful_count < target_samples:
         current_p = get_new_sample()
         extra_ptr += 1
 
-    success, run_id, data = run_single_sample(current_idx, current_p)
+    success, run_id, data, evaluation_attempts = run_single_sample(current_idx, current_p)
 
     if success:
         mass_flow = data.get('MassFlow', 0)
@@ -407,6 +436,16 @@ while successful_count < target_samples:
         if mass_flow < MIN_DISCARD:
             # ── CFD 发散点：彻底丢弃 ─────────────────────────────────
             print(f"[{run_id}] ✗ 发散点：MassFlow={mass_flow:.6f} g/s，丢弃。")
+            record_run_outcome(
+                FAILURE_RECORDS_CSV,
+                var_names,
+                current_p,
+                source="doe",
+                run_id=run_id,
+                status="failed",
+                failure_stage="physical_invalid",
+                reason=f"MassFlow={mass_flow:.6f} g/s is below the discard threshold.",
+            )
 
         elif mass_flow < MIN_NORMAL:
             data['is_boundary'] = 1
@@ -414,6 +453,10 @@ while successful_count < target_samples:
             successful_count += 1
             print(f"[{run_id}] ⚠ 边界点保留：MassFlow={mass_flow:.4f} g/s "
                   f"（近喘振区）（{successful_count}/{target_samples}）。")
+            record_run_outcome(
+                FAILURE_RECORDS_CSV, var_names, current_p,
+                source="doe", run_id=run_id, status="succeeded",
+            )
 
         else:
             # ── 正常工况点 ────────────────────────────────────────────
@@ -421,8 +464,39 @@ while successful_count < target_samples:
             pd.DataFrame([data]).to_csv(output_csv, mode='a', header=False, index=False)
             successful_count += 1
             print(f"[{run_id}] ✓ 正常点记录（{successful_count}/{target_samples}）。")
+            record_run_outcome(
+                FAILURE_RECORDS_CSV, var_names, current_p,
+                source="doe", run_id=run_id, status="succeeded",
+            )
     else:
         print(f"[{run_id}] ✗ 失败 → {data}。丢弃，继续下一点。")
+        reason = str(data)
+        structured_failure = load_structured_failure_status(
+            os.path.join(working_dir_base, run_id)
+        )
+        if structured_failure is not None:
+            failure_stage = structured_failure["stage"]
+            reason = structured_failure["reason"] or reason
+        elif "CFD" in reason or "求解器" in reason or ".res" in reason:
+            failure_stage = classify_cfx_failure_stage(reason)
+        elif "参数畸形" in reason or "CFturbo" in reason or "网格" in reason:
+            failure_stage = classify_geometry_failure_stage(reason)
+        else:
+            failure_stage = "infrastructure"
+        record_run_outcome(
+            FAILURE_RECORDS_CSV,
+            var_names,
+            current_p,
+            source="doe",
+            run_id=run_id,
+            status="failed",
+            failure_stage=failure_stage,
+            reason=reason,
+            confirmed=(
+                evaluation_attempts >= 2
+                and failure_stage in {"geometry", "mesh", "geometry_mesh", "cfx_solver"}
+            ),
+        )
 
     current_idx += 1
 

@@ -7,7 +7,7 @@ import os
 from pathlib import Path
 
 import joblib
-from sklearn.metrics import mean_squared_error
+import numpy as np
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import MinMaxScaler
 
@@ -116,28 +116,83 @@ class ActiveLearningService:
             y_test_surr = y_test[:, legacy.SURROGATE_OUTPUT_IDX]
 
             stratify_labels = w_pool if len(set(w_pool)) > 1 else None
-            x_tr, x_val, y_tr, y_val, w_tr, w_val = train_test_split(
-                x_pool_norm,
-                y_pool_norm,
-                w_pool,
+            train_idx, val_idx = train_test_split(
+                np.arange(len(x_pool)),
                 test_size=0.2,
                 random_state=42,
                 stratify=stratify_labels,
             )
+            x_tr, x_val = x_pool_norm[train_idx], x_pool_norm[val_idx]
+            y_tr, y_val = y_pool_norm[train_idx], y_pool_norm[val_idx]
+            w_tr, w_val = w_pool[train_idx], w_pool[val_idx]
+            nbl_idx = legacy.VAR_NAMES.index("nBl")
+            train_weights, weight_diagnostics = legacy.compute_density_nbl_sample_weights(
+                x_tr,
+                x_pool[train_idx, nbl_idx],
+                k_neighbors=legacy.CFG.density_k_neighbors,
+                min_weight=legacy.CFG.sample_weight_min,
+                max_weight=legacy.CFG.sample_weight_max,
+            )
 
             _emit(progress_callback, "running", "Training surrogate network...")
-            model, history = legacy.train_regressor(x_tr, y_tr, w_tr, x_val, y_val, w_val, save_path=str(self.config.workspace.best_regressor_pth))
+            model, history = legacy.train_regressor(
+                x_tr,
+                y_tr,
+                w_tr,
+                x_val,
+                y_val,
+                w_val,
+                save_path=str(self.config.workspace.best_regressor_pth),
+                sample_weights_train=train_weights,
+                random_seed=1000,
+            )
             joblib.dump(scaler_x, self.config.workspace.scaler_x_pkl)
             joblib.dump(scaler_y, self.config.workspace.scaler_y_pkl)
 
             y_pred = legacy.deterministic_predict(model, scaler_x.transform(x_test), scaler_y)
+            fixed_metrics = legacy.regression_metrics(
+                y_test_surr,
+                y_pred,
+                prefix="fixed_test_",
+            )
+            _emit(progress_callback, "running", f"Running {legacy.CFG.cv_folds}-fold validation...")
+            cv_rows, cv_summary = legacy.run_kfold_surrogate_validation(
+                X_raw=x_pool,
+                Y_surr=y_pool_surr,
+                W_boundary=w_pool,
+                al_iter=0,
+                cfg=legacy.CFG,
+            )
+            if cv_rows:
+                legacy.upsert_csv_records(
+                    str(self.config.workspace.cv_fold_metrics_csv),
+                    cv_rows,
+                    key_columns=["iter", "fold"],
+                )
+            legacy.upsert_csv_records(
+                str(self.config.workspace.surrogate_metrics_csv),
+                {
+                    "iter": 0,
+                    "mode": "standalone_training",
+                    "train_pool_samples_before_cfd": int(len(x_pool)),
+                    "fixed_test_samples": int(len(x_test)),
+                    "training_epochs": int(len(history)),
+                    "recorded_at_utc": legacy.utc_timestamp(),
+                    **fixed_metrics,
+                    **cv_summary,
+                    **weight_diagnostics,
+                },
+                key_columns=["iter"],
+            )
             metrics = {
                 "train_samples": int(len(x_pool)),
                 "test_samples": int(len(x_test)),
                 "epochs": int(len(history)),
-                "mse_eff": float(mean_squared_error(y_test_surr[:, 0], y_pred[:, 0])),
-                "mse_pr": float(mean_squared_error(y_test_surr[:, 1], y_pred[:, 1])),
-                "mse_mf": float(mean_squared_error(y_test_surr[:, 2], y_pred[:, 2])),
+                "mse_eff": fixed_metrics["fixed_test_mse_eff"],
+                "mse_pr": fixed_metrics["fixed_test_mse_pr"],
+                "mse_mf": fixed_metrics["fixed_test_mse_mf"],
+                **fixed_metrics,
+                **cv_summary,
             }
             return TaskResult(
                 status="succeeded",
@@ -147,6 +202,8 @@ class ActiveLearningService:
                     "model": str(self.config.workspace.best_regressor_pth),
                     "scaler_x": str(self.config.workspace.scaler_x_pkl),
                     "scaler_y": str(self.config.workspace.scaler_y_pkl),
+                    "validation_metrics": str(self.config.workspace.surrogate_metrics_csv),
+                    "cv_fold_metrics": str(self.config.workspace.cv_fold_metrics_csv),
                 },
             )
         except ValueError as exc:
@@ -179,6 +236,11 @@ class ActiveLearningService:
                     "hv_history": str(hv_csv),
                     "hv_plot": str(self.config.workspace.hv_plot_png),
                     "pool_checkpoint": str(self.config.workspace.pool_checkpoint_csv),
+                    "validation_metrics": str(self.config.workspace.surrogate_metrics_csv),
+                    "cv_fold_metrics": str(self.config.workspace.cv_fold_metrics_csv),
+                    "fixed_test_predictions": str(self.config.workspace.fixed_test_predictions_csv),
+                    "query_validation": str(self.config.workspace.al_query_validation_csv),
+                    "failure_records": str(self.config.workspace.failure_records_csv),
                 },
             )
         except ValueError as exc:

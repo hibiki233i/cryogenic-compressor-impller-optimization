@@ -8,7 +8,9 @@ param (
     [string]$TurboGridExe = "D:\ANSYS Inc\v251\TurboGrid\bin\cfxtg.exe",
     [string]$CftBatchTemplate = "F:\optimazition\Templates\BaseModel.cft-batch",
     [string]$BaseCft = "F:\optimazition\Templates\0908-2.cft",
-    [string]$TurboGridTemplate = "F:\optimazition\Templates\BaseMeshing.tst",
+    [Parameter(Mandatory = $true)]
+    [ValidateNotNullOrEmpty()]
+    [string]$TurboGridTemplate,
    [double]$d1s, [double]$dH, [double]$beta1hb, [double]$beta1sb, [double]$d2, 
     [double]$b2, [double]$beta2hb, [double]$beta2sb, [double]$Lz, [double]$t, 
     [double]$TipClear, [double]$nBl, [double]$rake_te_s,
@@ -16,6 +18,21 @@ param (
 )
 
 $ErrorActionPreference = "Stop"
+$Failure_Status = Join-Path $WorkingDir "failure_status.json"
+if (Test-Path $Failure_Status) { Remove-Item $Failure_Status -Force }
+
+function Write-FailureStatus {
+    param(
+        [string]$Path,
+        [string]$Stage,
+        [string]$Reason
+    )
+    [ordered]@{
+        stage = $Stage
+        reason = $Reason
+        recorded_at_utc = [DateTime]::UtcNow.ToString("o")
+    } | ConvertTo-Json -Depth 3 | Set-Content -Path $Path -Encoding UTF8
+}
 
 function Get-LogWarningInfo {
     param(
@@ -218,19 +235,39 @@ function Ensure-TurboGridExportAction {
     if ($null -eq $components) {
         $components = $Xml.CreateElement("ExportComponents")
         [void]$exportAction.AppendChild($components)
-    } else {
-        $components.RemoveAll()
     }
-    $components.SetAttribute("Count", "1")
     $components.SetAttribute("Type", "Array1")
     $components.SetAttribute("Desc", "Components to be exported")
 
-    $value = $Xml.CreateElement("Value")
-    $value.SetAttribute("Type", "Integer")
-    $value.SetAttribute("Caption", "Impeller")
-    $value.SetAttribute("Index", "0")
-    $value.InnerText = "3"
-    [void]$components.AppendChild($value)
+    # The component IDs in ExportComponents are CFturbo's one-based project
+    # component IDs, not arbitrary type IDs. Preserve a valid selection from
+    # the GUI-exported batch template (normally [Impeller_1] / 1).
+    $selectedComponents = @($components.SelectNodes("Value"))
+    if ($selectedComponents.Count -eq 0) {
+        $designComponent = $Xml.SelectSingleNode(
+            "//Updates//PolyList_CFturboDesign/*[@Name][1]"
+        )
+        if ($null -eq $designComponent) {
+            throw "CFturbo batch template contains no selectable design component for TurboGrid export."
+        }
+
+        $componentName = $designComponent.GetAttribute("Name")
+        $componentIndexText = $designComponent.GetAttribute("Index")
+        $componentId = 1
+        if (-not [string]::IsNullOrWhiteSpace($componentIndexText)) {
+            $componentId = [int]$componentIndexText + 1
+        }
+
+        $value = $Xml.CreateElement("Value")
+        $value.SetAttribute("Type", "Integer")
+        $value.SetAttribute("Caption", $componentName)
+        $value.SetAttribute("Index", "0")
+        $value.InnerText = [string]$componentId
+        [void]$components.AppendChild($value)
+        $selectedComponents = @($value)
+    }
+
+    $components.SetAttribute("Count", [string]$selectedComponents.Count)
 }
 
 function Set-TurboGridExportSettings {
@@ -274,7 +311,11 @@ $TurboGrid_Exe = $TurboGridExe
 
 # 模板文件路径 (直接使用 CFturbo 和 TurboGrid 原生导出的文件)
 $CFT_Template  = $CftBatchTemplate
-$TGS_Template  = $TurboGridTemplate
+if (-not (Test-Path -LiteralPath $TurboGridTemplate -PathType Leaf)) {
+    throw "GUI 配置的 TurboGrid 状态模板不存在: $TurboGridTemplate"
+}
+$TGS_Template = (Resolve-Path -LiteralPath $TurboGridTemplate).Path
+Write-Host "--> 使用 GUI 配置的 TurboGrid 状态模板: $TGS_Template"
 
 # 当前计算步的工作文件
 $Current_CFT   = Join-Path $WorkingDir "run_cfturbo.cft-batch"
@@ -368,6 +409,7 @@ if (Test-Path $Source_CFT_Model) {
     Copy-Item -Path $Source_CFT_Model -Destination $Target_CFT_Model -Force
 } else {
     Write-Warning "!!! 找不到母本工程文件: $Source_CFT_Model"
+    Write-FailureStatus -Path $Failure_Status -Stage "infrastructure" -Reason "Base CFturbo project file is missing."
     exit 2
 }
 
@@ -376,12 +418,14 @@ $cftProcess = Start-Process -FilePath $CFturbo_Exe -ArgumentList "-batch `"$Curr
 
 if ($cftProcess.ExitCode -eq 2) {
     Write-Warning "CFturbo 几何生成失败 (ExitCode=2)，退出。"
+    Write-FailureStatus -Path $Failure_Status -Stage "geometry" -Reason "CFturbo geometry generation returned ExitCode=2."
     exit 1
 } elseif ($cftProcess.ExitCode -eq 1) {
     Write-Warning "CFturbo 完成但有警告 (ExitCode=1)，继续执行..."
     # 不退出，继续后续步骤
 }
 if ($cftProcess.ExitCode -eq 2) {
+    Write-FailureStatus -Path $Failure_Status -Stage "geometry" -Reason "CFturbo geometry generation returned ExitCode=2."
     exit 1
 }
 
@@ -408,6 +452,7 @@ if (-not (Test-CurveExport -Hub $Export_Hub -Shroud $Export_Shroud -Profile $Exp
     Write-Warning "CFturbo 二次导出日志: $cftExportLogPath"
     Write-Warning "当前目录文件:"
     Get-ChildItem -Path $WorkingDir | ForEach-Object { Write-Warning ("    " + $_.Name) }
+    Write-FailureStatus -Path $Failure_Status -Stage "infrastructure" -Reason "CFturbo did not export the required TurboGrid curve files."
     exit 1
 }
 Write-Host "CFturbo curve 文件验证通过，继续网格划分..."
@@ -441,6 +486,7 @@ if (Test-Path $cftLogPath) {
         foreach ($f in $fatalFound) {
             Write-Warning "    - $f"
         }
+        Write-FailureStatus -Path $Failure_Status -Stage "geometry" -Reason ($fatalFound -join "; ")
         exit 2   # 用 exit code=2 表示硬失败（区别于 exit code=1 的 CFturbo 警告）
     } else {
         Write-Host ">>> CFturbo log 检查通过，无致命警告，继续网格划分。" -ForegroundColor Green
@@ -505,6 +551,7 @@ if (Test-Path $Export_Mesh) {
     exit 0
 } else {
     Write-Warning "!!! TurboGrid 未输出 .gtm 文件，网格映射失败。"
+    Write-FailureStatus -Path $Failure_Status -Stage "mesh" -Reason "TurboGrid did not produce the requested GTM mesh."
     exit 2
 }
 } catch {
@@ -512,5 +559,6 @@ if (Test-Path $Export_Mesh) {
     # [新增] 打印出究竟是哪一行代码引发的报错！
     Write-Error "具体报错行数: $($_.InvocationInfo.PositionMessage)"
     Write-Error "堆栈跟踪: $($_.ScriptStackTrace)"
+    Write-FailureStatus -Path $Failure_Status -Stage "infrastructure" -Reason ([string]$_)
     exit 1
 }

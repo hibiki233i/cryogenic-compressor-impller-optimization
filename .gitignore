@@ -20,3 +20,6 @@ patent_materials/
 *.pdf
 *.json
 *.xml
+
+pareto_cft_cases/
+*.csv

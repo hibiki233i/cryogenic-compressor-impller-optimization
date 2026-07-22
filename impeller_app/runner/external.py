@@ -17,8 +17,23 @@ from scipy.stats import qmc
 
 from ..config import AppConfig
 from ..models import TaskResult, TaskUpdate
-from cfx_runner import run_cfx_pipeline
-from design_variables import ensure_training_csv, load_variable_specs, lower_bounds, training_csv_columns, upper_bounds, variable_names
+from cfx_runner import is_current_cfx_result, run_cfx_pipeline
+from design_variables import (
+    ensure_training_csv,
+    load_variable_specs,
+    lower_bounds,
+    require_current_performance_data,
+    training_csv_columns,
+    upper_bounds,
+    variable_names,
+    write_performance_data_metadata,
+)
+from failure_records import (
+    classify_cfx_failure_stage,
+    classify_geometry_failure_stage,
+    load_structured_failure_status,
+    record_run_outcome,
+)
 
 CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
 
@@ -55,6 +70,42 @@ class RunnerAPI:
         self.min_discard_flow_g_s = float(self.config.runtime.default_discard_flow_g_s)
         self.boundary_flow_g_s = float(self.config.runtime.default_boundary_flow_g_s)
 
+    def _record_doe_outcome(
+        self,
+        sample: dict,
+        run_id: str,
+        status: str,
+        failure_stage: str = "",
+        reason: str = "",
+    ) -> None:
+        record_run_outcome(
+            self.config.workspace.failure_records_csv,
+            self.variable_names,
+            sample,
+            source="doe",
+            run_id=run_id,
+            status=status,
+            failure_stage=failure_stage,
+            reason=reason,
+        )
+
+    def _write_run_sample(self, working_dir: Path, sample: dict) -> None:
+        payload = {name: float(sample[name]) for name in self.variable_names}
+        (working_dir / "input_parameters.json").write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+    def _read_run_sample(self, working_dir: Path) -> dict | None:
+        path = working_dir / "input_parameters.json"
+        if not path.exists():
+            return None
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            return {name: float(payload[name]) for name in self.variable_names}
+        except (OSError, ValueError, TypeError, KeyError):
+            return None
+
     def validate_environment(self) -> TaskResult:
         cfg = self.config
         checks = {
@@ -87,6 +138,7 @@ class RunnerAPI:
                 ensure_training_csv(training_csv, self.variable_specs)
                 created_training_csv = True
             ensure_training_csv(training_csv, self.variable_specs)
+            require_current_performance_data(training_csv)
         except Exception as exc:
             return TaskResult(
                 status="failed",
@@ -115,6 +167,7 @@ class RunnerAPI:
                     "partial_runs": recovery["partial_runs"],
                     "reposted_runs": recovery["reposted_runs"],
                     "repost_failed_runs": recovery["repost_failed_runs"],
+                    "retry_runs": len(recovery["retry_indices"]),
                     "training_csv_backup": recovery["training_csv_backup"],
                     "next_index": recovery["next_index"],
                 },
@@ -128,6 +181,7 @@ class RunnerAPI:
                 "partial_runs": recovery["partial_runs"],
                 "reposted_runs": recovery["reposted_runs"],
                 "repost_failed_runs": recovery["repost_failed_runs"],
+                "retry_runs": len(recovery["retry_indices"]),
                 "training_csv_backup": recovery["training_csv_backup"],
                 "next_index": recovery["next_index"],
             },
@@ -217,6 +271,7 @@ class RunnerAPI:
         partial_runs = 0
         reposted_runs = 0
         repost_failed_runs = 0
+        retry_indices: list[int] = []
         max_run_idx = -1
         run_dirs = sorted([p for p in runs_dir.glob("Run_*") if p.is_dir()], key=lambda p: int(p.name.split("_")[1]))
         for run_dir in run_dirs:
@@ -224,19 +279,37 @@ class RunnerAPI:
                 break
             idx = int(run_dir.name.split("_")[1])
             max_run_idx = max(max_run_idx, idx)
-            sample = self._sample_for_index(idx, base_samples, extra_samples)
+            sample = self._read_run_sample(run_dir)
+            if sample is None:
+                sample = self._sample_for_index(idx, base_samples, extra_samples)
             if sample is None:
                 continue
             result_txt = run_dir / "CFX_Results.txt"
-            if result_txt.exists():
+            if is_current_cfx_result(result_txt):
                 try:
                     row = self._read_result_file(result_txt, sample)
                     if row is not None:
                         rows.append(row)
+                        self._record_doe_outcome(sample, run_dir.name, "succeeded")
+                    else:
+                        partial_runs += 1
+                        retry_indices.append(idx)
+                        self._record_doe_outcome(
+                            sample,
+                            run_dir.name,
+                            "failed",
+                            "physical_invalid",
+                            "Recovered result has MassFlow below the discard threshold.",
+                        )
                 except Exception:
-                    pass
+                    partial_runs += 1
+                    retry_indices.append(idx)
             elif list(run_dir.glob("*.res")):
-                _emit(progress_callback, f"{run_dir.name}: found .res without CFX_Results.txt; running CFX-Post recovery...")
+                _emit(
+                    progress_callback,
+                    f"{run_dir.name}: result is missing or uses the legacy total-pressure definition; "
+                    "running CFX-Post recovery...",
+                )
                 cfx_result = self.run_cfx_case(
                     run_dir,
                     f"Recovery-{run_dir.name}",
@@ -251,14 +324,35 @@ class RunnerAPI:
                     if row is not None:
                         rows.append(row)
                         reposted_runs += 1
+                        self._record_doe_outcome(sample, run_dir.name, "succeeded")
                     else:
                         partial_runs += 1
+                        retry_indices.append(idx)
+                        self._record_doe_outcome(
+                            sample,
+                            run_dir.name,
+                            "failed",
+                            "physical_invalid",
+                            "Recovered result has MassFlow below the discard threshold.",
+                        )
                 else:
                     partial_runs += 1
                     repost_failed_runs += 1
+                    retry_indices.append(idx)
+                    self._record_doe_outcome(
+                        sample,
+                        run_dir.name,
+                        "failed",
+                        classify_cfx_failure_stage(cfx_result.message),
+                        cfx_result.message,
+                    )
+            else:
+                partial_runs += 1
+                retry_indices.append(idx)
         backup_path = self._backup_training_csv()
         df = pd.DataFrame(rows, columns=self._columns()) if rows else pd.DataFrame(columns=self._columns())
         df.to_csv(self.config.workspace.training_csv, index=False)
+        write_performance_data_metadata(self.config.workspace.training_csv)
         return {
             "canceled": _is_cancelled(cancel_event),
             "rows": rows,
@@ -266,6 +360,7 @@ class RunnerAPI:
             "partial_runs": partial_runs,
             "reposted_runs": reposted_runs,
             "repost_failed_runs": repost_failed_runs,
+            "retry_indices": retry_indices,
             "training_csv_backup": backup_path,
             "next_index": max_run_idx + 1,
             "base_samples": base_samples,
@@ -276,9 +371,11 @@ class RunnerAPI:
         training_csv = self.config.workspace.training_csv
         frame = pd.DataFrame([row], columns=self._columns())
         if training_csv.exists():
+            require_current_performance_data(training_csv)
             frame.to_csv(training_csv, mode="a", header=False, index=False)
         else:
             frame.to_csv(training_csv, index=False)
+            write_performance_data_metadata(training_csv)
 
     def build_geometry_command(self, working_dir: Path, sample: dict) -> list[str]:
         cmd = [
@@ -407,43 +504,160 @@ class RunnerAPI:
             artifacts={"working_dir": str(working_dir)},
         )
 
-    def run_doe_sample(self, index: int, sample: dict, progress_callback=None, cancel_event=None) -> TaskResult:
+    def run_doe_sample(self, index: int, sample: dict, progress_callback=None, cancel_event=None, force: bool = False) -> TaskResult:
         run_id = f"Run_{index:03d}"
         working_dir = self.config.workspace.doe_runs_dir / run_id
         working_dir.mkdir(parents=True, exist_ok=True)
+        self._write_run_sample(working_dir, sample)
         if _is_cancelled(cancel_event):
             return TaskResult(status="canceled", message=f"{run_id}: canceled before start.", artifacts={"working_dir": str(working_dir)})
         result_txt = working_dir / "CFX_Results.txt"
-        if result_txt.exists():
+        if not force and is_current_cfx_result(result_txt):
             row = self._read_result_file(result_txt, sample)
             if row is None:
+                self._record_doe_outcome(
+                    sample,
+                    run_id,
+                    "failed",
+                    "physical_invalid",
+                    "Existing result has MassFlow below the discard threshold.",
+                )
                 return TaskResult(status="failed", message=f"{run_id}: existing result diverged and was discarded.", artifacts={"working_dir": str(working_dir)})
+            self._record_doe_outcome(sample, run_id, "succeeded")
             return TaskResult(status="succeeded", message=f"{run_id}: reused existing result.", metrics=row, artifacts={"working_dir": str(working_dir)})
         _emit(progress_callback, f"{run_id}: generating geometry and mesh...")
         geometry_result = self.run_geometry_generation(working_dir, sample, run_id=run_id, progress_callback=progress_callback, cancel_event=cancel_event)
         if geometry_result.status != "succeeded":
+            if geometry_result.status == "failed":
+                structured_failure = load_structured_failure_status(working_dir)
+                self._record_doe_outcome(
+                    sample,
+                    run_id,
+                    "failed",
+                    (
+                        structured_failure["stage"]
+                        if structured_failure is not None
+                        else classify_geometry_failure_stage(
+                            geometry_result.message,
+                            "\n".join(
+                                str(geometry_result.metrics.get(key, ""))
+                                for key in ("stdout", "stderr")
+                            ),
+                        )
+                    ),
+                    (
+                        structured_failure["reason"]
+                        if structured_failure is not None
+                        else geometry_result.message
+                    ),
+                )
             return geometry_result
         if _is_cancelled(cancel_event):
             return TaskResult(status="canceled", message=f"{run_id}: canceled before CFX.", artifacts={"working_dir": str(working_dir)})
         _emit(progress_callback, f"{run_id}: geometry done, launching CFX...")
         cfx_result = self.run_cfx_case(working_dir, run_id, float(sample["P_out"]), int(round(float(sample["nBl"]))), cancel_event=cancel_event)
         if cfx_result.status != "succeeded":
+            if cfx_result.status == "failed":
+                self._record_doe_outcome(
+                    sample,
+                    run_id,
+                    "failed",
+                    classify_cfx_failure_stage(cfx_result.message),
+                    cfx_result.message,
+                )
             return cfx_result
         row = self._result_row_from_cfx_metrics(sample, cfx_result.metrics)
         if row is None:
+            self._record_doe_outcome(
+                sample,
+                run_id,
+                "failed",
+                "physical_invalid",
+                "MassFlow is below the discard threshold.",
+            )
             return TaskResult(status="failed", message=f"{run_id}: divergent MassFlow, discarded.", artifacts={"working_dir": str(working_dir)})
         self._append_training_row(row)
+        self._record_doe_outcome(sample, run_id, "succeeded")
         return TaskResult(status="succeeded", message=f"{run_id}: DOE sample completed.", metrics=row, artifacts={"working_dir": str(working_dir)})
+
+    def _run_doe_sample_with_failure_confirmation(
+        self,
+        index: int,
+        sample: dict,
+        progress_callback=None,
+        cancel_event=None,
+        force: bool = False,
+    ) -> TaskResult:
+        result = self.run_doe_sample(
+            index,
+            sample,
+            progress_callback=progress_callback,
+            cancel_event=cancel_event,
+            force=force,
+        )
+        if result.status != "failed" or "diverged" in result.message.lower():
+            return result
+        _emit(
+            progress_callback,
+            f"Run_{index:03d}: repeating the same point once to confirm the failure stage...",
+        )
+        return self.run_doe_sample(
+            index,
+            sample,
+            progress_callback=progress_callback,
+            cancel_event=cancel_event,
+            force=True,
+        )
 
     def run_doe_batch(self, progress_callback=None, cancel_event=None) -> TaskResult:
         self.config.workspace.doe_runs_dir.mkdir(parents=True, exist_ok=True)
-        recovery = self._recover_doe_progress()
+        recovery = self._recover_doe_progress(
+            progress_callback=progress_callback,
+            cancel_event=cancel_event,
+        )
+        if recovery.get("canceled"):
+            return TaskResult(
+                status="canceled",
+                message="DOE batch canceled during recovery.",
+                metrics={
+                    "completed_runs": len(recovery["rows"]),
+                    "target_runs": int(self.config.runtime.doe_target_samples),
+                },
+            )
         samples = recovery["base_samples"]
         extra_samples = recovery["extra_samples"]
         current_index = int(recovery["next_index"])
+        retry_indices = list(recovery["retry_indices"])
         target = int(self.config.runtime.doe_target_samples)
         completed = len(recovery["rows"])
         extra_ptr = max(0, current_index - len(samples))
+        for retry_index in retry_indices:
+            if completed >= target:
+                break
+            if _is_cancelled(cancel_event):
+                return TaskResult(status="canceled", message="DOE batch canceled.", metrics={"completed_runs": completed, "target_runs": target})
+            sample = self._sample_for_index(retry_index, samples, extra_samples)
+            if sample is None:
+                continue
+            _emit(
+                progress_callback,
+                f"Run_{retry_index:03d}: retrying existing failed DOE sample...",
+                progress=completed / max(1, target),
+            )
+            result = self._run_doe_sample_with_failure_confirmation(
+                retry_index,
+                sample,
+                progress_callback=progress_callback,
+                cancel_event=cancel_event,
+                force=True,
+            )
+            if result.status == "canceled":
+                return TaskResult(status="canceled", message=result.message, metrics={"completed_runs": completed, "target_runs": target}, artifacts=result.artifacts)
+            if result.status == "succeeded":
+                completed += 1
+                _emit(progress_callback, result.message, progress=completed / max(1, target), metrics={"completed_runs": completed, "target_runs": target})
+            else:
+                _emit(progress_callback, result.message, progress=completed / max(1, target))
         while completed < target:
             if _is_cancelled(cancel_event):
                 return TaskResult(status="canceled", message="DOE batch canceled.", metrics={"completed_runs": completed, "target_runs": target})
@@ -456,7 +670,12 @@ class RunnerAPI:
                 sample = self._new_extra_sample()
                 extra_samples.append(sample)
                 extra_ptr += 1
-            result = self.run_doe_sample(current_index, sample, progress_callback=progress_callback, cancel_event=cancel_event)
+            result = self._run_doe_sample_with_failure_confirmation(
+                current_index,
+                sample,
+                progress_callback=progress_callback,
+                cancel_event=cancel_event,
+            )
             current_index += 1
             if result.status == "canceled":
                 return TaskResult(status="canceled", message=result.message, metrics={"completed_runs": completed, "target_runs": target}, artifacts=result.artifacts)

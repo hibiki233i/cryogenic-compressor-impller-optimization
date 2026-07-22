@@ -17,6 +17,7 @@
     "doe_runs_dir": "D:\\BOUNDYR\\Runs",
     "active_learning_runs_dir": "D:\\BOUNDYR\\ActiveLearning_Runs",
     "training_csv": "D:\\BOUNDYR\\Compressor_Training_Data.csv",
+    "failure_records_csv": "D:\\BOUNDYR\\failure_records.csv",
     "design_variables_json": "D:\\BOUNDYR\\design_variables.json",
     "pareto_export_dir": "D:\\BOUNDYR\\pareto_cft_cases"
   },

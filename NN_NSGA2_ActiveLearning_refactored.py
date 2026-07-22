@@ -5,14 +5,20 @@ import subprocess
 import warnings
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
+from datetime import datetime, timezone
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from scipy.spatial.distance import cdist
 from scipy.stats import qmc
 from sklearn.preprocessing import MinMaxScaler, StandardScaler
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import mean_squared_error, roc_auc_score
+from sklearn.model_selection import KFold, StratifiedKFold, train_test_split
+from sklearn.metrics import (
+    mean_absolute_error,
+    mean_squared_error,
+    r2_score,
+    roc_auc_score,
+)
 from sklearn.ensemble import RandomForestClassifier
 import torch
 import torch.nn as nn
@@ -25,7 +31,24 @@ from cfx_runner import run_cfx_pipeline
 warnings.filterwarnings("ignore", category=UserWarning)
 import joblib
 from pymoo.util.nds.non_dominated_sorting import NonDominatedSorting
-from design_variables import lower_bounds, load_variable_specs, upper_bounds, variable_names
+from design_variables import (
+    PERFORMANCE_DATA_SCHEMA_VERSION,
+    TOTAL_PRESSURE_DEFINITION,
+    is_current_performance_data,
+    lower_bounds,
+    load_variable_specs,
+    require_current_performance_data,
+    upper_bounds,
+    variable_names,
+    write_performance_data_metadata,
+)
+from failure_records import (
+    classify_cfx_failure_stage,
+    classify_geometry_failure_stage,
+    load_structured_failure_status,
+    load_failure_training_sets,
+    record_run_outcome,
+)
 
 CREATE_NO_WINDOW = 0x08000000 if os.name == 'nt' else 0
 
@@ -49,20 +72,47 @@ ALL_OUTPUT_NAMES = ['Efficiency', TARGET_PR_NAME, 'Power', 'MassFlow']
 SURROGATE_OUTPUT_NAMES = ['Efficiency', TARGET_PR_NAME, 'MassFlow']
 SURROGATE_OUTPUT_IDX = [0, 1, 3]  
 TRUE_HV_REF_EFF = 0.6
-TRUE_HV_REF_PR  = 1.8
+TRUE_HV_REF_PR  = 1.0
 DESIGN_VARIABLES_PATH = _env_or_default("IMPELLER_DESIGN_VARIABLES_PATH", "design_variables.json")
 _VARIABLE_SPECS = load_variable_specs(DESIGN_VARIABLES_PATH)
 VAR_NAMES = variable_names(_VARIABLE_SPECS)
 L_BOUNDS = lower_bounds(_VARIABLE_SPECS)
 U_BOUNDS = upper_bounds(_VARIABLE_SPECS)
+P_OUT_NAME = "P_out"
+P_OUT_IDX = VAR_NAMES.index(P_OUT_NAME)
+GEOMETRY_VAR_NAMES = [name for name in VAR_NAMES if name != P_OUT_NAME]
+GEOMETRY_VAR_IDX = np.array([VAR_NAMES.index(name) for name in GEOMETRY_VAR_NAMES], dtype=int)
+
+# nBl remains an input of the performance surrogate and the explicit overlap
+# rule, but it is deliberately excluded from learned failure classifiers. P_out
+# is also excluded here because this workflow pins every optimization query to
+# one operating point; its tiny DOE/AL batch offset would otherwise leak the
+# run phase into the failure label instead of describing physical feasibility.
+FAILURE_CLASSIFIER_EXCLUDED_FEATURES = frozenset({"nBl", "P_out"})
+FEASIBILITY_FEATURE_NAMES = [
+    name for name in VAR_NAMES
+    if name not in FAILURE_CLASSIFIER_EXCLUDED_FEATURES
+]
+FEASIBILITY_VAR_IDX = np.array(
+    [VAR_NAMES.index(name) for name in FEASIBILITY_FEATURE_NAMES], dtype=int
+)
+GEOM_WARN_FEATURE_NAMES = [
+    name for name in GEOMETRY_VAR_NAMES
+    if name not in FAILURE_CLASSIFIER_EXCLUDED_FEATURES
+]
+GEOM_WARN_VAR_IDX = np.array(
+    [VAR_NAMES.index(name) for name in GEOM_WARN_FEATURE_NAMES], dtype=int
+)
 
 MIN_VALID_FLOW_G_S = float(_env_or_default("IMPELLER_MIN_VALID_FLOW_G_S", 0.1))
 MIN_DISCARD_FLOW_G_S = float(_env_or_default("IMPELLER_MIN_DISCARD_FLOW_G_S", 0.0001))
 BOUNDARY_FLOW_G_S = float(_env_or_default("IMPELLER_BOUNDARY_FLOW_G_S", 3.60))
 MIN_EFFICIENCY = float(_env_or_default("IMPELLER_MIN_EFFICIENCY", 0.60))
 MIN_POWER = float(_env_or_default("IMPELLER_MIN_POWER", 60.0))
-MIN_PRESSURE_RATIO = float(_env_or_default("IMPELLER_MIN_PRESSURE_RATIO", 1.60))
-MAX_PRESSURE_RATIO = float(_env_or_default("IMPELLER_MAX_PRESSURE_RATIO", 2.85))
+OPTIMIZATION_P_OUT = float(_env_or_default("IMPELLER_OPTIMIZATION_P_OUT", 12.0))
+OPERATING_POINT_P_OUT_TOLERANCE = float(
+    _env_or_default("IMPELLER_OPERATING_POINT_P_OUT_TOLERANCE", 0.25)
+)
 
 # 默认工程几何阈值，可由 GUI/配置文件覆盖，用于当前叶轮族的可行域筛选。
 MIN_D2_D1S_GAP = float(_env_or_default("IMPELLER_MIN_D2_D1S_GAP", 0.070))
@@ -91,24 +141,96 @@ OVERLAP_PENALTY_COEFF = 0.035
 OVERLAP_EHVI_DECAY_DEG = 3.0
 GEOM_WARN_PENALTY_COEFF = 0.20
 GEOM_WARN_RUNS_DIR_FALLBACK = "ActiveLearning_Runs"
-GEOM_WARN_FEATURE_NAMES = [name for name in VAR_NAMES if name != "P_out"]
 
 PS_SCRIPT_PATH  = _env_or_default("IMPELLER_PS_SCRIPT_PATH", r"F:\optimazition\Run-GeometryMeshing.ps1")
+TURBOGRID_TEMPLATE = _env_or_default(
+    "IMPELLER_TURBOGRID_TEMPLATE", r"F:\optimazition\Templates\new_base.tst"
+)
 AL_WORKING_BASE = _env_or_default("IMPELLER_AL_WORKING_BASE", r"F:\optimazition\ActiveLearning_Runs")
 TRAINING_CSV    = _env_or_default("IMPELLER_TRAINING_CSV", "Compressor_Training_Data.csv")
 SCALER_X_PATH = _env_or_default("IMPELLER_SCALER_X_PATH", "scaler_X.pkl")
 SCALER_Y_PATH = _env_or_default("IMPELLER_SCALER_Y_PATH", "scaler_Y.pkl")
 BEST_REG_PATH   = _env_or_default("IMPELLER_BEST_REG_PATH", "best_regressor.pth")
-GEOM_WARN_CLF_PATH = _env_or_default("IMPELLER_GEOM_WARN_CLF_PATH", "geometry_warning_clf.pkl")
+GEOM_FEAS_CLF_PATH = _env_or_default(
+    "IMPELLER_GEOM_FEAS_CLF_PATH", "geometry_feasibility_clf.pkl"
+)
 HV_CSV_PATH     = _env_or_default("IMPELLER_HV_CSV_PATH", "hv_history.csv")
 HV_PLOT_PATH    = _env_or_default("IMPELLER_HV_PLOT_PATH", "hv_convergence.png")
 FAILED_POINTS_PATH = _env_or_default("IMPELLER_FAILED_POINTS_PATH", "failed_points.npy")  # 保留失败样本池
+FAILURE_RECORDS_CSV = _env_or_default(
+    "IMPELLER_FAILURE_RECORDS_CSV", "failure_records.csv"
+)
+SURROGATE_METRICS_CSV = _env_or_default(
+    "IMPELLER_SURROGATE_METRICS_CSV", "surrogate_validation_history.csv"
+)
+CV_FOLD_METRICS_CSV = _env_or_default(
+    "IMPELLER_CV_FOLD_METRICS_CSV", "surrogate_cv_fold_history.csv"
+)
+FIXED_TEST_PREDICTIONS_CSV = _env_or_default(
+    "IMPELLER_FIXED_TEST_PREDICTIONS_CSV", "fixed_test_predictions_history.csv"
+)
+AL_QUERY_VALIDATION_CSV = _env_or_default(
+    "IMPELLER_AL_QUERY_VALIDATION_CSV", "al_query_validation.csv"
+)
 TEST_SPLIT_PATH = _env_or_default("IMPELLER_TEST_SPLIT_PATH", "fixed_test_set.npz")  # 固定测试集，避免随机划分引入评估波动
 TEST_SET_CSV = _env_or_default("IMPELLER_TEST_SET_CSV", "fixed_test_set.csv")
 POOL_CHECKPOINT_CSV = _env_or_default("IMPELLER_POOL_CHECKPOINT_CSV", "al_training_pool_checkpoint.csv")
 CHECKPOINT_META_PATH = _env_or_default("IMPELLER_CHECKPOINT_META_PATH", "al_checkpoint_meta.json")
 GEOMETRY_SUMMARY_PATH = _env_or_default("IMPELLER_GEOMETRY_SUMMARY_PATH", "geometry_summary.json")
 ENABLE_INTERACTIVE_PLOT = _env_or_default("IMPELLER_ENABLE_PLOT", "0").lower() in {"1", "true", "yes"}
+
+HV_HISTORY_COLUMNS = [
+    "iter", "hv_policy_version", "n_samples", "train_samples_before_cfd",
+    "true_hv", "surrogate_hv",
+    "mse_eff", "mse_pr", "mse_mf", "rmse_eff", "rmse_pr", "rmse_mf",
+    "mae_eff", "mae_pr", "mae_mf", "r2_eff", "r2_pr", "r2_mf",
+    "cv_rmse_eff_mean", "cv_rmse_pr_mean", "cv_rmse_mf_mean",
+    "cv_r2_eff_mean", "cv_r2_pr_mean", "cv_r2_mf_mean",
+]
+HV_POLICY_VERSION = 2  # v2: verified CFD front is not vetoed by soft overlap proxy
+
+
+def read_optional_csv(path: str, columns: list[str] | None = None) -> pd.DataFrame:
+    """Read a CSV that may exist before its first data row is written."""
+    if not os.path.exists(path) or os.path.getsize(path) == 0:
+        return pd.DataFrame(columns=columns)
+    try:
+        return pd.read_csv(path)
+    except pd.errors.EmptyDataError:
+        return pd.DataFrame(columns=columns)
+
+
+def write_hv_history(path: str, records: list[dict]) -> pd.DataFrame:
+    frame = pd.DataFrame(records, columns=HV_HISTORY_COLUMNS)
+    frame.to_csv(path, index=False)
+    return frame
+
+
+def recover_query_counters(
+    query_csv_path: str,
+    total_attempts: int = 0,
+    total_success: int = 0,
+) -> tuple[int, int]:
+    """Prevent run-id reuse when query CSV is newer than checkpoint metadata."""
+    history = read_optional_csv(query_csv_path)
+    if history.empty or "run_id" not in history.columns:
+        return int(total_attempts), int(total_success)
+
+    attempt_ids = pd.to_numeric(
+        history["run_id"].astype(str).str.extract(r"_A(\d+)$", expand=False),
+        errors="coerce",
+    ).dropna()
+    if len(attempt_ids) > 0:
+        total_attempts = max(int(total_attempts), int(attempt_ids.max()))
+    if "status" in history.columns:
+        logged_success = int(
+            history.loc[
+                history["status"].astype(str).str.lower() == "success",
+                "run_id",
+            ].nunique()
+        )
+        total_success = max(int(total_success), logged_success)
+    return int(total_attempts), int(total_success)
 
 
 MAX_AL_ITERS    = 80
@@ -139,6 +261,12 @@ class ALConfig:
     n_gen: int = 120
 
     n_eval_candidates_per_iter: int = 4
+    cv_folds: int = 5
+    cv_max_epochs: int = 1200
+    cv_patience: int = 40
+    density_k_neighbors: int = 10
+    sample_weight_min: float = 0.25
+    sample_weight_max: float = 4.0
 
     # --- 新增：局部采样比例 ---
     local_sample_ratio: float = 0.4
@@ -161,7 +289,45 @@ def configure_runtime(**overrides):
         globals_dict["VAR_NAMES"] = variable_names(specs)
         globals_dict["L_BOUNDS"] = lower_bounds(specs)
         globals_dict["U_BOUNDS"] = upper_bounds(specs)
-        globals_dict["GEOM_WARN_FEATURE_NAMES"] = [name for name in globals_dict["VAR_NAMES"] if name != "P_out"]
+        globals_dict["P_OUT_IDX"] = globals_dict["VAR_NAMES"].index(P_OUT_NAME)
+        globals_dict["GEOMETRY_VAR_NAMES"] = [
+            name for name in globals_dict["VAR_NAMES"] if name != P_OUT_NAME
+        ]
+        globals_dict["GEOMETRY_VAR_IDX"] = np.array(
+            [globals_dict["VAR_NAMES"].index(name) for name in globals_dict["GEOMETRY_VAR_NAMES"]],
+            dtype=int,
+        )
+        globals_dict["FEASIBILITY_FEATURE_NAMES"] = [
+            name for name in globals_dict["VAR_NAMES"]
+            if name not in FAILURE_CLASSIFIER_EXCLUDED_FEATURES
+        ]
+        globals_dict["FEASIBILITY_VAR_IDX"] = np.array(
+            [
+                globals_dict["VAR_NAMES"].index(name)
+                for name in globals_dict["FEASIBILITY_FEATURE_NAMES"]
+            ],
+            dtype=int,
+        )
+        globals_dict["GEOM_WARN_FEATURE_NAMES"] = [
+            name for name in globals_dict["GEOMETRY_VAR_NAMES"]
+            if name not in FAILURE_CLASSIFIER_EXCLUDED_FEATURES
+        ]
+        globals_dict["GEOM_WARN_VAR_IDX"] = np.array(
+            [
+                globals_dict["VAR_NAMES"].index(name)
+                for name in globals_dict["GEOM_WARN_FEATURE_NAMES"]
+            ],
+            dtype=int,
+        )
+
+    p_out_lower = float(globals_dict["L_BOUNDS"][globals_dict["P_OUT_IDX"]])
+    p_out_upper = float(globals_dict["U_BOUNDS"][globals_dict["P_OUT_IDX"]])
+    fixed_p_out = float(globals_dict["OPTIMIZATION_P_OUT"])
+    if not p_out_lower <= fixed_p_out <= p_out_upper:
+        raise ValueError(
+            f"OPTIMIZATION_P_OUT={fixed_p_out} Pa must be within "
+            f"the surrogate training bounds [{p_out_lower}, {p_out_upper}] Pa."
+        )
 
 
 def parse_runtime_args():
@@ -209,6 +375,14 @@ def get_resume_iter(
         try:
             with open(checkpoint_meta_path, "r", encoding="utf-8") as f:
                 meta = json.load(f)
+            if (
+                int(meta.get("performance_data_schema_version", 0))
+                != PERFORMANCE_DATA_SCHEMA_VERSION
+                or meta.get("total_pressure_definition")
+                != TOTAL_PRESSURE_DEFINITION
+            ):
+                print("[断点续跑] 忽略旧总压定义对应的 checkpoint 元信息。")
+                return 0
             completed_iters = int(meta.get("completed_iters", 0) or 0)
             in_progress_iter = meta.get("in_progress_iter")
             if in_progress_iter is not None:
@@ -221,7 +395,7 @@ def get_resume_iter(
             print(f"[断点续跑] 读取 checkpoint 元信息失败，将回退到 HV 历史: {e}")
 
     if os.path.exists(hv_csv_path):
-        hv_df = pd.read_csv(hv_csv_path)
+        hv_df = read_optional_csv(hv_csv_path, HV_HISTORY_COLUMNS)
         if len(hv_df) > 0 and 'iter' in hv_df.columns:
             return int(hv_df['iter'].max())
     return 0
@@ -230,6 +404,14 @@ def get_resume_iter(
 def load_pool_checkpoint(pool_csv=None):
     pool_csv = POOL_CHECKPOINT_CSV if pool_csv is None else pool_csv
     if not os.path.exists(pool_csv):
+        return None
+    if os.path.getsize(pool_csv) == 0:
+        print(f"[断点续跑] 忽略空训练池 checkpoint: {pool_csv}")
+        return None
+    if not is_current_performance_data(pool_csv):
+        print(
+            f"[断点续跑] 忽略旧版训练池 checkpoint（总压定义不匹配）: {pool_csv}"
+        )
         return None
 
     df_pool = pd.read_csv(pool_csv)
@@ -273,9 +455,10 @@ def save_checkpoint(
         df_pool[col] = Y_pool[:, j]
     df_pool['is_boundary'] = W_pool
     df_pool.to_csv(pool_csv, index=False)
+    write_performance_data_metadata(pool_csv)
 
     np.save(failed_points_path, np.array(failed_points, dtype=float))
-    pd.DataFrame(hv_history).to_csv(hv_csv_path, index=False)
+    write_hv_history(hv_csv_path, hv_history)
 
     if completed_iters is None:
         completed_iters = al_iter + 1
@@ -289,7 +472,15 @@ def save_checkpoint(
         "total_attempts": int(total_attempts),
         "total_success": int(total_success),
         "pool_checkpoint_csv": pool_csv,
-        "fixed_test_set_csv": TEST_SET_CSV
+        "fixed_test_set_csv": TEST_SET_CSV,
+        "surrogate_metrics_csv": SURROGATE_METRICS_CSV,
+        "cv_fold_metrics_csv": CV_FOLD_METRICS_CSV,
+        "fixed_test_predictions_csv": FIXED_TEST_PREDICTIONS_CSV,
+        "al_query_validation_csv": AL_QUERY_VALIDATION_CSV,
+        "failure_records_csv": FAILURE_RECORDS_CSV,
+        "hv_policy_version": HV_POLICY_VERSION,
+        "performance_data_schema_version": PERFORMANCE_DATA_SCHEMA_VERSION,
+        "total_pressure_definition": TOTAL_PRESSURE_DEFINITION,
     }
     with open(checkpoint_meta_path, "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
@@ -308,6 +499,37 @@ def snap_discrete_vars(X: np.ndarray) -> np.ndarray:
     return X
 
 
+def expand_geometry_decisions(
+    X_geometry: np.ndarray,
+    fixed_p_out: float | None = None,
+) -> np.ndarray:
+    """Expand 13 geometry decisions to the 14-input conditional surrogate vector."""
+    X_geometry = np.asarray(X_geometry, dtype=float)
+    if X_geometry.ndim == 1:
+        X_geometry = X_geometry[None, :]
+    if X_geometry.shape[1] == len(VAR_NAMES):
+        X_full = np.array(X_geometry, dtype=float, copy=True)
+    elif X_geometry.shape[1] == len(GEOMETRY_VAR_NAMES):
+        X_full = np.empty((len(X_geometry), len(VAR_NAMES)), dtype=float)
+        X_full[:, GEOMETRY_VAR_IDX] = X_geometry
+    else:
+        raise ValueError(
+            f"Expected {len(GEOMETRY_VAR_NAMES)} geometry values or "
+            f"{len(VAR_NAMES)} full surrogate inputs, got {X_geometry.shape[1]}."
+        )
+    active_p_out = OPTIMIZATION_P_OUT if fixed_p_out is None else fixed_p_out
+    X_full[:, P_OUT_IDX] = float(active_p_out)
+    return snap_discrete_vars(X_full)
+
+
+def pin_optimization_operating_point(
+    X: np.ndarray,
+    fixed_p_out: float | None = None,
+) -> np.ndarray:
+    """Keep P_out as a surrogate context input, never as an optimization decision."""
+    return expand_geometry_decisions(X, fixed_p_out=fixed_p_out)
+
+
 def normalize_minmax(arr: np.ndarray) -> np.ndarray:
     arr = np.asarray(arr)
     rng = arr.max() - arr.min()
@@ -316,6 +538,150 @@ def normalize_minmax(arr: np.ndarray) -> np.ndarray:
 
 def calc_distance_to_set(X_norm: np.ndarray, ref_norm: np.ndarray) -> np.ndarray:
     return cdist(X_norm, ref_norm).min(axis=1)
+
+
+def utc_timestamp() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def upsert_csv_records(
+    csv_path: str,
+    records: list[dict] | dict,
+    key_columns: list[str],
+) -> None:
+    """Crash-tolerant CSV upsert used by validation and CFD query logs."""
+    if isinstance(records, dict):
+        records = [records]
+    if not records:
+        return
+
+    new_df = pd.DataFrame(records)
+    missing_keys = [column for column in key_columns if column not in new_df.columns]
+    if missing_keys:
+        raise ValueError(f"CSV upsert records missing key columns: {missing_keys}")
+
+    if os.path.exists(csv_path):
+        existing = read_optional_csv(csv_path)
+    else:
+        existing = pd.DataFrame()
+
+    merged = pd.concat([existing, new_df], ignore_index=True, sort=False)
+    merged = merged.drop_duplicates(subset=key_columns, keep="last")
+    os.makedirs(os.path.dirname(os.path.abspath(csv_path)), exist_ok=True)
+    tmp_path = f"{csv_path}.tmp"
+    merged.to_csv(tmp_path, index=False)
+    os.replace(tmp_path, csv_path)
+    write_performance_data_metadata(csv_path)
+
+
+def regression_metrics(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    prefix: str = "",
+) -> dict:
+    """Return per-output and macro MSE/RMSE/MAE/R² metrics."""
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+    if y_true.shape != y_pred.shape:
+        raise ValueError(
+            f"Metric arrays must have the same shape, got {y_true.shape} and {y_pred.shape}."
+        )
+    if y_true.ndim != 2 or y_true.shape[1] != len(SURROGATE_OUTPUT_NAMES):
+        raise ValueError(
+            f"Expected metric arrays with shape (N, {len(SURROGATE_OUTPUT_NAMES)})."
+        )
+
+    suffixes = ["eff", "pr", "mf"]
+    result = {}
+    per_metric = {"mse": [], "rmse": [], "mae": [], "r2": []}
+    for output_idx, suffix in enumerate(suffixes):
+        true_col = y_true[:, output_idx]
+        pred_col = y_pred[:, output_idx]
+        mse = float(mean_squared_error(true_col, pred_col))
+        values = {
+            "mse": mse,
+            "rmse": float(np.sqrt(mse)),
+            "mae": float(mean_absolute_error(true_col, pred_col)),
+            "r2": float(r2_score(true_col, pred_col)) if len(true_col) >= 2 else np.nan,
+        }
+        for metric_name, value in values.items():
+            result[f"{prefix}{metric_name}_{suffix}"] = value
+            per_metric[metric_name].append(value)
+
+    for metric_name, values in per_metric.items():
+        result[f"{prefix}{metric_name}_macro"] = float(np.nanmean(values))
+    return result
+
+
+def compute_density_nbl_sample_weights(
+    X_norm: np.ndarray,
+    nbl_values: np.ndarray,
+    k_neighbors: int = 10,
+    min_weight: float = 0.25,
+    max_weight: float = 4.0,
+) -> tuple[np.ndarray, dict]:
+    """
+    Combine local inverse-density weighting with inverse-frequency nBl weighting.
+
+    Sparse points receive larger k-nearest-neighbour distance weights; each nBl
+    class receives a tempered inverse-frequency weight. Square-root tempering,
+    clipping and mean-one normalization prevent rare classes from destabilizing
+    the optimizer.
+    """
+    X_norm = np.asarray(X_norm, dtype=float)
+    nbl_values = np.rint(np.asarray(nbl_values, dtype=float)).astype(int)
+    n_samples = len(X_norm)
+    if n_samples != len(nbl_values):
+        raise ValueError("X_norm and nbl_values must contain the same sample count.")
+    if n_samples == 0:
+        return np.empty(0, dtype=float), {
+            "weight_min": np.nan,
+            "weight_max": np.nan,
+            "weight_mean": np.nan,
+            "effective_sample_size": 0.0,
+            "density_k": 0,
+            "nbl_weight_means": "{}",
+        }
+
+    if n_samples == 1:
+        density_weight = np.ones(1)
+        density_k = 0
+    else:
+        density_k = min(max(1, int(k_neighbors)), n_samples - 1)
+        distances = cdist(X_norm, X_norm)
+        np.fill_diagonal(distances, np.inf)
+        nearest = np.partition(distances, density_k - 1, axis=1)[:, :density_k]
+        mean_neighbor_distance = nearest.mean(axis=1)
+        reference_distance = max(float(np.median(mean_neighbor_distance)), 1e-12)
+        density_weight = np.sqrt(mean_neighbor_distance / reference_distance)
+
+    unique_nbl, nbl_counts = np.unique(nbl_values, return_counts=True)
+    n_classes = max(len(unique_nbl), 1)
+    nbl_weight_map = {
+        int(nbl): np.sqrt(n_samples / (n_classes * int(count)))
+        for nbl, count in zip(unique_nbl, nbl_counts)
+    }
+    nbl_weight = np.array([nbl_weight_map[int(nbl)] for nbl in nbl_values])
+
+    weights = density_weight * nbl_weight
+    weights /= max(float(np.mean(weights)), 1e-12)
+    weights = np.clip(weights, float(min_weight), float(max_weight))
+    weights /= max(float(np.mean(weights)), 1e-12)
+
+    effective_n = float(weights.sum() ** 2 / max(np.square(weights).sum(), 1e-12))
+    nbl_weight_means = {
+        str(int(nbl)): float(weights[nbl_values == nbl].mean())
+        for nbl in unique_nbl
+    }
+    diagnostics = {
+        "weight_min": float(weights.min()),
+        "weight_max": float(weights.max()),
+        "weight_mean": float(weights.mean()),
+        "effective_sample_size": effective_n,
+        "density_k": int(density_k),
+        "nbl_weight_means": json.dumps(nbl_weight_means, ensure_ascii=False),
+    }
+    return weights, diagnostics
 
 
 def infer_boundary_from_outputs(y: np.ndarray) -> float:
@@ -393,7 +759,10 @@ def geometry_safe_mask(
 
 
 def load_and_clean_data(csv_path: str):
-    df = pd.read_csv(csv_path)
+    require_current_performance_data(csv_path)
+    df = read_optional_csv(csv_path)
+    if len(df.columns) == 0:
+        raise ValueError(f"TRAINING_CSV 为空或没有表头: {csv_path}")
 
     required_cols = VAR_NAMES + ALL_OUTPUT_NAMES + ['is_boundary']
     for c in required_cols:
@@ -442,7 +811,11 @@ def split_with_fixed_testset(df: pd.DataFrame, test_csv=None, test_size=0.15):
             "请先补充更多 DOE 样本后再运行主动学习。"
         )
 
-    if os.path.exists(test_csv):
+    if (
+        os.path.exists(test_csv)
+        and os.path.getsize(test_csv) > 0
+        and is_current_performance_data(test_csv)
+    ):
         test_df = pd.read_csv(test_csv)
 
         # 用设计变量做匹配键
@@ -472,6 +845,7 @@ def split_with_fixed_testset(df: pd.DataFrame, test_csv=None, test_size=0.15):
         )
 
         df_test.to_csv(test_csv, index=False)
+        write_performance_data_metadata(test_csv)
         print(f"[保存固定测试集] {test_csv} | 测试集 {len(df_test)} | 训练池 {len(df_train)}")
 
     X_pool = df_train[VAR_NAMES].values.astype(float)
@@ -569,18 +943,20 @@ def _generate_candidates_mixed(
     X_global = snap_discrete_vars(
         qmc.scale(sampler.random(n_global), L_BOUNDS, U_BOUNDS)
     )
+    X_global = pin_optimization_operating_point(X_global)
 
     if current_pareto_X is not None and len(current_pareto_X) > 0:
         sigma = (U_BOUNDS - L_BOUNDS) * 0.06   # 各维度范围的 6%
         idx = np.random.choice(len(current_pareto_X), n_local, replace=True)
         X_local = current_pareto_X[idx] + np.random.randn(n_local, len(VAR_NAMES)) * sigma
         X_local = np.clip(X_local, L_BOUNDS, U_BOUNDS)
-        X_local = snap_discrete_vars(X_local)
+        X_local = pin_optimization_operating_point(X_local)
     else:
         sampler2 = qmc.LatinHypercube(d=len(VAR_NAMES), seed=None)
         X_local = snap_discrete_vars(
             qmc.scale(sampler2.random(n_local), L_BOUNDS, U_BOUNDS)
         )
+        X_local = pin_optimization_operating_point(X_local)
 
     return np.vstack([X_global, X_local])
 def compute_true_cumulative_hv(
@@ -589,16 +965,28 @@ def compute_true_cumulative_hv(
     W_pool: np.ndarray,
     geom_warn_clf=None,
     geom_safe_threshold: float | None = None,
-    exclude_overlap_proxy: bool = True,
+    exclude_overlap_proxy: bool = False,
     ref_eff: float = TRUE_HV_REF_EFF,
-    ref_pr: float = TRUE_HV_REF_PR
+    ref_pr: float = TRUE_HV_REF_PR,
+    fixed_p_out: float | None = None,
+    p_out_tolerance: float | None = None,
 ):
     """
-    返回 (hv_val, front_Y, front_X)
+    返回 (hv_val, front_Y, front_X)。已完成 CFD 的成功点默认不再被
+    overlap 软代理否决；该代理只用于未计算候选的采集惩罚。
     front_Y: (K, 2) 非支配前沿的 [Efficiency, PR]
     front_X: (K, 14) 对应的设计变量，供局部采样使用
     """
     X_pool = snap_discrete_vars(X_pool)
+    active_p_out = OPTIMIZATION_P_OUT if fixed_p_out is None else fixed_p_out
+    active_tolerance = (
+        OPERATING_POINT_P_OUT_TOLERANCE
+        if p_out_tolerance is None
+        else p_out_tolerance
+    )
+    operating_point_ok = (
+        np.abs(X_pool[:, P_OUT_IDX] - float(active_p_out)) <= float(active_tolerance)
+    )
     geom_ok = geometry_safe_mask(
         X_pool,
         geom_warn_clf=geom_warn_clf,
@@ -607,10 +995,9 @@ def compute_true_cumulative_hv(
     )
 
     feas_mask = (
+        operating_point_ok &
         geom_ok &
         (Y_pool[:, 0] >= MIN_EFFICIENCY) &
-        (Y_pool[:, 1] >= MIN_PRESSURE_RATIO) &
-        (Y_pool[:, 1] <= MAX_PRESSURE_RATIO) &
         (Y_pool[:, 3] >= BOUNDARY_FLOW_G_S)
     )
 
@@ -643,7 +1030,7 @@ def extract_surrogate_front_and_hv(
     if res.X is None or len(res.X) == 0:
         return None, None, np.nan
 
-    X_pf = snap_discrete_vars(np.atleast_2d(res.X))
+    X_pf = expand_geometry_decisions(np.atleast_2d(res.X))
     X_pf_norm = scaler_X.transform(X_pf)
 
     mean_real, _ = mc_dropout_predict(reg_model, X_pf_norm, scaler_Y, n_samples=50)
@@ -709,9 +1096,16 @@ class BoundaryClassifierNN(nn.Module):
 # =============================================================================
 # 损失函数
 # =============================================================================
-def weighted_regression_loss(pred, target, is_boundary):
+def weighted_regression_loss(
+    pred,
+    target,
+    is_boundary,
+    sample_weights=None,
+):
     per_sample = ((pred - target) ** 2).mean(dim=1)
     weights = 1.0 + (BOUNDARY_WEIGHT - 1.0) * is_boundary
+    if sample_weights is not None:
+        weights = weights * sample_weights
     return (per_sample * weights).mean()
 
 
@@ -721,9 +1115,19 @@ def weighted_regression_loss(pred, target, is_boundary):
 def train_regressor(
     X_train, Y_train, W_train,
     X_val, Y_val, W_val,
-    save_path=BEST_REG_PATH
+    save_path=BEST_REG_PATH,
+    sample_weights_train=None,
+    max_epochs: int = 1200,
+    patience: int = 40,
+    random_seed: int | None = None,
 ):
-    model = PerformanceSurrogate(input_dim=14, output_dim=3).to(DEVICE)
+    if random_seed is not None:
+        torch.manual_seed(int(random_seed))
+
+    model = PerformanceSurrogate(
+        input_dim=len(VAR_NAMES),
+        output_dim=len(SURROGATE_OUTPUT_NAMES),
+    ).to(DEVICE)
     optimizer = optim.Adam(model.parameters(), lr=0.0015, weight_decay=1e-5)
 
     Xtr = torch.tensor(X_train, dtype=torch.float32, device=DEVICE)
@@ -733,18 +1137,23 @@ def train_regressor(
     Xva = torch.tensor(X_val, dtype=torch.float32, device=DEVICE)
     Yva = torch.tensor(Y_val, dtype=torch.float32, device=DEVICE)
     Wva = torch.tensor(W_val, dtype=torch.float32, device=DEVICE)
+    Str = (
+        torch.tensor(sample_weights_train, dtype=torch.float32, device=DEVICE)
+        if sample_weights_train is not None
+        else None
+    )
 
     best_val = np.inf
-    patience = 40
     counter = 0
+    best_state = None
 
     history = []
 
-    for epoch in range(1200):
+    for epoch in range(int(max_epochs)):
         model.train()
         optimizer.zero_grad()
         pred = model(Xtr)
-        loss = weighted_regression_loss(pred, Ytr, Wtr)
+        loss = weighted_regression_loss(pred, Ytr, Wtr, Str)
         loss.backward()
         optimizer.step()
 
@@ -758,14 +1167,20 @@ def train_regressor(
         if val_loss < best_val:
             best_val = val_loss
             counter = 0
-            torch.save(model.state_dict(), save_path)
+            best_state = {
+                key: value.detach().cpu().clone()
+                for key, value in model.state_dict().items()
+            }
         else:
             counter += 1
 
         if counter >= patience:
             break
 
-    model.load_state_dict(torch.load(save_path, map_location=DEVICE))
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    if save_path is not None:
+        torch.save(model.state_dict(), save_path)
     return model, history
 
 
@@ -787,7 +1202,8 @@ def train_feasibility_classifier(X_success, X_failed, min_failed_required=4):
         
     print(f"  [可行性分类器] 满足启动条件 (成功: {n_success}, 失败: {n_failed})，开始训练...")
 
-    X_all = np.vstack([X_success, X_failed])
+    X_all_raw = snap_discrete_vars(np.vstack([X_success, X_failed]))
+    X_all = X_all_raw[:, FEASIBILITY_VAR_IDX]
     y_all = np.hstack([np.ones(n_success), np.zeros(n_failed)])
 
     # 2. 动态正则化：失败样本越少，对树模型的约束越强，防止过拟合
@@ -818,6 +1234,11 @@ def train_feasibility_classifier(X_success, X_failed, min_failed_required=4):
     )
     
     clf.fit(X_all, y_all)
+    clf.impeller_feature_names_ = tuple(FEASIBILITY_FEATURE_NAMES)
+    clf.impeller_excluded_feature_names_ = tuple(
+        sorted(FAILURE_CLASSIFIER_EXCLUDED_FEATURES)
+    )
+    clf.impeller_classifier_schema_version_ = 2
     return clf
 
 
@@ -900,6 +1321,111 @@ def deterministic_predict(model, X_norm, scaler_Y):
     return scaler_Y.inverse_transform(y_norm)
 
 
+def normalized_std_to_real(std_norm: np.ndarray, scaler_Y) -> np.ndarray:
+    """Convert MinMax-scaled predictive standard deviation to physical units."""
+    scale = np.asarray(scaler_Y.scale_, dtype=float)
+    safe_scale = np.where(np.abs(scale) > 1e-12, np.abs(scale), np.nan)
+    return np.asarray(std_norm, dtype=float) / safe_scale
+
+
+def run_kfold_surrogate_validation(
+    X_raw: np.ndarray,
+    Y_surr: np.ndarray,
+    W_boundary: np.ndarray,
+    al_iter: int,
+    cfg: ALConfig,
+) -> tuple[list[dict], dict]:
+    """Leakage-safe K-fold validation with fold-local scalers and train weights."""
+    X_raw = snap_discrete_vars(X_raw)
+    Y_surr = np.asarray(Y_surr, dtype=float)
+    W_boundary = np.asarray(W_boundary, dtype=float)
+    n_samples = len(X_raw)
+    n_splits = min(int(cfg.cv_folds), n_samples)
+    if n_splits < 2:
+        return [], {
+            "cv_status": "insufficient_samples",
+            "cv_folds": int(n_splits),
+        }
+
+    nbl_idx = VAR_NAMES.index("nBl")
+    nbl_values = np.rint(X_raw[:, nbl_idx]).astype(int)
+    strat_labels = np.array(
+        [f"{nbl}:{int(boundary)}" for nbl, boundary in zip(nbl_values, W_boundary)]
+    )
+    _, strat_counts = np.unique(strat_labels, return_counts=True)
+    if len(strat_counts) > 0 and int(strat_counts.min()) >= n_splits:
+        splitter = StratifiedKFold(
+            n_splits=n_splits,
+            shuffle=True,
+            random_state=42,
+        )
+        split_iter = splitter.split(X_raw, strat_labels)
+        split_method = "stratified_nBl_boundary"
+    else:
+        splitter = KFold(n_splits=n_splits, shuffle=True, random_state=42)
+        split_iter = splitter.split(X_raw)
+        split_method = "kfold"
+
+    fold_rows = []
+    for fold_idx, (train_idx, val_idx) in enumerate(split_iter, start=1):
+        fold_scaler_X = MinMaxScaler()
+        fold_scaler_Y = MinMaxScaler()
+        X_train_norm = fold_scaler_X.fit_transform(X_raw[train_idx])
+        X_val_norm = fold_scaler_X.transform(X_raw[val_idx])
+        Y_train_norm = fold_scaler_Y.fit_transform(Y_surr[train_idx])
+        Y_val_norm = fold_scaler_Y.transform(Y_surr[val_idx])
+
+        train_weights, weight_diag = compute_density_nbl_sample_weights(
+            X_train_norm,
+            nbl_values[train_idx],
+            k_neighbors=cfg.density_k_neighbors,
+            min_weight=cfg.sample_weight_min,
+            max_weight=cfg.sample_weight_max,
+        )
+        fold_model, fold_history = train_regressor(
+            X_train_norm,
+            Y_train_norm,
+            W_boundary[train_idx],
+            X_val_norm,
+            Y_val_norm,
+            W_boundary[val_idx],
+            save_path=None,
+            sample_weights_train=train_weights,
+            max_epochs=cfg.cv_max_epochs,
+            patience=cfg.cv_patience,
+            random_seed=10000 + int(al_iter) * 100 + fold_idx,
+        )
+        fold_pred = deterministic_predict(fold_model, X_val_norm, fold_scaler_Y)
+        row = {
+            "iter": int(al_iter),
+            "fold": int(fold_idx),
+            "n_train": int(len(train_idx)),
+            "n_validation": int(len(val_idx)),
+            "split_method": split_method,
+            "epochs": int(len(fold_history)),
+            "recorded_at_utc": utc_timestamp(),
+            **regression_metrics(Y_surr[val_idx], fold_pred),
+            **weight_diag,
+        }
+        fold_rows.append(row)
+
+    metric_columns = [
+        f"{metric}_{suffix}"
+        for metric in ("mse", "rmse", "mae", "r2")
+        for suffix in ("eff", "pr", "mf", "macro")
+    ]
+    summary = {
+        "cv_status": "completed",
+        "cv_folds": int(n_splits),
+        "cv_split_method": split_method,
+    }
+    for column in metric_columns:
+        values = np.array([row[column] for row in fold_rows], dtype=float)
+        summary[f"cv_mean_{column}"] = float(np.nanmean(values))
+        summary[f"cv_std_{column}"] = float(np.nanstd(values, ddof=1)) if len(values) > 1 else 0.0
+    return fold_rows, summary
+
+
 def predict_boundary_prob(boundary_model, X_norm):
     if boundary_model is None:
         return np.zeros(len(X_norm))
@@ -910,10 +1436,68 @@ def predict_boundary_prob(boundary_model, X_norm):
     return 1 / (1 + np.exp(-logits))
 
 
+def _classifier_positive_probability(clf, features, positive_label=1):
+    probabilities = clf.predict_proba(features)
+    classes = np.asarray(clf.classes_)
+    matches = np.flatnonzero(classes == positive_label)
+    if len(matches) == 0:
+        return np.zeros(len(features), dtype=float)
+    return probabilities[:, int(matches[0])]
+
+
+def _legacy_classifier_probability_marginalized_over_nbl(
+    clf,
+    X_raw,
+    feature_idx,
+    positive_label=1,
+):
+    """Remove direct nBl dependence from a persisted pre-v2 classifier.
+
+    Old classifiers cannot be transformed in place.  Averaging their output at
+    every allowed nBl value preserves their geometry/operating knowledge while
+    making the result invariant to the candidate's actual blade count.
+    """
+    X_raw = snap_discrete_vars(X_raw)
+    nbl_idx = VAR_NAMES.index("nBl")
+    allowed_nbl = np.arange(
+        int(np.ceil(L_BOUNDS[nbl_idx])),
+        int(np.floor(U_BOUNDS[nbl_idx])) + 1,
+        dtype=float,
+    )
+    variants = np.repeat(X_raw[None, :, :], len(allowed_nbl), axis=0)
+    variants[:, :, nbl_idx] = allowed_nbl[:, None]
+    features = variants.reshape(-1, len(VAR_NAMES))[:, feature_idx]
+    probabilities = _classifier_positive_probability(
+        clf,
+        features,
+        positive_label=positive_label,
+    )
+    return probabilities.reshape(len(allowed_nbl), len(X_raw)).mean(axis=0)
+
+
 def predict_feasible_prob(feas_clf, X_raw):
     if feas_clf is None:
         return np.ones(len(X_raw))
-    return feas_clf.predict_proba(X_raw)[:, 1]
+    X_raw = snap_discrete_vars(X_raw)
+    n_features = int(getattr(feas_clf, "n_features_in_", -1))
+    if n_features == len(FEASIBILITY_FEATURE_NAMES):
+        return _classifier_positive_probability(
+            feas_clf,
+            X_raw[:, FEASIBILITY_VAR_IDX],
+            positive_label=1,
+        )
+    if n_features == len(VAR_NAMES):
+        return _legacy_classifier_probability_marginalized_over_nbl(
+            feas_clf,
+            X_raw,
+            np.arange(len(VAR_NAMES), dtype=int),
+            positive_label=1,
+        )
+    raise ValueError(
+        "Unsupported feasibility-classifier feature count: "
+        f"{n_features}; expected {len(FEASIBILITY_FEATURE_NAMES)} (current) "
+        f"or {len(VAR_NAMES)} (legacy)."
+    )
 
 
 def load_geometry_summary(work_dir: str):
@@ -1009,7 +1593,62 @@ def load_geometry_warning_dataset():
     return X, y
 
 
-def train_geometry_warning_classifier(X_geom, y_bad, min_bad_required=8):
+def load_recorded_failure_datasets():
+    """Load confirmed DOE/AL failures using the correct feature spaces."""
+    return load_failure_training_sets(
+        FAILURE_RECORDS_CSV,
+        VAR_NAMES,
+        GEOMETRY_VAR_NAMES,
+    )
+
+
+def build_geometry_classifier_dataset(
+    X_success_full: np.ndarray,
+    X_geometry_failed: np.ndarray,
+):
+    """Build an nBl-neutral geometry classifier from confirmed failures."""
+    frames = []
+    X_success_full = np.asarray(X_success_full, dtype=float)
+    if len(X_success_full) > 0:
+        frames.append(
+            pd.DataFrame(
+                np.column_stack(
+                    [X_success_full[:, GEOMETRY_VAR_IDX], np.zeros(len(X_success_full))]
+                ),
+                columns=GEOMETRY_VAR_NAMES + ["is_bad"],
+            )
+        )
+
+    X_geometry_failed = np.asarray(X_geometry_failed, dtype=float)
+    if X_geometry_failed.size > 0:
+        X_geometry_failed = X_geometry_failed.reshape(-1, len(GEOMETRY_VAR_NAMES))
+        frames.append(
+            pd.DataFrame(
+                np.column_stack(
+                    [X_geometry_failed, np.ones(len(X_geometry_failed))]
+                ),
+                columns=GEOMETRY_VAR_NAMES + ["is_bad"],
+            )
+        )
+
+    if not frames:
+        return None, None
+    combined = pd.concat(frames, ignore_index=True)
+    # nBl is intentionally absent from the learned classifier.  If otherwise
+    # identical feature rows occur at different blade counts, retain the
+    # conservative label while the explicit nBl/rake overlap rule handles the
+    # known blade-count physics separately.
+    combined = (
+        combined.groupby(GEOM_WARN_FEATURE_NAMES, as_index=False, dropna=False)["is_bad"]
+        .max()
+    )
+    return (
+        combined[GEOM_WARN_FEATURE_NAMES].to_numpy(dtype=float),
+        combined["is_bad"].to_numpy(dtype=float),
+    )
+
+
+def train_geometry_feasibility_classifier(X_geom, y_bad, min_bad_required=4):
     if X_geom is None or y_bad is None or len(X_geom) == 0:
         return None
     if len(np.unique(y_bad)) < 2 or int(y_bad.sum()) < min_bad_required:
@@ -1025,14 +1664,38 @@ def train_geometry_warning_classifier(X_geom, y_bad, min_bad_required=8):
         max_features="sqrt"
     )
     clf.fit(X_geom, y_bad.astype(int))
+    clf.impeller_feature_names_ = tuple(GEOM_WARN_FEATURE_NAMES)
+    clf.impeller_excluded_feature_names_ = tuple(
+        sorted(FAILURE_CLASSIFIER_EXCLUDED_FEATURES)
+    )
+    clf.impeller_classifier_schema_version_ = 2
     return clf
 
 
 def predict_geometry_safe_prob(geom_warn_clf, X_raw):
     if geom_warn_clf is None:
         return np.ones(len(X_raw))
-    X_geom = snap_discrete_vars(X_raw)[:, :len(GEOM_WARN_FEATURE_NAMES)]
-    p_bad = geom_warn_clf.predict_proba(X_geom)[:, 1]
+    X_raw = snap_discrete_vars(X_raw)
+    n_features = int(getattr(geom_warn_clf, "n_features_in_", -1))
+    if n_features == len(GEOM_WARN_FEATURE_NAMES):
+        p_bad = _classifier_positive_probability(
+            geom_warn_clf,
+            X_raw[:, GEOM_WARN_VAR_IDX],
+            positive_label=1,
+        )
+    elif n_features == len(GEOMETRY_VAR_NAMES):
+        p_bad = _legacy_classifier_probability_marginalized_over_nbl(
+            geom_warn_clf,
+            X_raw,
+            GEOMETRY_VAR_IDX,
+            positive_label=1,
+        )
+    else:
+        raise ValueError(
+            "Unsupported geometry-classifier feature count: "
+            f"{n_features}; expected {len(GEOM_WARN_FEATURE_NAMES)} (current) "
+            f"or {len(GEOMETRY_VAR_NAMES)} (legacy)."
+        )
     return 1.0 - p_bad
 
 
@@ -1050,7 +1713,8 @@ def run_single_cfd(x_cand: np.ndarray, run_id: str):
         r"C:\Program Files\PowerShell\7\pwsh.exe",
         "-ExecutionPolicy", "Bypass",
         "-File", PS_SCRIPT_PATH,
-        "-WorkingDir", current_work_dir
+        "-WorkingDir", current_work_dir,
+        "-TurboGridTemplate", TURBOGRID_TEMPLATE,
     ]
 
     for name in VAR_NAMES:
@@ -1070,8 +1734,24 @@ def run_single_cfd(x_cand: np.ndarray, run_id: str):
         geometry_summary = load_geometry_summary(current_work_dir)
 
         if ps_result.returncode != 0:
-            print(f"     [{run_id}] 几何/网格失败，Exit Code: {ps_result.returncode}")
-            return False, None, geometry_summary
+            reason = f"几何/网格失败，Exit Code: {ps_result.returncode}"
+            print(f"     [{run_id}] {reason}")
+            structured_failure = load_structured_failure_status(current_work_dir)
+            return False, None, geometry_summary, {
+                "stage": (
+                    structured_failure["stage"]
+                    if structured_failure is not None
+                    else classify_geometry_failure_stage(
+                        reason,
+                        f"{ps_result.stdout}\n{ps_result.stderr}",
+                    )
+                ),
+                "reason": (
+                    structured_failure["reason"]
+                    if structured_failure is not None
+                    else reason
+                ),
+            }
 
         p_out_val = param_dict['P_out']
         nbl_val = int(round(param_dict['nBl']))
@@ -1083,7 +1763,10 @@ def run_single_cfd(x_cand: np.ndarray, run_id: str):
 
         if not success_cfx:
             print(f"     [{run_id}] CFD 失败: {msg}")
-            return False, None, geometry_summary
+            return False, None, geometry_summary, {
+                "stage": classify_cfx_failure_stage(msg),
+                "reason": msg,
+            }
 
         true_y = np.array([
             cfx_res['Efficiency'],
@@ -1092,11 +1775,28 @@ def run_single_cfd(x_cand: np.ndarray, run_id: str):
             cfx_res['MassFlow'],
         ], dtype=float)
 
-        return True, true_y, geometry_summary
+        if not np.all(np.isfinite(true_y)):
+            return False, None, geometry_summary, {
+                "stage": "physical_invalid",
+                "reason": "CFD returned NaN or infinite performance values.",
+            }
+        if float(true_y[3]) < MIN_DISCARD_FLOW_G_S:
+            return False, None, geometry_summary, {
+                "stage": "physical_invalid",
+                "reason": (
+                    f"MassFlow={true_y[3]:.6g} g/s is below the discard "
+                    f"threshold {MIN_DISCARD_FLOW_G_S:.6g} g/s."
+                ),
+            }
+
+        return True, true_y, geometry_summary, None
 
     except Exception as e:
         print(f"     [{run_id}] 未知异常: {e}")
-        return False, None, None
+        return False, None, None, {
+            "stage": "infrastructure",
+            "reason": str(e),
+        }
 
 
 def print_geometry_summary(geometry_summary: dict | None):
@@ -1158,19 +1858,31 @@ def compute_ehvi_acquisition(
     invalid_geom = np.any(geom_g > 0.0, axis=1)
 
     # 快速均值预测（5 次 MC，仅用于剪枝）
-    mean_quick, _ = mc_dropout_predict(reg_model, X_norm, scaler_Y, n_samples=5)
+    mean_quick, std_quick_norm = mc_dropout_predict(
+        reg_model, X_norm, scaler_Y, n_samples=5
+    )
     pred_eff_q = mean_quick[:, 0]
-    pred_pr_q  = mean_quick[:, 1]
     pred_mf_q  = mean_quick[:, 2]
 
-    valid_mask = (
+    # Exploitation is deliberately conservative: it uses both learned
+    # feasibility models and the surrogate's predicted performance limits.
+    exploitation_mask = (
         (p_feas >= cfg.feasible_prob_threshold_pick) &
         (p_geom_safe >= cfg.geom_safe_prob_threshold_pick) &
         (~invalid_geom) &
         (pred_mf_q >= max(MIN_DISCARD_FLOW_G_S, BOUNDARY_FLOW_G_S - 0.05)) &
         (pred_eff_q >= MIN_EFFICIENCY) &
-        (pred_eff_q <= 0.85) &
-        (pred_pr_q  <= MAX_PRESSURE_RATIO)
+        (pred_eff_q <= 0.85)
+    )
+
+    # Exploration must be able to challenge the learned models.  Restrict it
+    # only by explicit geometry rules, finite surrogate output and proximity
+    # to confirmed failures; otherwise a wrong low prediction would prevent
+    # the uncertainty/coverage slots from ever collecting corrective CFD data.
+    exploration_mask = (
+        (~invalid_geom)
+        & np.all(np.isfinite(mean_quick), axis=1)
+        & np.all(np.isfinite(std_quick_norm), axis=1)
     )
 
     # 失败点距离过滤（太近的直接排除）
@@ -1179,15 +1891,28 @@ def compute_ehvi_acquisition(
         failed_raw  = snap_discrete_vars(np.array(failed_points_raw))
         failed_norm = scaler_X.transform(failed_raw)
         d_fail_all  = calc_distance_to_set(X_norm, failed_norm)
-        valid_mask &= (d_fail_all > 0.04)
+        sufficiently_far_from_failure = d_fail_all > 0.04
+        exploitation_mask &= sufficiently_far_from_failure
+        exploration_mask &= sufficiently_far_from_failure
 
-    valid_idx = np.where(valid_mask)[0]
+    valid_idx = np.where(exploitation_mask)[0]
 
     ehvi = np.full(N, -np.inf)
 
     if len(valid_idx) == 0:
-        print("  [EHVI] 警告：预筛选后无有效候选点，所有点均无效。")
-        return X_cand, ehvi, {"pred_mean": mean_quick, "p_feas": p_feas}
+        print(
+            "  [EHVI] 警告：预筛选后无开发候选点；"
+            f"仍保留 {int(exploration_mask.sum())} 个探索候选。"
+        )
+        return X_cand, ehvi, {
+            "pred_mean": mean_quick,
+            "pred_std_norm": std_quick_norm,
+            "p_feas": p_feas,
+            "p_geom_safe": p_geom_safe,
+            "valid_mask": exploitation_mask,
+            "exploration_mask": exploration_mask,
+            "overlap_proxy_violation": overlap_proxy_violation(X_cand),
+        }
 
     # ------------------------------------------------------------------
     # 3. 对有效候选点做完整 MC Dropout（cfg.mc_samples 次）
@@ -1197,12 +1922,14 @@ def compute_ehvi_acquisition(
 
     reg_model.train()
     X_t = torch.tensor(X_valid_norm, dtype=torch.float32, device=DEVICE)
-    mc_preds = []
+    mc_preds_norm = []
     with torch.no_grad():
         for _ in range(cfg.mc_samples):
-            p = reg_model(X_t).cpu().numpy()
-            mc_preds.append(scaler_Y.inverse_transform(p))
-    mc_preds = np.stack(mc_preds, axis=0)   # (S, N_valid, 3)
+            mc_preds_norm.append(reg_model(X_t).cpu().numpy())
+    mc_preds_norm = np.stack(mc_preds_norm, axis=0)  # (S, N_valid, 3)
+    mc_preds = scaler_Y.inverse_transform(
+        mc_preds_norm.reshape(-1, mc_preds_norm.shape[-1])
+    ).reshape(mc_preds_norm.shape)
 
     # ------------------------------------------------------------------
     # 4. EHVI 计算
@@ -1243,10 +1970,14 @@ def compute_ehvi_acquisition(
 
     info = {
         "pred_mean": mean_quick,
+        "pred_std_norm": std_quick_norm,
         "p_feas": p_feas,
         "p_geom_safe": p_geom_safe,
+        "valid_mask": exploitation_mask,
+        "exploration_mask": exploration_mask,
         "overlap_proxy_violation": overlap_proxy_violation(X_cand),
     }
+    info["pred_std_norm"][valid_idx] = mc_preds_norm.std(axis=0)
     return X_cand, ehvi, info
 
 
@@ -1264,7 +1995,8 @@ class CompressorMOOProblem(Problem):
         scaler_Y,
         X_pool_raw,
         Y_pool_raw,
-        cfg: ALConfig
+        cfg: ALConfig,
+        fixed_p_out: float | None = None,
     ):
         self.reg_model = reg_model
         self.feas_clf = feas_clf
@@ -1274,27 +2006,28 @@ class CompressorMOOProblem(Problem):
         self.X_pool_raw = snap_discrete_vars(X_pool_raw)
         self.Y_pool_raw = Y_pool_raw
         self.cfg = cfg
+        self.fixed_p_out = float(
+            OPTIMIZATION_P_OUT if fixed_p_out is None else fixed_p_out
+        )
 
        
         
         self.eff_max_phys = 0.84
         self.eff_min_phys = 0.6
-        self.pr_min_phys  = 1.80
-
         n_rules = geometry_rule_violations(self.X_pool_raw[:1]).shape[1]
 
         super().__init__(
 
-            n_var=14,
+            n_var=len(GEOMETRY_VAR_NAMES),
             n_obj=2,
-            n_ieq_constr=7 + n_rules,
-            xl=L_BOUNDS,
-            xu=U_BOUNDS
+            n_ieq_constr=5 + n_rules,
+            xl=L_BOUNDS[GEOMETRY_VAR_IDX],
+            xu=U_BOUNDS[GEOMETRY_VAR_IDX],
         )
 
     def _evaluate(self, X, out, *args, **kwargs):
-        X = snap_discrete_vars(X)
-        X_norm = self.scaler_X.transform(X)
+        X_full = expand_geometry_decisions(X, fixed_p_out=self.fixed_p_out)
+        X_norm = self.scaler_X.transform(X_full)
 
         mean_real, std_norm = mc_dropout_predict(
             self.reg_model, X_norm, self.scaler_Y, n_samples=20
@@ -1304,27 +2037,24 @@ class CompressorMOOProblem(Problem):
         pr_raw  = mean_real[:, 1]
         mf      = mean_real[:, 2]
         unc = std_norm[:, :2].mean(axis=1)
-        p_feas = predict_feasible_prob(self.feas_clf, X)
-        p_geom_safe = predict_geometry_safe_prob(self.geom_warn_clf, X)
-        overlap_violation = overlap_proxy_violation(X)
+        p_feas = predict_feasible_prob(self.feas_clf, X_full)
+        p_geom_safe = predict_geometry_safe_prob(self.geom_warn_clf, X_full)
+        overlap_violation = overlap_proxy_violation(X_full)
         eff_obj = np.clip(eff_raw, 0.45, 0.84)
-        pr_obj  = np.clip(pr_raw, MIN_PRESSURE_RATIO, MAX_PRESSURE_RATIO)
         out["F"] = np.column_stack([
             -eff_obj + 0.12 * unc + OVERLAP_PENALTY_COEFF * overlap_violation + GEOM_WARN_PENALTY_COEFF * (1.0 - p_geom_safe),
-            -pr_obj  + 0.12 * unc + OVERLAP_PENALTY_COEFF * overlap_violation + GEOM_WARN_PENALTY_COEFF * (1.0 - p_geom_safe)
+            -pr_raw  + 0.12 * unc + OVERLAP_PENALTY_COEFF * overlap_violation + GEOM_WARN_PENALTY_COEFF * (1.0 - p_geom_safe),
         ])
         g_basic = np.column_stack([
             BOUNDARY_FLOW_G_S - mf,
             eff_raw - self.eff_max_phys,
             self.eff_min_phys - eff_raw,
-            pr_raw - MAX_PRESSURE_RATIO,
-            self.pr_min_phys - pr_raw,
             self.cfg.feasible_prob_threshold_opt - p_feas,
             self.cfg.geom_safe_prob_threshold_opt - p_geom_safe,
         ])
 
         # 几何规则约束
-        g_geom = geometry_rule_violations(X)
+        g_geom = geometry_rule_violations(X_full)
 
         out["G"] = np.column_stack([g_basic, g_geom])
 
@@ -1333,46 +2063,258 @@ class CompressorMOOProblem(Problem):
 # 选点策略
 # =============================================================================
 # =============================================================================
-# 选点策略：EHVI 贪心 + 多样性约束
+# 选点策略：2 个 EHVI + 1 个最大不确定性 + 1 个欠采样 nBl/空间填充
 # =============================================================================
 def select_candidates_diverse(
     acq_X: np.ndarray,
     ehvi_vals: np.ndarray,
     scaler_X,
+    acq_info: dict | None = None,
+    X_pool_raw: np.ndarray | None = None,
+    X_failed_raw: np.ndarray | list | None = None,
     n_pick: int = 4,
-    min_dist_norm: float = 0.08
+    min_dist_norm: float = 0.08,
+    n_ehvi: int = 2,
 ):
     """
-    贪心批量选点：
-    每步选当前 EHVI 最高的点，然后在归一化空间中
-    将距离 < min_dist_norm 的候选点排除，再选下一个。
+    固定配额批量选点：
+      1) 2 个 Pareto/EHVI 点；
+      2) 1 个 MC-Dropout 最大不确定性点；
+      3) 1 个训练池中欠采样 nBl 类别内的空间填充点。
+
+    EHVI 使用保守开发掩码；不确定性与覆盖槽位使用仅含显式规则和
+    已确认失败距离的探索掩码，使它们能够纠正分类器/代理模型误判。
+    所有策略共享批内最小距离约束。
     """
-    # 预先归一化所有候选点（只算一次）
-    X_cand_norm = scaler_X.transform(snap_discrete_vars(acq_X))
+    X_cand = snap_discrete_vars(np.asarray(acq_X, dtype=float))
+    X_cand_norm = scaler_X.transform(X_cand)
+    n_candidates = len(X_cand)
+    if n_candidates == 0 or n_pick <= 0:
+        return [], []
 
-    selected   = []
-    labels     = []
-    scores     = ehvi_vals.copy()
-    sel_norm   = []   # 已选点的归一化坐标
-
-    for slot in range(n_pick):
-        if not np.any(np.isfinite(scores) & (scores > 0)):
-            break
-
-        idx    = np.argmax(scores)
-        x      = snap_discrete_vars(acq_X[idx:idx+1])[0]
-        x_norm = X_cand_norm[idx]
-
-        selected.append(x)
-        labels.append(
-            f"EHVI贪心#{slot+1} (ehvi={ehvi_vals[idx]:.5f})"
+    valid_mask = np.ones(n_candidates, dtype=bool)
+    exploration_mask = None
+    exploration_support = np.ones(n_candidates, dtype=float)
+    pred_std_norm = np.zeros((n_candidates, len(SURROGATE_OUTPUT_NAMES)))
+    if acq_info is not None:
+        if "valid_mask" in acq_info:
+            valid_mask = np.asarray(acq_info["valid_mask"], dtype=bool).copy()
+        if "exploration_mask" in acq_info:
+            exploration_mask = np.asarray(
+                acq_info["exploration_mask"], dtype=bool
+            ).copy()
+        if "pred_std_norm" in acq_info:
+            pred_std_norm = np.asarray(acq_info["pred_std_norm"], dtype=float)
+        if "p_feas" in acq_info and "p_geom_safe" in acq_info:
+            p_feas = np.asarray(acq_info["p_feas"], dtype=float)
+            p_geom_safe = np.asarray(acq_info["p_geom_safe"], dtype=float)
+            if p_feas.shape != (n_candidates,) or p_geom_safe.shape != (n_candidates,):
+                raise ValueError(
+                    "acq_info feasibility probabilities must match the candidate count."
+                )
+            exploration_support = np.sqrt(
+                np.clip(p_feas, 0.0, 1.0)
+                * np.clip(p_geom_safe, 0.0, 1.0)
+            )
+            exploration_support = np.nan_to_num(
+                exploration_support, nan=0.0, posinf=0.0, neginf=0.0
+            )
+    if valid_mask.shape != (n_candidates,):
+        raise ValueError("acq_info['valid_mask'] must match the candidate count.")
+    if exploration_mask is None:
+        exploration_mask = valid_mask.copy()
+    if exploration_mask.shape != (n_candidates,):
+        raise ValueError(
+            "acq_info['exploration_mask'] must match the candidate count."
         )
-        sel_norm.append(x_norm)
+    if pred_std_norm.shape[0] != n_candidates:
+        raise ValueError("acq_info['pred_std_norm'] must match the candidate count.")
 
-        # 排除与已选点过近的候选
-        sel_arr   = np.array(sel_norm)               # (n_selected, 14)
-        min_dists = cdist(X_cand_norm, sel_arr).min(axis=1)  # (N,)
-        scores[min_dists < min_dist_norm] = -np.inf
+    X_pool = (
+        snap_discrete_vars(np.asarray(X_pool_raw, dtype=float))
+        if X_pool_raw is not None and len(X_pool_raw) > 0
+        else np.empty((0, X_cand.shape[1]), dtype=float)
+    )
+    X_pool_norm = (
+        scaler_X.transform(X_pool)
+        if len(X_pool) > 0
+        else np.empty((0, X_cand.shape[1]), dtype=float)
+    )
+    X_failed = (
+        snap_discrete_vars(np.asarray(X_failed_raw, dtype=float))
+        if X_failed_raw is not None and len(X_failed_raw) > 0
+        else np.empty((0, X_cand.shape[1]), dtype=float)
+    )
+
+    selected = []
+    labels = []
+    selected_idx = []
+    exploitation_available = valid_mask.copy()
+    exploration_available = exploration_mask.copy()
+
+    # 不重复查询训练池中已有的设计点。
+    if len(X_pool_norm) > 0:
+        not_in_training_pool = (
+            calc_distance_to_set(X_cand_norm, X_pool_norm) > 1e-10
+        )
+        exploitation_available &= not_in_training_pool
+        exploration_available &= not_in_training_pool
+
+    def refresh_batch_distance():
+        if not selected_idx:
+            return
+        d_selected = calc_distance_to_set(
+            X_cand_norm, X_cand_norm[np.asarray(selected_idx, dtype=int)]
+        )
+        too_close = d_selected < min_dist_norm
+        exploitation_available[too_close] = False
+        exploration_available[too_close] = False
+
+    def add_candidate(idx: int, label: str):
+        selected_idx.append(int(idx))
+        selected.append(X_cand[idx].copy())
+        labels.append(label)
+        exploitation_available[idx] = False
+        exploration_available[idx] = False
+        refresh_batch_distance()
+
+    # 1) Pareto exploitation: exactly two EHVI slots when possible.
+    ehvi_scores = np.asarray(ehvi_vals, dtype=float)
+    for slot in range(min(n_ehvi, n_pick)):
+        # Zero-EHVI candidates are still Pareto-directed samples from the
+        # acquisition pool. Keeping them eligible preserves the fixed 2-slot
+        # exploitation quota when the current front yields no positive HVI.
+        eligible = (
+            exploitation_available
+            & np.isfinite(ehvi_scores)
+            & (ehvi_scores >= 0.0)
+        )
+        if not np.any(eligible):
+            break
+        idx = int(np.argmax(np.where(eligible, ehvi_scores, -np.inf)))
+        add_candidate(
+            idx,
+            f"Pareto/EHVI#{slot + 1} (ehvi={ehvi_scores[idx]:.5f})",
+        )
+
+    # 2) Exploration: largest normalized MC-Dropout uncertainty.
+    if len(selected) < min(n_pick, n_ehvi + 1):
+        uncertainty = np.nanmean(pred_std_norm, axis=1)
+        # Learned safety remains a soft preference, never a veto. The 0.25
+        # floor preserves counterexample collection in regions the classifier
+        # currently considers risky.
+        support_weight = 0.25 + 0.75 * exploration_support
+        uncertainty_score = uncertainty * support_weight
+        eligible = exploration_available & np.isfinite(uncertainty_score)
+        if np.any(eligible):
+            idx = int(
+                np.argmax(np.where(eligible, uncertainty_score, -np.inf))
+            )
+            add_candidate(
+                idx,
+                f"最大不确定性 (u_norm={uncertainty[idx]:.5f}, "
+                f"safety_support={exploration_support[idx]:.3f})",
+            )
+
+    # 3) Coverage: least represented blade-count class, then maximin fill.
+    if len(selected) < min(n_pick, n_ehvi + 2):
+        nbl_idx = VAR_NAMES.index("nBl")
+        allowed_nbl = np.arange(
+            int(np.ceil(L_BOUNDS[nbl_idx])),
+            int(np.floor(U_BOUNDS[nbl_idx])) + 1,
+        )
+        pool_nbl = (
+            np.rint(X_pool[:, nbl_idx]).astype(int)
+            if len(X_pool) > 0
+            else np.empty(0, dtype=int)
+        )
+        failed_nbl = (
+            np.rint(X_failed[:, nbl_idx]).astype(int)
+            if len(X_failed) > 0
+            else np.empty(0, dtype=int)
+        )
+        success_counts = {
+            int(nbl): int(np.count_nonzero(pool_nbl == nbl))
+            for nbl in allowed_nbl
+        }
+        failure_counts = {
+            int(nbl): int(np.count_nonzero(failed_nbl == nbl))
+            for nbl in allowed_nbl
+        }
+        evaluated_counts = {
+            int(nbl): success_counts[int(nbl)] + failure_counts[int(nbl)]
+            for nbl in allowed_nbl
+        }
+        candidate_nbl = np.rint(X_cand[:, nbl_idx]).astype(int)
+        target_nbl = None
+        eligible = np.zeros(n_candidates, dtype=bool)
+        for nbl in sorted(
+            evaluated_counts,
+            key=lambda value: (
+                evaluated_counts[value],
+                success_counts[value],
+                value,
+            ),
+        ):
+            eligible_for_nbl = exploration_available & (candidate_nbl == nbl)
+            if np.any(eligible_for_nbl):
+                target_nbl = nbl
+                eligible = eligible_for_nbl
+                break
+
+        if target_nbl is not None:
+            same_nbl_pool = X_pool_norm[pool_nbl == target_nbl]
+            references = same_nbl_pool
+            if len(references) == 0:
+                references = X_pool_norm
+            if selected_idx:
+                selected_norm = X_cand_norm[np.asarray(selected_idx, dtype=int)]
+                references = (
+                    np.vstack([references, selected_norm])
+                    if len(references) > 0
+                    else selected_norm
+                )
+            fill_distance = (
+                calc_distance_to_set(X_cand_norm, references)
+                if len(references) > 0
+                else np.ones(n_candidates)
+            )
+            fill_score = fill_distance * (
+                0.25 + 0.75 * exploration_support
+            )
+            idx = int(np.argmax(np.where(eligible, fill_score, -np.inf)))
+            add_candidate(
+                idx,
+                f"欠采样nBl/空间填充 (nBl={target_nbl}, "
+                f"success={success_counts[target_nbl]}, "
+                f"failed={failure_counts[target_nbl]}, "
+                f"evaluated={evaluated_counts[target_nbl]}, "
+                f"d={fill_distance[idx]:.4f}, "
+                f"safety_support={exploration_support[idx]:.3f})",
+            )
+
+    # Any unavailable quota is filled by a valid maximin point.
+    while len(selected) < n_pick and np.any(exploration_available):
+        references = X_pool_norm
+        if selected_idx:
+            selected_norm = X_cand_norm[np.asarray(selected_idx, dtype=int)]
+            references = (
+                np.vstack([references, selected_norm])
+                if len(references) > 0
+                else selected_norm
+            )
+        fill_distance = (
+            calc_distance_to_set(X_cand_norm, references)
+            if len(references) > 0
+            else np.ones(n_candidates)
+        )
+        fill_score = fill_distance * (0.25 + 0.75 * exploration_support)
+        idx = int(
+            np.argmax(
+                np.where(exploration_available, fill_score, -np.inf)
+            )
+        )
+        add_candidate(idx, f"有效候选空间回填 (d={fill_distance[idx]:.4f})")
 
     # 不足时随机补充
     attempts = 0
@@ -1382,13 +2324,22 @@ def select_candidates_diverse(
         x_rand  = snap_discrete_vars(
             qmc.scale(sampler.random(1), L_BOUNDS, U_BOUNDS)
         )[0]
+        x_rand = pin_optimization_operating_point(x_rand)[0]
 
         # 即使在随机补充阶段，也尽量不要把明显违反几何规则的点送去 CFD。
         if np.any(geometry_rule_violations(x_rand[None, :]) > 0.0):
             continue
+        x_rand_norm = scaler_X.transform(x_rand[None, :])
+        if len(X_pool_norm) > 0:
+            if calc_distance_to_set(x_rand_norm, X_pool_norm)[0] <= 1e-10:
+                continue
+        if selected:
+            selected_norm = scaler_X.transform(np.asarray(selected))
+            if calc_distance_to_set(x_rand_norm, selected_norm)[0] < min_dist_norm:
+                continue
 
         selected.append(x_rand)
-        labels.append("随机补充点")
+        labels.append("几何安全随机回填")
 
     return selected[:n_pick], labels[:n_pick]
 
@@ -1435,40 +2386,77 @@ def run_nsga2_only_from_lhs(
     Y_pool_norm = scaler_Y.fit_transform(Y_pool_surr)
 
     stratify_labels = W_pool if len(np.unique(W_pool)) > 1 else None
-    X_tr, X_val, Y_tr, Y_val, W_tr, W_val = train_test_split(
-        X_pool_norm,
-        Y_pool_norm,
-        W_pool,
+    train_idx, val_idx = train_test_split(
+        np.arange(len(X_pool)),
         test_size=0.2,
         random_state=42,
         stratify=stratify_labels,
     )
+    X_tr, X_val = X_pool_norm[train_idx], X_pool_norm[val_idx]
+    Y_tr, Y_val = Y_pool_norm[train_idx], Y_pool_norm[val_idx]
+    W_tr, W_val = W_pool[train_idx], W_pool[val_idx]
+    nbl_idx = VAR_NAMES.index("nBl")
+    train_sample_weights, weight_diagnostics = compute_density_nbl_sample_weights(
+        X_tr,
+        X_pool[train_idx, nbl_idx],
+        k_neighbors=CFG.density_k_neighbors,
+        min_weight=CFG.sample_weight_min,
+        max_weight=CFG.sample_weight_max,
+    )
 
     print(f"[NSGA-II] 训练 surrogate | 训练池: {len(X_pool)} | 固定测试集: {len(X_test_fixed)}")
-    reg_model, reg_hist = train_regressor(X_tr, Y_tr, W_tr, X_val, Y_val, W_val)
+    reg_model, reg_hist = train_regressor(
+        X_tr,
+        Y_tr,
+        W_tr,
+        X_val,
+        Y_val,
+        W_val,
+        sample_weights_train=train_sample_weights,
+        random_seed=1000,
+    )
     joblib.dump(scaler_X, SCALER_X_PATH)
     joblib.dump(scaler_Y, SCALER_Y_PATH)
 
     X_test_norm = scaler_X.transform(X_test_fixed)
     Y_test_pred = deterministic_predict(reg_model, X_test_norm, scaler_Y)
-    mse_eff = mean_squared_error(Y_test_fixed_surr[:, 0], Y_test_pred[:, 0])
-    mse_pr = mean_squared_error(Y_test_fixed_surr[:, 1], Y_test_pred[:, 1])
-    mse_mf = mean_squared_error(Y_test_fixed_surr[:, 2], Y_test_pred[:, 2])
-    print(f"[NSGA-II] 固定测试误差 Eff={mse_eff:.6f}, PR={mse_pr:.6f}, MF={mse_mf:.6f}")
-
-    if os.path.exists(FAILED_POINTS_PATH):
-        failed_points = list(np.load(FAILED_POINTS_PATH, allow_pickle=True))
-    else:
-        failed_points = []
-    feas_clf = train_feasibility_classifier(
-        X_pool,
-        np.array(failed_points) if len(failed_points) > 0 else np.empty((0, len(VAR_NAMES))),
+    fixed_metrics = regression_metrics(
+        Y_test_fixed_surr,
+        Y_test_pred,
+        prefix="fixed_test_",
+    )
+    mse_eff = fixed_metrics["fixed_test_mse_eff"]
+    mse_pr = fixed_metrics["fixed_test_mse_pr"]
+    mse_mf = fixed_metrics["fixed_test_mse_mf"]
+    print(
+        "[NSGA-II] 固定测试误差 "
+        f"Eff RMSE={fixed_metrics['fixed_test_rmse_eff']:.6f}, "
+        f"MAE={fixed_metrics['fixed_test_mae_eff']:.6f}, "
+        f"R²={fixed_metrics['fixed_test_r2_eff']:.4f} | "
+        f"PR RMSE={fixed_metrics['fixed_test_rmse_pr']:.6f}, "
+        f"MF RMSE={fixed_metrics['fixed_test_rmse_mf']:.6f}"
     )
 
-    X_geom_warn, y_geom_warn = load_geometry_warning_dataset()
-    geom_warn_clf = train_geometry_warning_classifier(X_geom_warn, y_geom_warn)
+    failed_points = []
+    geometry_failures, operating_failures, _ = (
+        load_recorded_failure_datasets()
+    )
+    if len(geometry_failures) > 0:
+        failed_points.extend(expand_geometry_decisions(geometry_failures).tolist())
+    if len(operating_failures) > 0:
+        failed_points.extend(operating_failures.tolist())
+    feas_clf = train_feasibility_classifier(
+        X_pool,
+        operating_failures,
+    )
+
+    X_geom_warn, y_geom_warn = build_geometry_classifier_dataset(
+        X_pool,
+        geometry_failures,
+    )
+    geom_warn_clf = train_geometry_feasibility_classifier(X_geom_warn, y_geom_warn)
     if geom_warn_clf is not None:
-        joblib.dump(geom_warn_clf, GEOM_WARN_CLF_PATH)
+        joblib.dump(geom_warn_clf, GEOM_FEAS_CLF_PATH)
 
     print(f"[NSGA-II] 开始优化 | pop_size={CFG.pop_size} | n_gen={CFG.n_gen}")
     problem = CompressorMOOProblem(
@@ -1505,6 +2493,7 @@ def run_nsga2_only_from_lhs(
     out["uncertainty_norm"] = pred_std_norm[:, :2].mean(axis=1)
     out["surrogate_hv"] = surrogate_hv
     out.to_csv(output_csv, index=False)
+    write_performance_data_metadata(output_csv)
 
     summary = {
         "mode": "nsga2_only",
@@ -1519,6 +2508,12 @@ def run_nsga2_only_from_lhs(
         "mse_mf": float(mse_mf),
         "epochs": int(len(reg_hist)),
         "output_csv": output_csv,
+        "fixed_outlet_static_pressure_pa": float(OPTIMIZATION_P_OUT),
+        "geometry_decision_variables": list(GEOMETRY_VAR_NAMES),
+        "total_pressure_definition": TOTAL_PRESSURE_DEFINITION,
+        "pressure_ratio_constraints": "none",
+        **fixed_metrics,
+        **weight_diagnostics,
     }
     if summary_json:
         with open(summary_json, "w", encoding="utf-8") as f:
@@ -1559,20 +2554,26 @@ def main_multiobjective_active_learning(max_al_iters: int | None = None):
         print(f"[断点续跑] 未找到可用训练池 checkpoint，继续使用 TRAINING_CSV 划分后的训练池: {len(X_pool)}")
 
     # 失败点池：主动学习中动态累积
-    if os.path.exists(FAILED_POINTS_PATH):
-        failed_points = list(np.load(FAILED_POINTS_PATH, allow_pickle=True))
-    else:
-        failed_points = []
+    failed_points = []
+    recorded_geometry_failures, recorded_operating_failures, _ = (
+        load_recorded_failure_datasets()
+    )
+    if len(recorded_geometry_failures) > 0:
+        failed_points.extend(
+            expand_geometry_decisions(recorded_geometry_failures).tolist()
+        )
+    if len(recorded_operating_failures) > 0:
+        failed_points.extend(recorded_operating_failures.tolist())
 
     scaler_X = MinMaxScaler()
     scaler_Y = MinMaxScaler()
     start_iter = get_resume_iter()
     effective_max_al_iters = CFG.max_al_iters if max_al_iters is None else int(max_al_iters)
 
-    if os.path.exists(HV_CSV_PATH):
-        hv_history = pd.read_csv(HV_CSV_PATH).to_dict('records')
-    else:
-        hv_history = []
+    hv_history = read_optional_csv(
+        HV_CSV_PATH,
+        HV_HISTORY_COLUMNS,
+    ).to_dict('records')
 
     total_attempts = 0
     total_success = 0
@@ -1581,11 +2582,36 @@ def main_multiobjective_active_learning(max_al_iters: int | None = None):
         try:
             with open(CHECKPOINT_META_PATH, "r", encoding="utf-8") as f:
                 checkpoint_meta = json.load(f)
-            total_attempts = int(checkpoint_meta.get("total_attempts", 0))
-            total_success = int(checkpoint_meta.get("total_success", 0))
-            resumed_in_progress_iter = checkpoint_meta.get("in_progress_iter")
+            if (
+                int(checkpoint_meta.get("performance_data_schema_version", 0))
+                == PERFORMANCE_DATA_SCHEMA_VERSION
+                and checkpoint_meta.get("total_pressure_definition")
+                == TOTAL_PRESSURE_DEFINITION
+            ):
+                total_attempts = int(checkpoint_meta.get("total_attempts", 0))
+                total_success = int(checkpoint_meta.get("total_success", 0))
+                resumed_in_progress_iter = checkpoint_meta.get("in_progress_iter")
+                if int(checkpoint_meta.get("hv_policy_version", 1)) != HV_POLICY_VERSION:
+                    print(
+                        "[断点续跑] HV 口径已升级为 v2：软 overlap 代理不再"
+                        "否决真实 CFD 点；新旧轮次的 HV 跳变不应解释为模型收敛变化。"
+                    )
+            else:
+                print("[断点续跑] 旧总压定义的 checkpoint 计数已忽略。")
         except Exception as e:
             print(f"[断点续跑] 读取 checkpoint 元信息中的计数失败，将从 0 开始累计: {e}")
+
+    checkpoint_attempts = total_attempts
+    total_attempts, total_success = recover_query_counters(
+        AL_QUERY_VALIDATION_CSV,
+        total_attempts=total_attempts,
+        total_success=total_success,
+    )
+    if total_attempts > checkpoint_attempts:
+        print(
+            f"[断点续跑] 查询日志比 checkpoint 更新，尝试编号恢复为 "
+            f"A{total_attempts:05d}，下一编号将从 A{total_attempts + 1:05d} 开始。"
+        )
 
     print(f"[断点续跑] checkpoint 元信息路径: {os.path.abspath(CHECKPOINT_META_PATH)}")
     print(f"[断点续跑] 已完成轮次: {start_iter} | 本次将运行到总轮次: {effective_max_al_iters}")
@@ -1628,17 +2654,37 @@ def main_multiobjective_active_learning(max_al_iters: int | None = None):
 
         # 每轮内部验证划分
         stratify_labels = W_pool if len(np.unique(W_pool)) > 1 else None
-        X_tr, X_val, Y_tr, Y_val, W_tr, W_val = train_test_split(
-            X_pool_norm, Y_pool_norm, W_pool,
+        train_idx, val_idx = train_test_split(
+            np.arange(len(X_pool)),
             test_size=0.2,
             random_state=42 + al_iter,
             stratify=stratify_labels
+        )
+        X_tr, X_val = X_pool_norm[train_idx], X_pool_norm[val_idx]
+        Y_tr, Y_val = Y_pool_norm[train_idx], Y_pool_norm[val_idx]
+        W_tr, W_val = W_pool[train_idx], W_pool[val_idx]
+        nbl_idx = VAR_NAMES.index("nBl")
+        train_sample_weights, weight_diagnostics = compute_density_nbl_sample_weights(
+            X_tr,
+            X_pool[train_idx, nbl_idx],
+            k_neighbors=CFG.density_k_neighbors,
+            min_weight=CFG.sample_weight_min,
+            max_weight=CFG.sample_weight_max,
         )
 
         # ---------------------------------------------------------------------
         # 2. 训练性能回归 surrogate
         # ---------------------------------------------------------------------
-        reg_model, reg_hist = train_regressor(X_tr, Y_tr, W_tr, X_val, Y_val, W_val)
+        reg_model, reg_hist = train_regressor(
+            X_tr,
+            Y_tr,
+            W_tr,
+            X_val,
+            Y_val,
+            W_val,
+            sample_weights_train=train_sample_weights,
+            random_seed=1000 + al_iter,
+        )
         joblib.dump(scaler_X, SCALER_X_PATH)
         joblib.dump(scaler_Y, SCALER_Y_PATH)
 
@@ -1646,20 +2692,112 @@ def main_multiobjective_active_learning(max_al_iters: int | None = None):
         X_test_norm = scaler_X.transform(X_test_fixed)
         Y_test_pred = deterministic_predict(reg_model, X_test_norm, scaler_Y)
 
-        mse_eff = mean_squared_error(Y_test_fixed_surr[:, 0], Y_test_pred[:, 0])
-        mse_pr  = mean_squared_error(Y_test_fixed_surr[:, 1], Y_test_pred[:, 1])
-        mse_mf  = mean_squared_error(Y_test_fixed_surr[:, 2], Y_test_pred[:, 2])
+        fixed_metrics = regression_metrics(
+            Y_test_fixed_surr,
+            Y_test_pred,
+            prefix="fixed_test_",
+        )
+        mse_eff = fixed_metrics["fixed_test_mse_eff"]
+        mse_pr = fixed_metrics["fixed_test_mse_pr"]
+        mse_mf = fixed_metrics["fixed_test_mse_mf"]
+        print(
+            "  [固定测试集] "
+            f"Eff RMSE={fixed_metrics['fixed_test_rmse_eff']:.6f}, "
+            f"MAE={fixed_metrics['fixed_test_mae_eff']:.6f}, "
+            f"R²={fixed_metrics['fixed_test_r2_eff']:.4f} | "
+            f"PR RMSE={fixed_metrics['fixed_test_rmse_pr']:.6f}, "
+            f"MAE={fixed_metrics['fixed_test_mae_pr']:.6f}, "
+            f"R²={fixed_metrics['fixed_test_r2_pr']:.4f} | "
+            f"MF RMSE={fixed_metrics['fixed_test_rmse_mf']:.6f}, "
+            f"MAE={fixed_metrics['fixed_test_mae_mf']:.6f}, "
+            f"R²={fixed_metrics['fixed_test_r2_mf']:.4f}"
+        )
 
-        print(f"  [测试误差] Eff={mse_eff:.6f}, PR={mse_pr:.6f}, MF={mse_mf:.6f}")
+        fixed_prediction_rows = []
+        for test_idx, (x_test, y_true, y_pred) in enumerate(
+            zip(X_test_fixed, Y_test_fixed_surr, Y_test_pred)
+        ):
+            row = {
+                "iter": int(al_iter + 1),
+                "test_index": int(test_idx),
+                "recorded_at_utc": utc_timestamp(),
+            }
+            row.update({name: float(value) for name, value in zip(VAR_NAMES, x_test)})
+            for output_idx, suffix in enumerate(("eff", "pr", "mf")):
+                row[f"true_{suffix}"] = float(y_true[output_idx])
+                row[f"pred_{suffix}"] = float(y_pred[output_idx])
+                row[f"error_{suffix}"] = float(y_pred[output_idx] - y_true[output_idx])
+                row[f"abs_error_{suffix}"] = abs(row[f"error_{suffix}"])
+            fixed_prediction_rows.append(row)
+        upsert_csv_records(
+            FIXED_TEST_PREDICTIONS_CSV,
+            fixed_prediction_rows,
+            key_columns=["iter", "test_index"],
+        )
+
+        print(f"  [K-fold] 开始 {min(CFG.cv_folds, len(X_pool))}-fold 交叉验证...")
+        cv_fold_rows, cv_summary = run_kfold_surrogate_validation(
+            X_raw=X_pool,
+            Y_surr=Y_pool_surr,
+            W_boundary=W_pool,
+            al_iter=al_iter + 1,
+            cfg=CFG,
+        )
+        if cv_fold_rows:
+            upsert_csv_records(
+                CV_FOLD_METRICS_CSV,
+                cv_fold_rows,
+                key_columns=["iter", "fold"],
+            )
+            print(
+                "  [K-fold] "
+                f"Eff RMSE={cv_summary['cv_mean_rmse_eff']:.6f}±"
+                f"{cv_summary['cv_std_rmse_eff']:.6f} | "
+                f"PR RMSE={cv_summary['cv_mean_rmse_pr']:.6f}±"
+                f"{cv_summary['cv_std_rmse_pr']:.6f} | "
+                f"MF RMSE={cv_summary['cv_mean_rmse_mf']:.6f}±"
+                f"{cv_summary['cv_std_rmse_mf']:.6f}"
+            )
+
+        validation_row = {
+            "iter": int(al_iter + 1),
+            "train_pool_samples_before_cfd": int(len(X_pool)),
+            "fixed_test_samples": int(len(X_test_fixed)),
+            "training_epochs": int(len(reg_hist)),
+            "recorded_at_utc": utc_timestamp(),
+            **fixed_metrics,
+            **cv_summary,
+            **weight_diagnostics,
+        }
+        upsert_csv_records(
+            SURROGATE_METRICS_CSV,
+            validation_row,
+            key_columns=["iter"],
+        )
 
         # ---------------------------------------------------------------------
         # 3. 训练可行性分类器
         # ---------------------------------------------------------------------
-        feas_clf = train_feasibility_classifier(X_pool, np.array(failed_points) if len(failed_points) > 0 else np.empty((0, 14)))
+        geometry_failures, operating_failures, _ = load_recorded_failure_datasets()
+        failed_points = []
+        if len(geometry_failures) > 0:
+            failed_points.extend(
+                expand_geometry_decisions(geometry_failures).tolist()
+            )
+        if len(operating_failures) > 0:
+            failed_points.extend(operating_failures.tolist())
+        feas_clf = train_feasibility_classifier(
+            X_pool,
+            operating_failures,
+        )
         if feas_clf is None:
             print("  [可行性分类器] 当前无失败样本，默认全部可行。")
         else:
-            print(f"  [可行性分类器] 已用成功 {len(X_pool)} / 失败 {len(failed_points)} 样本训练。")
+            print(
+                f"  [工况可行性分类器] 已用成功 {len(X_pool)} / "
+                f"已确认求解失败 {len(operating_failures)} 样本训练"
+                f"（{len(FEASIBILITY_FEATURE_NAMES)}维，不含固定 P_out/nBl）。"
+            )
 
         # ---------------------------------------------------------------------
         # 4. 训练边界分类器
@@ -1671,23 +2809,32 @@ def main_multiobjective_active_learning(max_al_iters: int | None = None):
             print("  [边界分类器] 已训练。")
 
         # ---------------------------------------------------------------------
-        # 4.5 训练几何报错分类器（使用 ActiveLearning_Runs 中真实 CFturbo warning）
+        # 4.5 训练不含 nBl 的几何可生成性分类器（仅使用已确认的 DOE/AL 失败）
         # ---------------------------------------------------------------------
-        X_geom_warn, y_geom_warn = load_geometry_warning_dataset()
-        geom_warn_clf = train_geometry_warning_classifier(X_geom_warn, y_geom_warn)
+        X_geom_warn, y_geom_warn = build_geometry_classifier_dataset(
+            X_pool,
+            geometry_failures,
+        )
+        geom_warn_clf = train_geometry_feasibility_classifier(X_geom_warn, y_geom_warn)
         if geom_warn_clf is None:
             print("  [几何报错分类器] 样本不足或类别不足，跳过。")
         else:
-            joblib.dump(geom_warn_clf, GEOM_WARN_CLF_PATH)
+            joblib.dump(geom_warn_clf, GEOM_FEAS_CLF_PATH)
             n_bad = int(y_geom_warn.sum())
-            print(f"  [几何报错分类器] 已训练。样本={len(y_geom_warn)} | 报错样本={n_bad}")
+            print(
+                f"  [几何安全分类器] 已训练。样本={len(y_geom_warn)} | "
+                f"警告/失败样本={n_bad}"
+                f"（{len(GEOM_WARN_FEATURE_NAMES)}维，不含 P_out/nBl）"
+            )
 
+        # X_pool 中的点已经通过 CFD 验证；失败分类器只用于未计算候选点
+        # 的风险控制，不能反过来否决真实成功样本或改变真实 Pareto 前沿。
         true_hv_ref_val, true_front_Y, true_front_X = compute_true_cumulative_hv(
             X_pool=X_pool,
             Y_pool=Y_pool,
             W_pool=W_pool,
-            geom_warn_clf=geom_warn_clf,
-            geom_safe_threshold=CFG.geom_safe_prob_threshold_pick,
+            geom_warn_clf=None,
+            geom_safe_threshold=None,
             ref_eff=TRUE_HV_REF_EFF,
             ref_pr=TRUE_HV_REF_PR
         )
@@ -1718,7 +2865,7 @@ def main_multiobjective_active_learning(max_al_iters: int | None = None):
         pareto_meta = {}
         surrogate_hv_val = np.nan
         if res.F is not None and len(res.F) > 0:
-            pareto_X = snap_discrete_vars(res.X)
+            pareto_X = expand_geometry_decisions(res.X)
             pareto_Y = -res.F
             pareto_X, pareto_Y, surrogate_hv_val = extract_surrogate_front_and_hv(
                 res=res,
@@ -1757,21 +2904,130 @@ def main_multiobjective_active_learning(max_al_iters: int | None = None):
             acq_X=acq_X,
             ehvi_vals=ehvi_vals,
             scaler_X=scaler_X,
+            acq_info=acq_info,
+            X_pool_raw=X_pool,
+            X_failed_raw=failed_points,
             n_pick=CFG.n_eval_candidates_per_iter,
-            min_dist_norm=CFG.diversity_min_dist
+            min_dist_norm=CFG.diversity_min_dist,
+            n_ehvi=2,
         )
-      
+        print("  [选点配额] " + " | ".join(labels))
+
+        if candidates_X:
+            selected_array = np.asarray(candidates_X, dtype=float)
+            selected_norm = scaler_X.transform(selected_array)
+            pre_cfd_mean, pre_cfd_std_norm = mc_dropout_predict(
+                reg_model,
+                selected_norm,
+                scaler_Y,
+                n_samples=CFG.mc_samples,
+            )
+            pre_cfd_std_real = normalized_std_to_real(
+                pre_cfd_std_norm,
+                scaler_Y,
+            )
+        else:
+            pre_cfd_mean = np.empty((0, len(SURROGATE_OUTPUT_NAMES)))
+            pre_cfd_std_norm = np.empty_like(pre_cfd_mean)
+            pre_cfd_std_real = np.empty_like(pre_cfd_mean)
 
         # ---------------------------------------------------------------------
         # 8. CFD 闭环更新
         # ---------------------------------------------------------------------
         for i, (x_cand, label) in enumerate(zip(candidates_X, labels)):
-            run_id = f"AL_Iter{al_iter+1:02d}_P{i+1}"
+            next_attempt = total_attempts + 1
+            run_id = (
+                f"AL_Iter{al_iter+1:02d}_P{i+1}_A{next_attempt:05d}"
+            )
             print(f"\n  -> [候选 {i+1}/{len(candidates_X)}] {label}")
-            total_attempts += 1
+            total_attempts = next_attempt
 
-            success, true_y, geometry_summary = run_single_cfd(x_cand, run_id)
+            matched = np.where(
+                np.all(np.isclose(acq_X, x_cand, rtol=0.0, atol=1e-12), axis=1)
+            )[0]
+            acq_idx = int(matched[0]) if len(matched) > 0 else None
+            query_record = {
+                "run_id": run_id,
+                "iter": int(al_iter + 1),
+                "candidate_slot": int(i + 1),
+                "selection_strategy": label,
+                "status": "submitted",
+                "submitted_at_utc": utc_timestamp(),
+                "completed_at_utc": "",
+                "acquisition_index": acq_idx,
+                "ehvi": (
+                    float(ehvi_vals[acq_idx])
+                    if acq_idx is not None and np.isfinite(ehvi_vals[acq_idx])
+                    else np.nan
+                ),
+                "pred_feasible_probability": (
+                    float(acq_info["p_feas"][acq_idx])
+                    if acq_idx is not None and "p_feas" in acq_info
+                    else np.nan
+                ),
+                "pred_geometry_safe_probability": (
+                    float(acq_info["p_geom_safe"][acq_idx])
+                    if acq_idx is not None and "p_geom_safe" in acq_info
+                    else np.nan
+                ),
+                "pred_eff": float(pre_cfd_mean[i, 0]),
+                "pred_pr": float(pre_cfd_mean[i, 1]),
+                "pred_mf": float(pre_cfd_mean[i, 2]),
+                "uncertainty_norm_eff": float(pre_cfd_std_norm[i, 0]),
+                "uncertainty_norm_pr": float(pre_cfd_std_norm[i, 1]),
+                "uncertainty_norm_mf": float(pre_cfd_std_norm[i, 2]),
+                "uncertainty_norm_mean": float(pre_cfd_std_norm[i].mean()),
+                "uncertainty_real_eff": float(pre_cfd_std_real[i, 0]),
+                "uncertainty_real_pr": float(pre_cfd_std_real[i, 1]),
+                "uncertainty_real_mf": float(pre_cfd_std_real[i, 2]),
+            }
+            query_record.update(
+                {name: float(value) for name, value in zip(VAR_NAMES, x_cand)}
+            )
+            upsert_csv_records(
+                AL_QUERY_VALIDATION_CSV,
+                query_record,
+                key_columns=["run_id"],
+            )
+
+            success = False
+            true_y = None
+            geometry_summary = None
+            failure_info = None
+            failure_record = None
+            evaluation_attempts = 0
+            for evaluation_attempt in range(1, 3):
+                evaluation_attempts = evaluation_attempt
+                success, true_y, geometry_summary, failure_info = run_single_cfd(
+                    x_cand,
+                    run_id,
+                )
+                if success:
+                    record_run_outcome(
+                        FAILURE_RECORDS_CSV,
+                        VAR_NAMES,
+                        x_cand,
+                        source="active_learning",
+                        run_id=run_id,
+                        status="succeeded",
+                    )
+                    break
+                failure_record = record_run_outcome(
+                    FAILURE_RECORDS_CSV,
+                    VAR_NAMES,
+                    x_cand,
+                    source="active_learning",
+                    run_id=run_id,
+                    status="failed",
+                    failure_stage=(failure_info or {}).get("stage", "infrastructure"),
+                    reason=(failure_info or {}).get("reason", ""),
+                )
+                if bool(failure_record.get("confirmed")):
+                    break
+                if evaluation_attempt < 2:
+                    print("     [失败复核] 将原点重试一次，排除偶发软件或求解故障。")
             print_geometry_summary(geometry_summary)
+            query_record["evaluation_attempts"] = int(evaluation_attempts)
 
             if success:
                 total_success += 1
@@ -1786,9 +3042,72 @@ def main_multiobjective_active_learning(max_al_iters: int | None = None):
                 Y_pool = np.vstack([Y_pool, true_y])
                 W_pool = np.append(W_pool, new_boundary)
 
+                true_surr = np.asarray(true_y, dtype=float)[SURROGATE_OUTPUT_IDX]
+                query_record.update({
+                    "status": "success",
+                    "completed_at_utc": utc_timestamp(),
+                    "true_eff": float(true_surr[0]),
+                    "true_pr": float(true_surr[1]),
+                    "true_mf": float(true_surr[2]),
+                    "true_power": float(true_y[2]),
+                    "is_boundary": float(new_boundary),
+                })
+                for output_idx, suffix in enumerate(("eff", "pr", "mf")):
+                    error = float(pre_cfd_mean[i, output_idx] - true_surr[output_idx])
+                    uncertainty = float(pre_cfd_std_real[i, output_idx])
+                    query_record[f"error_{suffix}"] = error
+                    query_record[f"abs_error_{suffix}"] = abs(error)
+                    query_record[f"squared_error_{suffix}"] = error ** 2
+                    query_record[f"standardized_abs_error_{suffix}"] = (
+                        abs(error) / max(uncertainty, 1e-12)
+                    )
+                    query_record[f"covered_by_1sigma_{suffix}"] = bool(
+                        abs(error) <= uncertainty
+                    )
+                    query_record[f"covered_by_2sigma_{suffix}"] = bool(
+                        abs(error) <= 2.0 * uncertainty
+                    )
+
             else:
-                failed_points.append(x_cand.copy())
-                print(f"     [失败] 已加入失败样本池，当前失败累计 {len(failed_points)}")
+                if (
+                    failure_record is not None
+                    and bool(failure_record.get("confirmed"))
+                    and failure_record.get("failure_stage")
+                    in {
+                        "geometry",
+                        "mesh",
+                        "geometry_mesh",
+                        "fatal_overflow",
+                        "blockage",
+                        "physical_invalid",
+                    }
+                ):
+                    failed_points.append(x_cand.copy())
+                    print(
+                        f"     [已确认失败] 已加入距离过滤池，当前累计 "
+                        f"{len(failed_points)}"
+                    )
+                else:
+                    print("     [系统性故障] 已记录，但不作为设计不可行标签。")
+                query_record.update({
+                    "status": "failed",
+                    "completed_at_utc": utc_timestamp(),
+                    "failure_stage": (failure_info or {}).get(
+                        "stage", "infrastructure"
+                    ),
+                    "failure_reason": (failure_info or {}).get("reason", ""),
+                })
+
+            query_record["geometry_summary_json"] = json.dumps(
+                geometry_summary or {},
+                ensure_ascii=False,
+                default=str,
+            )
+            upsert_csv_records(
+                AL_QUERY_VALIDATION_CSV,
+                query_record,
+                key_columns=["run_id"],
+            )
 
             save_checkpoint(
                 al_iter=al_iter,
@@ -1810,19 +3129,36 @@ def main_multiobjective_active_learning(max_al_iters: int | None = None):
             X_pool=X_pool,
             Y_pool=Y_pool,
             W_pool=W_pool,
-            geom_warn_clf=geom_warn_clf,
-            geom_safe_threshold=CFG.geom_safe_prob_threshold_pick,
+            geom_warn_clf=None,
+            geom_safe_threshold=None,
             ref_eff=TRUE_HV_REF_EFF,
             ref_pr=TRUE_HV_REF_PR
         )
         hv_history.append({
             "iter": al_iter + 1,
+            "hv_policy_version": HV_POLICY_VERSION,
             "n_samples": len(X_pool),
+            "train_samples_before_cfd": validation_row["train_pool_samples_before_cfd"],
             "true_hv": true_hv_val,
             "surrogate_hv": surrogate_hv_val,
             "mse_eff": mse_eff,
             "mse_pr": mse_pr,
-            "mse_mf": mse_mf
+            "mse_mf": mse_mf,
+            "rmse_eff": fixed_metrics["fixed_test_rmse_eff"],
+            "rmse_pr": fixed_metrics["fixed_test_rmse_pr"],
+            "rmse_mf": fixed_metrics["fixed_test_rmse_mf"],
+            "mae_eff": fixed_metrics["fixed_test_mae_eff"],
+            "mae_pr": fixed_metrics["fixed_test_mae_pr"],
+            "mae_mf": fixed_metrics["fixed_test_mae_mf"],
+            "r2_eff": fixed_metrics["fixed_test_r2_eff"],
+            "r2_pr": fixed_metrics["fixed_test_r2_pr"],
+            "r2_mf": fixed_metrics["fixed_test_r2_mf"],
+            "cv_rmse_eff_mean": cv_summary.get("cv_mean_rmse_eff", np.nan),
+            "cv_rmse_pr_mean": cv_summary.get("cv_mean_rmse_pr", np.nan),
+            "cv_rmse_mf_mean": cv_summary.get("cv_mean_rmse_mf", np.nan),
+            "cv_r2_eff_mean": cv_summary.get("cv_mean_r2_eff", np.nan),
+            "cv_r2_pr_mean": cv_summary.get("cv_mean_r2_pr", np.nan),
+            "cv_r2_mf_mean": cv_summary.get("cv_mean_r2_mf", np.nan),
         })
         save_checkpoint(
             al_iter=al_iter,
@@ -1851,8 +3187,7 @@ def main_multiobjective_active_learning(max_al_iters: int | None = None):
     # =========================================================================
     # 收尾：HV 历史
     # =========================================================================
-    hv_df = pd.DataFrame(hv_history)
-    hv_df.to_csv(HV_CSV_PATH, index=False)
+    hv_df = write_hv_history(HV_CSV_PATH, hv_history)
     
     print(f"\n[完成] HV 历史已保存: {HV_CSV_PATH}")
 

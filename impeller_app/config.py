@@ -15,10 +15,12 @@ class SolverPaths:
     turbogrid_exe: Path = Path(r"D:\ANSYS Inc\v251\TurboGrid\bin\cfxtg.exe")
     cfx_bin_dir: Path = Path(r"D:\ANSYS Inc\v251\CFX\bin")
     template_cfx: Path = Path("Templates/BaseModel.cfx")
-    template_cse: Path = Path("Templates/Extract_Results.cse")
+    template_cse: Path = Path("cfx_post/Extract_Results.cse")
     base_cft: Path = Path("Templates/0908-2.cft")
     cft_batch_template: Path = Path("Templates/BaseModel.cft-batch")
-    turbogrid_template: Path = Path("Templates/BaseMeshing.tst")
+    # First-launch default only. Once the GUI saves its Environment settings,
+    # that persisted value is passed explicitly to Run-GeometryMeshing.ps1.
+    turbogrid_template: Path = Path("Templates/new_base.tst")
 
 
 @dataclass
@@ -32,12 +34,18 @@ class WorkspacePaths:
     pool_checkpoint_csv: Path = Path("al_training_pool_checkpoint.csv")
     checkpoint_meta_json: Path = Path("al_checkpoint_meta.json")
     failed_points_npy: Path = Path("failed_points.npy")
+    failure_records_csv: Path = Path("failure_records.csv")
     hv_history_csv: Path = Path("hv_history.csv")
     hv_plot_png: Path = Path("hv_convergence.png")
+    surrogate_metrics_csv: Path = Path("surrogate_validation_history.csv")
+    cv_fold_metrics_csv: Path = Path("surrogate_cv_fold_history.csv")
+    fixed_test_predictions_csv: Path = Path("fixed_test_predictions_history.csv")
+    al_query_validation_csv: Path = Path("al_query_validation.csv")
     scaler_x_pkl: Path = Path("scaler_X.pkl")
     scaler_y_pkl: Path = Path("scaler_Y.pkl")
     best_regressor_pth: Path = Path("best_regressor.pth")
     geom_warn_clf_pkl: Path = Path("geometry_warning_clf.pkl")
+    geometry_feas_clf_pkl: Path = Path("geometry_feasibility_clf.pkl")
     pareto_front_csv: Path = Path("pareto_front_points.csv")
     pareto_plot_png: Path = Path("pareto_front.png")
     pareto_selection_json: Path = Path("pareto_selected_point.json")
@@ -59,12 +67,18 @@ class WorkspacePaths:
             pool_checkpoint_csv=_resolve(root, self.pool_checkpoint_csv),
             checkpoint_meta_json=_resolve(root, self.checkpoint_meta_json),
             failed_points_npy=_resolve(root, self.failed_points_npy),
+            failure_records_csv=_resolve(root, self.failure_records_csv),
             hv_history_csv=_resolve(root, self.hv_history_csv),
             hv_plot_png=_resolve(root, self.hv_plot_png),
+            surrogate_metrics_csv=_resolve(root, self.surrogate_metrics_csv),
+            cv_fold_metrics_csv=_resolve(root, self.cv_fold_metrics_csv),
+            fixed_test_predictions_csv=_resolve(root, self.fixed_test_predictions_csv),
+            al_query_validation_csv=_resolve(root, self.al_query_validation_csv),
             scaler_x_pkl=_resolve(root, self.scaler_x_pkl),
             scaler_y_pkl=_resolve(root, self.scaler_y_pkl),
             best_regressor_pth=_resolve(root, self.best_regressor_pth),
             geom_warn_clf_pkl=_resolve(root, self.geom_warn_clf_pkl),
+            geometry_feas_clf_pkl=_resolve(root, self.geometry_feas_clf_pkl),
             pareto_front_csv=_resolve(root, self.pareto_front_csv),
             pareto_plot_png=_resolve(root, self.pareto_plot_png),
             pareto_selection_json=_resolve(root, self.pareto_selection_json),
@@ -82,13 +96,13 @@ class RuntimeSettings:
     rpm: float = 10000.0
     mass_flow: float = 0.0036
     alpha0: float = 0.0
+    optimization_outlet_static_pressure_pa: float = 12.0
+    operating_point_pressure_tolerance_pa: float = 0.25
     default_invalid_flow_g_s: float = 0.1
     default_discard_flow_g_s: float = 0.0001
     default_boundary_flow_g_s: float = 3.6
     default_min_efficiency: float = 0.60
     default_min_power: float = 60.0
-    default_min_pressure_ratio: float = 1.60
-    default_max_pressure_ratio: float = 2.85
     default_min_d2_d1s_gap: float = 0.070
     default_max_le_sweep_diff: float = 52.0
     default_max_exit_angle_diff: float = 13.5
@@ -136,15 +150,21 @@ class AppConfig:
         runtime = cfg.runtime
         return {
             "PS_SCRIPT_PATH": str(cfg.solver.geometry_script_path),
+            "TURBOGRID_TEMPLATE": str(cfg.solver.turbogrid_template),
             "AL_WORKING_BASE": str(ws.active_learning_runs_dir),
             "TRAINING_CSV": str(ws.training_csv),
             "SCALER_X_PATH": str(ws.scaler_x_pkl),
             "SCALER_Y_PATH": str(ws.scaler_y_pkl),
             "BEST_REG_PATH": str(ws.best_regressor_pth),
-            "GEOM_WARN_CLF_PATH": str(ws.geom_warn_clf_pkl),
+            "GEOM_FEAS_CLF_PATH": str(ws.geometry_feas_clf_pkl),
             "HV_CSV_PATH": str(ws.hv_history_csv),
             "HV_PLOT_PATH": str(ws.hv_plot_png),
+            "SURROGATE_METRICS_CSV": str(ws.surrogate_metrics_csv),
+            "CV_FOLD_METRICS_CSV": str(ws.cv_fold_metrics_csv),
+            "FIXED_TEST_PREDICTIONS_CSV": str(ws.fixed_test_predictions_csv),
+            "AL_QUERY_VALIDATION_CSV": str(ws.al_query_validation_csv),
             "FAILED_POINTS_PATH": str(ws.failed_points_npy),
+            "FAILURE_RECORDS_CSV": str(ws.failure_records_csv),
             "POOL_CHECKPOINT_CSV": str(ws.pool_checkpoint_csv),
             "CHECKPOINT_META_PATH": str(ws.checkpoint_meta_json),
             "DESIGN_VARIABLES_PATH": str(ws.design_variables_json),
@@ -153,8 +173,8 @@ class AppConfig:
             "BOUNDARY_FLOW_G_S": float(runtime.default_boundary_flow_g_s),
             "MIN_EFFICIENCY": float(runtime.default_min_efficiency),
             "MIN_POWER": float(runtime.default_min_power),
-            "MIN_PRESSURE_RATIO": float(runtime.default_min_pressure_ratio),
-            "MAX_PRESSURE_RATIO": float(runtime.default_max_pressure_ratio),
+            "OPTIMIZATION_P_OUT": float(runtime.optimization_outlet_static_pressure_pa),
+            "OPERATING_POINT_P_OUT_TOLERANCE": float(runtime.operating_point_pressure_tolerance_pa),
             "MIN_D2_D1S_GAP": float(runtime.default_min_d2_d1s_gap),
             "MAX_LE_SWEEP_DIFF": float(runtime.default_max_le_sweep_diff),
             "MAX_EXIT_ANGLE_DIFF": float(runtime.default_max_exit_angle_diff),

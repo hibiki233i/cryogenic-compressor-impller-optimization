@@ -39,7 +39,14 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from design_variables import lower_bounds, load_variable_specs, upper_bounds, variable_names
+from design_variables import (
+    lower_bounds,
+    load_variable_specs,
+    require_current_performance_data,
+    upper_bounds,
+    variable_names,
+    write_performance_data_metadata,
+)
 
 try:
     import torch
@@ -55,14 +62,30 @@ _VARIABLE_SPECS = load_variable_specs()
 VAR_NAMES = variable_names(_VARIABLE_SPECS)
 L_BOUNDS = lower_bounds(_VARIABLE_SPECS)
 U_BOUNDS = upper_bounds(_VARIABLE_SPECS)
+P_OUT_NAME = "P_out"
+P_OUT_IDX = VAR_NAMES.index(P_OUT_NAME)
+GEOMETRY_VAR_NAMES = [name for name in VAR_NAMES if name != P_OUT_NAME]
+GEOMETRY_VAR_IDX = np.array(
+    [VAR_NAMES.index(name) for name in GEOMETRY_VAR_NAMES], dtype=int
+)
+FAILURE_CLASSIFIER_EXCLUDED_FEATURES = frozenset({"nBl"})
+GEOM_WARN_FEATURE_NAMES = [
+    name for name in GEOMETRY_VAR_NAMES
+    if name not in FAILURE_CLASSIFIER_EXCLUDED_FEATURES
+]
+GEOM_WARN_VAR_IDX = np.array(
+    [VAR_NAMES.index(name) for name in GEOM_WARN_FEATURE_NAMES], dtype=int
+)
 
 MIN_VALID_FLOW_G_S = float(os.environ.get("IMPELLER_MIN_VALID_FLOW_G_S", 0.1))
 MIN_DISCARD_FLOW_G_S = float(os.environ.get("IMPELLER_MIN_DISCARD_FLOW_G_S", 0.0001))
 BOUNDARY_FLOW_G_S = float(os.environ.get("IMPELLER_BOUNDARY_FLOW_G_S", 3.60))
 MIN_EFFICIENCY = float(os.environ.get("IMPELLER_MIN_EFFICIENCY", 0.60))
 MIN_POWER = float(os.environ.get("IMPELLER_MIN_POWER", 60.0))
-MIN_PRESSURE_RATIO = float(os.environ.get("IMPELLER_MIN_PRESSURE_RATIO", 1.60))
-MAX_PRESSURE_RATIO = float(os.environ.get("IMPELLER_MAX_PRESSURE_RATIO", 2.85))
+OPTIMIZATION_P_OUT = float(os.environ.get("IMPELLER_OPTIMIZATION_P_OUT", 12.0))
+OPERATING_POINT_P_OUT_TOLERANCE = float(
+    os.environ.get("IMPELLER_OPERATING_POINT_P_OUT_TOLERANCE", 0.25)
+)
 MIN_D2_D1S_GAP = float(os.environ.get("IMPELLER_MIN_D2_D1S_GAP", 0.070))
 MAX_LE_SWEEP_DIFF = float(os.environ.get("IMPELLER_MAX_LE_SWEEP_DIFF", 52.0))
 MAX_EXIT_ANGLE_DIFF = float(os.environ.get("IMPELLER_MAX_EXIT_ANGLE_DIFF", 13.5))
@@ -83,13 +106,12 @@ def min_rake_te_s_for_nbl(n_bl: int) -> float:
 DEFAULT_POOL_CSV = "al_training_pool_checkpoint.csv"
 DEFAULT_TRAINING_CSV = "Compressor_Training_Data.csv"
 DEFAULT_MODEL_PATH = "best_regressor.pth"
-DEFAULT_GEOM_WARN_CLF_PATH = "geometry_warning_clf.pkl"
+DEFAULT_GEOM_WARN_CLF_PATH = "geometry_feasibility_clf.pkl"
 DEFAULT_PARETO_CSV = "pareto_front_points.csv"
 DEFAULT_PLOT_PATH = "pareto_front.png"
 DEFAULT_SELECTION_JSON = "pareto_selected_point.json"
 DEFAULT_ENGINEERING_CSV = "pareto_engineering_ranked.csv"
 DEFAULT_ENGINEERING_JSON = "pareto_engineering_report.json"
-GEOM_WARN_FEATURE_NAMES = [name for name in VAR_NAMES if name != "P_out"]
 
 
 def configure_runtime(design_variables_path: str | None = None, **overrides):
@@ -102,7 +124,28 @@ def configure_runtime(design_variables_path: str | None = None, **overrides):
     globals_dict["VAR_NAMES"] = variable_names(specs)
     globals_dict["L_BOUNDS"] = lower_bounds(specs)
     globals_dict["U_BOUNDS"] = upper_bounds(specs)
-    globals_dict["GEOM_WARN_FEATURE_NAMES"] = [name for name in globals_dict["VAR_NAMES"] if name != "P_out"]
+    globals_dict["P_OUT_IDX"] = globals_dict["VAR_NAMES"].index(P_OUT_NAME)
+    globals_dict["GEOMETRY_VAR_NAMES"] = [
+        name for name in globals_dict["VAR_NAMES"] if name != P_OUT_NAME
+    ]
+    globals_dict["GEOMETRY_VAR_IDX"] = np.array(
+        [
+            globals_dict["VAR_NAMES"].index(name)
+            for name in globals_dict["GEOMETRY_VAR_NAMES"]
+        ],
+        dtype=int,
+    )
+    globals_dict["GEOM_WARN_FEATURE_NAMES"] = [
+        name for name in globals_dict["GEOMETRY_VAR_NAMES"]
+        if name not in FAILURE_CLASSIFIER_EXCLUDED_FEATURES
+    ]
+    globals_dict["GEOM_WARN_VAR_IDX"] = np.array(
+        [
+            globals_dict["VAR_NAMES"].index(name)
+            for name in globals_dict["GEOM_WARN_FEATURE_NAMES"]
+        ],
+        dtype=int,
+    )
 
 
 @dataclass
@@ -155,6 +198,16 @@ def snap_discrete_vars(x: np.ndarray) -> np.ndarray:
         x = x[None, :]
     nbl_idx = VAR_NAMES.index("nBl")
     x[:, nbl_idx] = np.clip(np.round(x[:, nbl_idx]), L_BOUNDS[nbl_idx], U_BOUNDS[nbl_idx])
+    return x
+
+
+def pin_optimization_operating_point(
+    x: np.ndarray,
+    fixed_p_out: float | None = None,
+) -> np.ndarray:
+    x = snap_discrete_vars(x)
+    active_p_out = OPTIMIZATION_P_OUT if fixed_p_out is None else fixed_p_out
+    x[:, P_OUT_IDX] = float(active_p_out)
     return x
 
 
@@ -219,8 +272,37 @@ def predict_geometry_safe_prob(geom_warn_clf, x_raw: np.ndarray) -> np.ndarray:
     if geom_warn_clf is None:
         return np.ones(len(x_raw))
     x_raw = snap_discrete_vars(x_raw)
-    x_geom = x_raw[:, :len(GEOM_WARN_FEATURE_NAMES)]
-    p_bad = geom_warn_clf.predict_proba(x_geom)[:, 1]
+    n_features = int(getattr(geom_warn_clf, "n_features_in_", -1))
+    classes = np.asarray(geom_warn_clf.classes_)
+    bad_class = np.flatnonzero(classes == 1)
+    if len(bad_class) == 0:
+        return np.ones(len(x_raw))
+
+    if n_features == len(GEOM_WARN_FEATURE_NAMES):
+        p_bad = geom_warn_clf.predict_proba(x_raw[:, GEOM_WARN_VAR_IDX])[
+            :, int(bad_class[0])
+        ]
+    elif n_features == len(GEOMETRY_VAR_NAMES):
+        # Compatibility for classifiers persisted before nBl was removed.
+        # Marginalizing over every allowed blade count makes their safety
+        # estimate independent of the candidate's actual nBl.
+        nbl_idx = VAR_NAMES.index("nBl")
+        allowed_nbl = np.arange(
+            int(np.ceil(L_BOUNDS[nbl_idx])),
+            int(np.floor(U_BOUNDS[nbl_idx])) + 1,
+            dtype=float,
+        )
+        variants = np.repeat(x_raw[None, :, :], len(allowed_nbl), axis=0)
+        variants[:, :, nbl_idx] = allowed_nbl[:, None]
+        legacy_features = variants.reshape(-1, len(VAR_NAMES))[:, GEOMETRY_VAR_IDX]
+        p_bad = geom_warn_clf.predict_proba(legacy_features)[:, int(bad_class[0])]
+        p_bad = p_bad.reshape(len(allowed_nbl), len(x_raw)).mean(axis=0)
+    else:
+        raise ValueError(
+            "Unsupported geometry-classifier feature count: "
+            f"{n_features}; expected {len(GEOM_WARN_FEATURE_NAMES)} (current) "
+            f"or {len(GEOMETRY_VAR_NAMES)} (legacy)."
+        )
     return 1.0 - p_bad
 
 
@@ -253,6 +335,7 @@ def resolve_input_csv(explicit_path: str | None) -> str:
 
 
 def load_dataset(csv_path: str) -> pd.DataFrame:
+    require_current_performance_data(csv_path)
     df = pd.read_csv(csv_path)
     required = VAR_NAMES + ALL_OUTPUT_NAMES
     missing = [col for col in required if col not in df.columns]
@@ -270,17 +353,22 @@ def load_dataset(csv_path: str) -> pd.DataFrame:
 def build_front_dataframe(df: pd.DataFrame, geom_warn_clf=None, geom_safe_threshold: float = 0.45) -> pd.DataFrame:
     x_pool = snap_discrete_vars(df[VAR_NAMES].to_numpy(dtype=float))
     y_pool = df[ALL_OUTPUT_NAMES].to_numpy(dtype=float)
-    p_geom_safe = predict_geometry_safe_prob(geom_warn_clf, x_pool)
 
     geom_ok = np.all(geometry_rule_violations(x_pool) <= 0.0, axis=1)
+    operating_point_ok = (
+        np.abs(x_pool[:, P_OUT_IDX] - OPTIMIZATION_P_OUT)
+        <= OPERATING_POINT_P_OUT_TOLERANCE
+    )
     feas_mask = (
-        geom_ok
-        & (p_geom_safe >= geom_safe_threshold)
+        operating_point_ok
+        & geom_ok
         & (y_pool[:, 0] >= 0.45)
-        & (y_pool[:, 1] >= MIN_PRESSURE_RATIO)
-        & (y_pool[:, 1] <= MAX_PRESSURE_RATIO)
         & (y_pool[:, 3] >= BOUNDARY_FLOW_G_S)
     )
+
+    # Every row in this table is a completed CFD observation.  The learned
+    # failure classifier may annotate/rank such points, but must not veto a
+    # verified success or alter the true CFD Pareto front.
 
     df_feas = df.loc[feas_mask].copy().reset_index(drop=True)
     if len(df_feas) == 0:
@@ -351,8 +439,17 @@ def local_output_stability(front: pd.DataFrame, full_df: pd.DataFrame, k_neighbo
 
 def compute_engineering_front_scores(front: pd.DataFrame, full_df: pd.DataFrame, geom_warn_clf=None) -> pd.DataFrame:
     ranked = front.copy()
+    operating_df = full_df.loc[
+        np.abs(full_df[P_OUT_NAME] - OPTIMIZATION_P_OUT)
+        <= OPERATING_POINT_P_OUT_TOLERANCE
+    ].copy()
+    if len(operating_df) == 0:
+        raise ValueError(
+            f"No observations found within {OPERATING_POINT_P_OUT_TOLERANCE} Pa "
+            f"of the fixed P_out={OPTIMIZATION_P_OUT} Pa operating point."
+        )
     x_front = ranked[VAR_NAMES].to_numpy(dtype=float)
-    x_pool = full_df[VAR_NAMES].to_numpy(dtype=float)
+    x_pool = operating_df[VAR_NAMES].to_numpy(dtype=float)
     y = ranked[["Efficiency", "totalpressureratio", "MassFlow"]].to_numpy(dtype=float)
 
     geom_safe_prob = predict_geometry_safe_prob(geom_warn_clf, x_front)
@@ -361,13 +458,10 @@ def compute_engineering_front_scores(front: pd.DataFrame, full_df: pd.DataFrame,
     nearest_success_dist = np.partition(all_dist, 1, axis=1)[:, 1] if len(full_df) > 1 else np.zeros(len(ranked))
 
     knee_score = front_knee_scores(ranked)
-    stability_penalty = local_output_stability(ranked, full_df)
+    stability_penalty = local_output_stability(ranked, operating_df)
 
     flow_margin = np.maximum(0.0, y[:, 2] - BOUNDARY_FLOW_G_S)
     eff_margin = np.maximum(0.0, y[:, 0] - MIN_EFFICIENCY)
-    pr_upper_margin = np.maximum(0.0, MAX_PRESSURE_RATIO - y[:, 1])
-    pr_lower_margin = np.maximum(0.0, y[:, 1] - MIN_PRESSURE_RATIO)
-    pr_margin = np.minimum(pr_upper_margin, pr_lower_margin)
 
     ranges = {
         "nearest_success_dist": max(float(np.max(nearest_success_dist)), 1e-8),
@@ -375,16 +469,14 @@ def compute_engineering_front_scores(front: pd.DataFrame, full_df: pd.DataFrame,
         "stability_penalty": max(float(np.max(stability_penalty)), 1e-8),
         "flow_margin": max(float(np.max(flow_margin)), 1e-8),
         "eff_margin": max(float(np.max(eff_margin)), 1e-8),
-        "pr_margin": max(float(np.max(pr_margin)), 1e-8),
         "geom_safe_prob": max(float(np.max(geom_safe_prob)), 1e-8),
     }
 
     engineering_score = (
-        0.28 * (eff_margin / ranges["eff_margin"])
-        + 0.26 * (flow_margin / ranges["flow_margin"])
-        + 0.20 * (knee_score / ranges["knee_score"])
-        + 0.16 * (geom_safe_prob / ranges["geom_safe_prob"])
-        + 0.10 * (pr_margin / ranges["pr_margin"])
+        0.32 * (eff_margin / ranges["eff_margin"])
+        + 0.28 * (flow_margin / ranges["flow_margin"])
+        + 0.22 * (knee_score / ranges["knee_score"])
+        + 0.18 * (geom_safe_prob / ranges["geom_safe_prob"])
         - 0.10 * (nearest_success_dist / ranges["nearest_success_dist"])
         - 0.06 * (stability_penalty / ranges["stability_penalty"])
     )
@@ -395,7 +487,6 @@ def compute_engineering_front_scores(front: pd.DataFrame, full_df: pd.DataFrame,
     ranked["stability_penalty"] = stability_penalty
     ranked["flow_margin"] = flow_margin
     ranked["eff_margin"] = eff_margin
-    ranked["pr_margin"] = pr_margin
     ranked["engineering_score"] = engineering_score
     ranked = ranked.sort_values(["engineering_score", "Efficiency", "totalpressureratio"], ascending=[False, False, False]).reset_index(drop=True)
     ranked.insert(0, "engineering_rank", np.arange(1, len(ranked) + 1))
@@ -494,8 +585,6 @@ def score_inverse_candidates(
 
     mf_penalty = 80.0 * np.maximum(0.0, BOUNDARY_FLOW_G_S - mf) ** 2
     eff_low_penalty = 80.0 * np.maximum(0.0, MIN_EFFICIENCY - eff) ** 2
-    pr_low_penalty = 60.0 * np.maximum(0.0, MIN_PRESSURE_RATIO - pr) ** 2
-    pr_high_penalty = 60.0 * np.maximum(0.0, pr - MAX_PRESSURE_RATIO) ** 2
 
     x_norm = scaler_x.transform(x_raw)
     train_x_norm = scaler_x.transform(train_x_raw)
@@ -506,7 +595,9 @@ def score_inverse_candidates(
     sigma = (U_BOUNDS - L_BOUNDS) * 0.015
     noise = rng.normal(0.0, sigma, size=(len(x_raw), 6, len(VAR_NAMES)))
     x_pert = np.clip(x_raw[:, None, :] + noise, L_BOUNDS, U_BOUNDS)
-    x_pert = snap_discrete_vars(x_pert.reshape(-1, len(VAR_NAMES)))
+    x_pert = pin_optimization_operating_point(
+        x_pert.reshape(-1, len(VAR_NAMES))
+    )
     y_pert = predict_surrogate(model, x_pert, scaler_x, scaler_y)
     y_pert = y_pert.reshape(len(x_raw), 6, -1)
     robustness_penalty = (
@@ -520,8 +611,6 @@ def score_inverse_candidates(
         + geom_penalty
         + mf_penalty
         + eff_low_penalty
-        + pr_low_penalty
-        + pr_high_penalty
         + train_dist_penalty
         + 0.35 * robustness_penalty
         + geom_margin_bonus
@@ -549,8 +638,10 @@ def inverse_design_search(
     nearest_order = np.argsort(dist)[: min(5, len(front))]
 
     x_rand = rng.uniform(L_BOUNDS, U_BOUNDS, size=(random_samples, len(VAR_NAMES)))
-    x_rand = snap_discrete_vars(x_rand)
-    x_seed = np.vstack([front_x[nearest_order], x_rand])
+    x_rand = pin_optimization_operating_point(x_rand)
+    x_seed = pin_optimization_operating_point(
+        np.vstack([front_x[nearest_order], x_rand])
+    )
 
     y_seed = predict_surrogate(model, x_seed, scaler_x, scaler_y)
     score = score_inverse_candidates(model, y_seed, x_seed, target_eff, target_pr, scaler_x, scaler_y, train_x, rng)
@@ -564,9 +655,11 @@ def inverse_design_search(
     for _ in range(local_rounds):
         x_local = best_x + rng.normal(0.0, sigma, size=(local_samples, len(VAR_NAMES)))
         x_local = np.clip(x_local, L_BOUNDS, U_BOUNDS)
-        x_local = snap_discrete_vars(x_local)
+        x_local = pin_optimization_operating_point(x_local)
 
-        x_eval = np.vstack([best_x[None, :], front_x[nearest_order], x_local])
+        x_eval = pin_optimization_operating_point(
+            np.vstack([best_x[None, :], front_x[nearest_order], x_local])
+        )
         y_eval = predict_surrogate(model, x_eval, scaler_x, scaler_y)
         score_eval = score_inverse_candidates(model, y_eval, x_eval, target_eff, target_pr, scaler_x, scaler_y, train_x, rng)
 
@@ -616,7 +709,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--input-csv", default=None, help="Input CSV. Defaults to pool checkpoint, then training CSV.")
     parser.add_argument("--model-path", default=DEFAULT_MODEL_PATH, help="Path to best_regressor.pth")
-    parser.add_argument("--geom-warn-clf-path", default=DEFAULT_GEOM_WARN_CLF_PATH, help="Optional geometry warning classifier path.")
+    parser.add_argument("--geom-warn-clf-path", default=DEFAULT_GEOM_WARN_CLF_PATH, help="Optional 13-D geometry feasibility classifier path.")
     parser.add_argument("--geom-safe-threshold", type=float, default=0.45, help="Minimum predicted geometry-safe probability when building the Pareto front.")
     parser.add_argument("--output-csv", default=DEFAULT_PARETO_CSV, help="Output CSV for Pareto front points.")
     parser.add_argument("--plot-path", default=DEFAULT_PLOT_PATH, help="Output image path for Pareto curve.")
@@ -649,12 +742,14 @@ def main() -> int:
 
     front.to_csv(args.output_csv, index=False)
     front_ranked.to_csv(args.engineering_csv, index=False)
+    write_performance_data_metadata(args.output_csv)
+    write_performance_data_metadata(args.engineering_csv)
     save_pareto_plot(front, args.plot_path)
 
     engineering_report = {
         "input_csv": input_csv,
         "front_size": int(len(front)),
-        "geometry_warning_classifier_loaded": bool(geom_warn_clf is not None),
+        "geometry_feasibility_classifier_loaded": bool(geom_warn_clf is not None),
         "geometry_safe_threshold": float(args.geom_safe_threshold),
         "recommended_front_index": int(front_ranked.iloc[0]["front_index"]),
         "recommended_engineering_rank": int(front_ranked.iloc[0]["engineering_rank"]),

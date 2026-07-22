@@ -1,0 +1,36 @@
+!# CFX-Post automated performance extraction
+COMMAND FILE:
+  CFX Post Version = 25.1
+END
+
+! open(OUTFILE, ">CFX_Results.txt") or die "cannot create CFX_Results.txt\n";
+
+! sub get_num {
+!     my $val = shift;
+!     if ($val =~ /^\s*([-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?)/) {
+!         return $1;
+!     }
+!     return 0;
+! }
+
+!# Mass flow and static quantities
+! $massFlow = get_num(evaluate("-massFlow()\@R1 Outlet"));
+! $p_static_in  = get_num(evaluate("massFlowAve(Pressure)\@R1 Inlet"));
+! $p_static_out = get_num(evaluate("massFlowAve(Pressure)\@R1 Outlet"));
+! $StaticPR = ($p_static_in == 0) ? 0 : ($p_static_out / $p_static_in);
+! $Eff = get_num(evaluate("massFlowAve(Isentropic Compression Efficiency)\@R1 Outlet"));
+
+!# Shaft-fluid power from stationary-frame total enthalpy rise
+! $H_in  = get_num(evaluate("massFlowAve(Total Enthalpy in Stn Frame)\@INBlock INFLOW/ 1 [J kg^-1]"));
+! $H_out = get_num(evaluate("massFlowAve(Total Enthalpy in Stn Frame)\@OUTBlock OUTFLOW/ 1 [J kg^-1]"));
+! $mdot  = abs(get_num(evaluate("massFlow()\@INBlock INFLOW/ 1 [kg]")));
+! $Power = ($H_out - $H_in) * $mdot;
+
+!# Compressor total-to-total pressure ratio in the stationary (absolute) frame.
+!# This matches the Turbo Mode CFX-Post expression "Total Pressure Ratio".
+! $P_total_in  = get_num(evaluate("massFlowAve(Total Pressure in Stn Frame)\@R1 Inlet"));
+! $P_total_out = get_num(evaluate("massFlowAve(Total Pressure in Stn Frame)\@R1 Outlet"));
+! $TotalPR = ($P_total_in == 0) ? 0 : ($P_total_out / $P_total_in);
+
+! printf OUTFILE ("%f,%f,%f,%f,%f\n", $Eff, $StaticPR, $Power, $massFlow, $TotalPR);
+! close(OUTFILE);

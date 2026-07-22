@@ -25,6 +25,7 @@ import pandas as pd
 from design_variables import variable_names
 
 VAR_NAMES = variable_names()
+GEOMETRY_VAR_NAMES = [name for name in VAR_NAMES if name != "P_out"]
 
 DEFAULT_ENGINEERING_CSV = "pareto_engineering_ranked.csv"
 DEFAULT_FRONT_CSV = "pareto_front_points.csv"
@@ -191,7 +192,11 @@ def row_summary(row: pd.Series) -> dict:
         "front_index": int(row["front_index"]) if "front_index" in row.index else None,
         "engineering_rank": int(row["engineering_rank"]) if "engineering_rank" in row.index and pd.notna(row["engineering_rank"]) else None,
         "engineering_score": float(row["engineering_score"]) if "engineering_score" in row.index and pd.notna(row["engineering_score"]) else None,
-        "geometry": {name: (int(round(float(row[name]))) if name == "nBl" else float(row[name])) for name in VAR_NAMES},
+        "geometry": {
+            name: (int(round(float(row[name]))) if name == "nBl" else float(row[name]))
+            for name in GEOMETRY_VAR_NAMES
+        },
+        "operating_condition": {"P_out": float(row["P_out"])},
     }
     for col in [
         "Efficiency",
@@ -204,7 +209,6 @@ def row_summary(row: pd.Series) -> dict:
         "stability_penalty",
         "flow_margin",
         "eff_margin",
-        "pr_margin",
     ]:
         if col in row.index and pd.notna(row[col]):
             summary[col] = float(row[col])
@@ -225,7 +229,14 @@ def write_case_files(
     with open(case_dir / "case_summary.json", "w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
 
-    pd.DataFrame([{name: summary["geometry"][name] for name in VAR_NAMES}]).to_csv(case_dir / "geometry_parameters.csv", index=False)
+    pd.DataFrame([summary["geometry"]]).to_csv(
+        case_dir / "geometry_parameters.csv",
+        index=False,
+    )
+    pd.DataFrame([summary["operating_condition"]]).to_csv(
+        case_dir / "operating_condition.csv",
+        index=False,
+    )
 
     if base_cft:
         shutil.copy2(base_cft, case_dir / Path(base_cft).name)

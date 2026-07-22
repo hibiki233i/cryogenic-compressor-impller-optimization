@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 
+from design_variables import is_current_performance_data, write_performance_data_metadata
 from ..config import AppConfig
 from ..legacy import export_module, pareto_module
 from ..models import TaskResult
@@ -21,14 +22,23 @@ class ParetoService:
 
     def compute_pareto_front(self) -> TaskResult:
         cfg = self.config
-        df = self.pareto.load_dataset(str(cfg.workspace.pool_checkpoint_csv if cfg.workspace.pool_checkpoint_csv.exists() else cfg.workspace.training_csv))
-        geom_warn_clf = self.pareto.load_geometry_warning_classifier(str(cfg.workspace.geom_warn_clf_pkl))
+        source_csv = (
+            cfg.workspace.pool_checkpoint_csv
+            if is_current_performance_data(cfg.workspace.pool_checkpoint_csv)
+            else cfg.workspace.training_csv
+        )
+        df = self.pareto.load_dataset(str(source_csv))
+        geom_warn_clf = self.pareto.load_geometry_warning_classifier(
+            str(cfg.workspace.geometry_feas_clf_pkl)
+        )
         front = self.pareto.build_front_dataframe(df, geom_warn_clf=geom_warn_clf, geom_safe_threshold=cfg.runtime.pareto_geom_safe_threshold)
         if len(front) == 0:
             return TaskResult(status="failed", message="No feasible Pareto front could be extracted.")
         ranked = self.pareto.compute_engineering_front_scores(front, df, geom_warn_clf=geom_warn_clf)
         front.to_csv(cfg.workspace.pareto_front_csv, index=False)
         ranked.to_csv(cfg.workspace.pareto_engineering_csv, index=False)
+        write_performance_data_metadata(cfg.workspace.pareto_front_csv)
+        write_performance_data_metadata(cfg.workspace.pareto_engineering_csv)
         self.pareto.save_pareto_plot(front, str(cfg.workspace.pareto_plot_png))
         report = {
             "front_size": int(len(front)),
@@ -53,7 +63,12 @@ class ParetoService:
         result = self.compute_pareto_front()
         if result.status != "succeeded":
             return result
-        df = self.pareto.load_dataset(str(cfg.workspace.pool_checkpoint_csv if cfg.workspace.pool_checkpoint_csv.exists() else cfg.workspace.training_csv))
+        source_csv = (
+            cfg.workspace.pool_checkpoint_csv
+            if is_current_performance_data(cfg.workspace.pool_checkpoint_csv)
+            else cfg.workspace.training_csv
+        )
+        df = self.pareto.load_dataset(str(source_csv))
         front = self.pareto.load_dataset(str(cfg.workspace.pareto_front_csv))
         if selection.get("front_index") is not None:
             ranked = self.pareto.pd.read_csv(cfg.workspace.pareto_engineering_csv)
@@ -127,8 +142,10 @@ class ParetoService:
             # Do not pre-generate the same file here, otherwise rpm/mFlow can drift.
             summary = self.exporter.write_case_files(case_dir, row, resolved_base_cft, None)
             sample = dict(summary["geometry"])
-            if "P_out" in row.index and row["P_out"] is not None:
-                sample["P_out"] = float(row["P_out"])
+            sample["P_out"] = float(cfg.runtime.optimization_outlet_static_pressure_pa)
+            summary["operating_condition"] = {
+                "P_out": float(cfg.runtime.optimization_outlet_static_pressure_pa)
+            }
             geometry_result = runner.run_geometry_generation(case_dir, sample, run_id=case_dir.name)
             if geometry_result.status == "succeeded":
                 summary["mesh_generated"] = True

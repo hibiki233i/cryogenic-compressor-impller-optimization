@@ -1,0 +1,613 @@
+LIBRARY:
+  CEL:
+    EXPRESSIONS:
+      ATJump = ((2 - sigmaT) / sigmaT) * (2 * gammaHe3 / (gammaHe3 + 1)) * (1 \
+        / PrHe3) * (lambdaMfp / (1 + lambdaMfp / hTip))
+      BKDenom = max(1 - bBK * KnTip, 1.0E-6)
+      BKSlipDrag = muLocal / max(BKSlipLength, 1.0E-12 [m])
+      BKSlipLength = CSlip * lambdaMfp / BKDenom
+      CSlip = (2 - sigmaV) / sigmaV
+      CpHe3 = gammaHe3 / (gammaHe3 - 1) * RspecHe3
+      CreepCoeff = 0.75 * muLocal / (rhoLocal * TLocal)
+      GradTX = Temperature.Gradient X
+      GradTY = Temperature.Gradient Y
+      GradTZ = Temperature.Gradient Z
+      KnTip = lambdaMfp / hTip
+      MHe3 = 3.0160293E-3 [kg mol^-1]
+      PrHe3 = 0.67
+      Ramp = min(1, max(0, (aitern - 100) / 200))
+      RspecHe3 = Ru / MHe3
+      Ru = 8.314462618 [J mol^-1 K^-1]
+      ShroudMaxShear = 3 [Pa]
+      ShroudRawShearMag = Ramp * BKSlipDrag * ShroudSlipMag
+      ShroudSafeShearMag = min(ShroudRawShearMag, ShroudMaxShear)
+      ShroudScaleFactor = ShroudSafeShearMag / ShroudSlipMag
+      ShroudShearX = -1 * ShroudScaleFactor * SlipUShroud
+      ShroudShearY = -1 * ShroudScaleFactor * SlipVShroud
+      ShroudShearZ = -1 * ShroudScaleFactor * SlipWShroud
+      ShroudSlipMag = sqrt(SlipUShroud^2 + SlipVShroud^2 + SlipWShroud^2) + \
+        1.0E-6 [m s^-1]
+      SlipUShroud = Velocity u - (omega * y) - UCreep
+      SlipUTip = Velocity u - UCreep
+      SlipVShroud = Velocity v - (-omega * x) - VCreep
+      SlipVTip = Velocity v - VCreep
+      SlipWShroud = Velocity w - WCreep
+      SlipWTip = Velocity w - WCreep
+      TLocal = max(Temperature, 1.0 [K])
+      TipMaxShear = 8 [Pa]
+      TipRawShearMag = Ramp * BKSlipDrag * TipVelMag
+      TipSafeShearMag = min(TipRawShearMag, TipMaxShear)
+      TipScaleFactor = TipSafeShearMag / TipVelMag
+      TipShearX = -1 * TipScaleFactor * SlipUTip
+      TipShearY = -1 * TipScaleFactor * SlipVTip
+      TipShearZ = -1 * TipScaleFactor * SlipWTip
+      TipVelMag = sqrt(SlipUTip^2 + SlipVTip^2 + SlipWTip^2) + 1.0E-6 [m s^-1]
+      TwallJump = min(max(TwallRaw, TwallMin), TwallMax)
+      TwallJumpShroud = min(max(TwallRawShroud, TwallMin), TwallMax)
+      TwallMax = 30.0 [K]
+      TwallMin = 4.0 [K]
+      TwallRaw = c0 + c1*rLocal + c2*zLocal + c3*rLocal^2 + c4*rLocal*zLocal \
+        + c5*zLocal^2
+      TwallRawShroud = R1 Shroud.Temperature(x,y,z)
+      UCreep = CreepCoeff * GradTX
+      VCreep = CreepCoeff * GradTY
+      WCreep = CreepCoeff * GradTZ
+      bBK = -1
+      c0 = -699.716545921922 [K]
+      c1 = 3706.44056655496 [K m^-1]
+      c2 = 3297.52700508947 [K m^-1]
+      c3 = 182.08239050946 [K m^-2]
+      c4 = -17019.3636969885 [K m^-2]
+      c5 = -1815.1174331011 [K m^-2]
+      gammaHe3 = 1.6666667
+      hJump = min(max(hJumpRaw, 1.0E-6 [W m^-2 K^-1]), 1.0E8 [W m^-2 K^-1])
+      hJumpRaw = kJump / max(ATJump, 1.0E-12 [m])
+      hTip = 1 [mm]
+      kJump = muLocal * CpHe3 / PrHe3
+      lambdaMfp = muLocal / pAbs * sqrt((3.141592653 * Ru * TLocal) / (2 * \
+        MHe3))
+      muLocal = Dynamic Viscosity
+      omega = 10500 [rev min^-1]
+      pAbs = max(Pressure, pFloor)
+      pFloor = 1 [Pa]
+      rLocal = max(sqrt(x^2 + y^2), 1.0E-6 [m])
+      rhoLocal = max(pAbs / (RspecHe3 * TLocal), 1.0E-12 [kg m^-3])
+      sigmaT = 0.8
+      sigmaV = 0.8
+      zLocal = z
+    END
+    FUNCTION: R1 Shroud
+      Argument Units = [m], [m], [m]
+      Option = Profile Data
+      Spatial Fields = x, y, z
+      DATA FIELD: Temperature
+        Field Name = Temperature
+        Parameter List = Fixed Temperature,Opening Temperature,Outside \
+          Temperature,Static Temperature,Stationary Frame Total \
+          Temperature,Total Temperature
+        Result Units = [K]
+      END
+      DATA SOURCE:
+        File Name = D:/Kn/shroud_Twall_profile.csv
+        Option = From File
+      END
+    END
+  END
+  MATERIAL: HE3
+    Coord Frame = Coord 0
+    Material Group = User
+    Option = Pure Substance
+    Thermodynamic State = Gas
+    PROPERTIES:
+      Component Name = 3He
+      Option = Table
+      Table Format = TASCflow RGP
+      Table Name = D:/3Helium_gas_lowP_500Pa_500K.rgp
+    END
+  END
+END
+FLOW: Flow Analysis 1
+  SOLUTION UNITS:
+    Angle Units = [rad]
+    Length Units = [m]
+    Mass Units = [kg]
+    Solid Angle Units = [sr]
+    Temperature Units = [K]
+    Time Units = [s]
+  END
+  ANALYSIS TYPE:
+    Option = Steady State
+    EXTERNAL SOLVER COUPLING:
+      Option = None
+    END
+  END
+  DOMAIN: R1
+    Coord Frame = Coord 0
+    Domain Type = Fluid
+    Location = Inlet,Outlet,Passage Main
+    BOUNDARY: R1 Blade
+      Boundary Type = WALL
+      Frame Type = Rotating
+      Location = BLD HIGH,BLD LOW
+      Use Profile Data = False
+      BOUNDARY CONDITIONS:
+        HEAT TRANSFER:
+          Option = Adiabatic
+        END
+        MASS AND MOMENTUM:
+          Option = No Slip Wall
+        END
+        WALL ROUGHNESS:
+          Option = Rough Wall
+          Sand Grain Roughness Height = 5 [micron]
+        END
+      END
+    END
+    BOUNDARY: R1 Hub
+      Boundary Type = WALL
+      Coord Frame = Coord 0
+      Frame Type = Rotating
+      Location = INBlock HUB,OUTBlock HUB,Passage HUB
+      Use Profile Data = False
+      BOUNDARY CONDITIONS:
+        HEAT TRANSFER:
+          Option = Adiabatic
+        END
+        MASS AND MOMENTUM:
+          Option = No Slip Wall
+        END
+        WALL ROUGHNESS:
+          Option = Rough Wall
+          Sand Grain Roughness Height = 5 [micron]
+        END
+      END
+    END
+    BOUNDARY: R1 Inlet
+      Boundary Type = INLET
+      Frame Type = Stationary
+      Location = INBlock INFLOW
+      BOUNDARY CONDITIONS:
+        FLOW DIRECTION:
+          Option = Cylindrical Components
+          Unit Vector Axial Component = 1
+          Unit Vector Theta Component = 0.4
+          Unit Vector r Component = 0
+        END
+        FLOW REGIME:
+          Option = Subsonic
+        END
+        HEAT TRANSFER:
+          Option = Static Temperature
+          Static Temperature = 5 [K]
+        END
+        MASS AND MOMENTUM:
+          Option = Static Pressure
+          Relative Pressure = 4.7 [Pa]
+        END
+        TURBULENCE:
+          Option = Medium Intensity and Eddy Viscosity Ratio
+        END
+      END
+    END
+    BOUNDARY: R1 Outlet
+      Boundary Type = OUTLET
+      Frame Type = Stationary
+      Location = OUTBlock OUTFLOW
+      BOUNDARY CONDITIONS:
+        FLOW REGIME:
+          Option = Subsonic
+        END
+        MASS AND MOMENTUM:
+          Option = Static Pressure
+          Relative Pressure = 11 [Pa]
+        END
+      END
+    END
+    BOUNDARY: R1 Shroud
+      Boundary Type = WALL
+      Coord Frame = Coord 0
+      Frame Type = Rotating
+      Location = INBlock SHROUD,OUTBlock SHROUD,Passage SHROUD
+      Use Profile Data = False
+      BOUNDARY CONDITIONS:
+        HEAT TRANSFER:
+          Heat Transfer Coefficient = hJump
+          Option = Heat Transfer Coefficient
+          Outside Temperature = TwallJumpShroud
+        END
+        MASS AND MOMENTUM:
+          Option = No Slip Wall
+          WALL VELOCITY:
+            Option = Counter Rotating Wall
+          END
+        END
+        WALL ROUGHNESS:
+          Option = Rough Wall
+          Sand Grain Roughness Height = 5 [micron]
+        END
+      END
+    END
+    BOUNDARY: R1 to R1 Periodic 1 Side 1
+      Boundary Type = INTERFACE
+      Location = INBlock PER1
+      BOUNDARY CONDITIONS:
+        HEAT TRANSFER:
+          Option = Conservative Interface Flux
+        END
+        MASS AND MOMENTUM:
+          Option = Conservative Interface Flux
+        END
+        TURBULENCE:
+          Option = Conservative Interface Flux
+        END
+      END
+    END
+    BOUNDARY: R1 to R1 Periodic 1 Side 2
+      Boundary Type = INTERFACE
+      Location = INBlock PER2
+      BOUNDARY CONDITIONS:
+        HEAT TRANSFER:
+          Option = Conservative Interface Flux
+        END
+        MASS AND MOMENTUM:
+          Option = Conservative Interface Flux
+        END
+        TURBULENCE:
+          Option = Conservative Interface Flux
+        END
+      END
+    END
+    BOUNDARY: R1 to R1 Periodic 2 Side 1
+      Boundary Type = INTERFACE
+      Location = OUTBlock PER1
+      BOUNDARY CONDITIONS:
+        HEAT TRANSFER:
+          Option = Conservative Interface Flux
+        END
+        MASS AND MOMENTUM:
+          Option = Conservative Interface Flux
+        END
+        TURBULENCE:
+          Option = Conservative Interface Flux
+        END
+      END
+    END
+    BOUNDARY: R1 to R1 Periodic 2 Side 2
+      Boundary Type = INTERFACE
+      Location = OUTBlock PER2
+      BOUNDARY CONDITIONS:
+        HEAT TRANSFER:
+          Option = Conservative Interface Flux
+        END
+        MASS AND MOMENTUM:
+          Option = Conservative Interface Flux
+        END
+        TURBULENCE:
+          Option = Conservative Interface Flux
+        END
+      END
+    END
+    BOUNDARY: R1 to R1 Periodic 3 Side 1
+      Boundary Type = INTERFACE
+      Location = Passage PER1
+      BOUNDARY CONDITIONS:
+        HEAT TRANSFER:
+          Option = Conservative Interface Flux
+        END
+        MASS AND MOMENTUM:
+          Option = Conservative Interface Flux
+        END
+        TURBULENCE:
+          Option = Conservative Interface Flux
+        END
+      END
+    END
+    BOUNDARY: R1 to R1 Periodic 3 Side 2
+      Boundary Type = INTERFACE
+      Location = Passage PER2
+      BOUNDARY CONDITIONS:
+        HEAT TRANSFER:
+          Option = Conservative Interface Flux
+        END
+        MASS AND MOMENTUM:
+          Option = Conservative Interface Flux
+        END
+        TURBULENCE:
+          Option = Conservative Interface Flux
+        END
+      END
+    END
+    BOUNDARY: R1 to R1 internal Side 1
+      Boundary Type = INTERFACE
+      Location = SHROUD TIP GGI SIDE 1
+      BOUNDARY CONDITIONS:
+        HEAT TRANSFER:
+          Option = Conservative Interface Flux
+        END
+        MASS AND MOMENTUM:
+          Option = Conservative Interface Flux
+        END
+        TURBULENCE:
+          Option = Conservative Interface Flux
+        END
+      END
+    END
+    BOUNDARY: R1 to R1 internal Side 2
+      Boundary Type = INTERFACE
+      Location = SHROUD TIP GGI SIDE 2
+      BOUNDARY CONDITIONS:
+        HEAT TRANSFER:
+          Option = Conservative Interface Flux
+        END
+        MASS AND MOMENTUM:
+          Option = Conservative Interface Flux
+        END
+        TURBULENCE:
+          Option = Conservative Interface Flux
+        END
+      END
+    END
+    BOUNDARY: bladetip
+      Boundary Type = WALL
+      Frame Type = Rotating
+      Location = BLD SHROUD TIP
+      Use Profile Data = False
+      BOUNDARY CONDITIONS:
+        HEAT TRANSFER:
+          Heat Transfer Coefficient = hJump
+          Option = Heat Transfer Coefficient
+          Outside Temperature = TwallJump
+        END
+        MASS AND MOMENTUM:
+          Option = Specified Shear
+          SHEAR STRESS:
+            Option = Cartesian Components
+            xValue = TipShearX
+            yValue = TipShearY
+            zValue = TipShearZ
+          END
+        END
+        WALL ROUGHNESS:
+          Option = Smooth Wall
+        END
+      END
+    END
+    BOUNDARY: shroudtip
+      Boundary Type = WALL
+      Frame Type = Rotating
+      Location = Shroud_TipBand
+      Use Profile Data = False
+      BOUNDARY CONDITIONS:
+        HEAT TRANSFER:
+          Heat Transfer Coefficient = hJump
+          Option = Heat Transfer Coefficient
+          Outside Temperature = TwallJumpShroud
+        END
+        MASS AND MOMENTUM:
+          Option = Specified Shear
+          SHEAR STRESS:
+            Option = Cartesian Components
+            xValue = ShroudShearX
+            yValue = ShroudShearY
+            zValue = ShroudShearZ
+          END
+        END
+        WALL ROUGHNESS:
+          Option = Smooth Wall
+        END
+      END
+    END
+    DOMAIN MODELS:
+      BUOYANCY MODEL:
+        Option = Non Buoyant
+      END
+      DOMAIN MOTION:
+        Alternate Rotation Model = true
+        Angular Velocity = 10500 [rev min^-1]
+        Option = Rotating
+        AXIS DEFINITION:
+          Option = Coordinate Axis
+          Rotation Axis = Coord 0.3
+        END
+      END
+      MESH DEFORMATION:
+        Option = None
+      END
+      REFERENCE PRESSURE:
+        Reference Pressure = 0 [Pa]
+      END
+    END
+    FLUID DEFINITION: HE3
+      Material = HE3
+      Option = Material Library
+      MORPHOLOGY:
+        Option = Continuous Fluid
+      END
+    END
+    FLUID MODELS:
+      COMBUSTION MODEL:
+        Option = None
+      END
+      HEAT TRANSFER MODEL:
+        Include Viscous Work Term = True
+        Option = Total Energy
+      END
+      THERMAL RADIATION MODEL:
+        Option = None
+      END
+      TURBULENCE MODEL:
+        Option = SST
+      END
+      TURBULENT WALL FUNCTIONS:
+        High Speed Model = On
+        Option = Automatic
+      END
+    END
+  END
+  DOMAIN INTERFACE: R1 to R1 Periodic 1
+    Boundary List1 = R1 to R1 Periodic 1 Side 1
+    Boundary List2 = R1 to R1 Periodic 1 Side 2
+    Interface Type = Fluid Fluid
+    INTERFACE MODELS:
+      Option = Rotational Periodicity
+      AXIS DEFINITION:
+        Option = Coordinate Axis
+        Rotation Axis = Coord 0.3
+      END
+    END
+    MESH CONNECTION:
+      Option = Automatic
+    END
+  END
+  DOMAIN INTERFACE: R1 to R1 Periodic 2
+    Boundary List1 = R1 to R1 Periodic 2 Side 1
+    Boundary List2 = R1 to R1 Periodic 2 Side 2
+    Interface Type = Fluid Fluid
+    INTERFACE MODELS:
+      Option = Rotational Periodicity
+      AXIS DEFINITION:
+        Option = Coordinate Axis
+        Rotation Axis = Coord 0.3
+      END
+    END
+    MESH CONNECTION:
+      Option = Automatic
+    END
+  END
+  DOMAIN INTERFACE: R1 to R1 Periodic 3
+    Boundary List1 = R1 to R1 Periodic 3 Side 1
+    Boundary List2 = R1 to R1 Periodic 3 Side 2
+    Interface Type = Fluid Fluid
+    INTERFACE MODELS:
+      Option = Rotational Periodicity
+      AXIS DEFINITION:
+        Option = Coordinate Axis
+        Rotation Axis = Coord 0.3
+      END
+    END
+    MESH CONNECTION:
+      Option = Automatic
+    END
+  END
+  DOMAIN INTERFACE: R1 to R1 internal
+    Boundary List1 = R1 to R1 internal Side 1
+    Boundary List2 = R1 to R1 internal Side 2
+    Interface Type = Fluid Fluid
+    INTERFACE MODELS:
+      Option = General Connection
+      FRAME CHANGE:
+        Option = None
+      END
+      MASS AND MOMENTUM:
+        Option = Conservative Interface Flux
+        MOMENTUM INTERFACE MODEL:
+          Option = None
+        END
+      END
+      PITCH CHANGE:
+        Option = None
+      END
+    END
+    MESH CONNECTION:
+      Option = Automatic
+    END
+  END
+  OUTPUT CONTROL:
+    MONITOR OBJECTS:
+      EFFICIENCY OUTPUT:
+        Inflow Boundary = R1 Inlet
+        Option = Output To Solver Monitor
+        Outflow Boundary = R1 Outlet
+      END
+      MONITOR BALANCES:
+        Option = Full
+      END
+      MONITOR FORCES:
+        Option = Full
+      END
+      MONITOR PARTICLES:
+        Option = Full
+      END
+      MONITOR RESIDUALS:
+        Option = Full
+      END
+      MONITOR TOTALS:
+        Option = Full
+      END
+    END
+    RESULTS:
+      File Compression Level = Default
+      Option = Standard
+    END
+  END
+  SOLVER CONTROL:
+    Turbulence Numerics = High Resolution
+    ADVECTION SCHEME:
+      Option = High Resolution
+    END
+    CONVERGENCE CONTROL:
+      Local Timescale Factor = 5
+      Maximum Number of Iterations = 2000
+      Minimum Number of Iterations = 1
+      Timescale Control = Local Timescale Factor
+    END
+    CONVERGENCE CRITERIA:
+      Conservation Target = 0.001
+      Residual Target = 1e-07
+      Residual Type = RMS
+    END
+    DYNAMIC MODEL CONTROL:
+      Global Dynamic Model Control = On
+    END
+    INTERRUPT CONTROL:
+      Option = Any Interrupt
+      CONVERGENCE CONDITIONS:
+        Option = Default Conditions
+      END
+    END
+  END
+END
+COMMAND FILE:
+  Version = 25.1
+END
+SIMULATION CONTROL:
+  EXECUTION CONTROL:
+    EXECUTABLE SELECTION:
+      Double Precision = On
+      Large Problem = No
+    END
+    INTERPOLATOR STEP CONTROL:
+      Runtime Priority = Standard
+    END
+    PARTITIONER STEP CONTROL:
+      Multidomain Option = Automatic
+      Option = Spatial Partitioning
+      Runtime Priority = Standard
+      PARTITION SMOOTHING:
+        Maximum Partition Smoothing Sweeps = 100
+        Option = Smooth
+      END
+      PARTITIONING TYPE:
+        MeTiS Type = k-way
+        Multipass Partitioning Option = None
+        Option = MeTiS
+        Partition Size Rule = Automatic
+      END
+      SPATIAL PARTITIONING:
+        Option = Automatic
+      END
+    END
+    RUN DEFINITION:
+      Run Mode = Full
+      Solver Input File = D:/Kn/sliptip_las_temre.def
+    END
+    SOLVER STEP CONTROL:
+      Runtime Priority = Standard
+      PARALLEL ENVIRONMENT:
+        Maximum Number of Processes = 8
+        Parallel Host List = DESKTOP-C7IET3Q
+        Start Method = Intel MPI Local Parallel
+      END
+    END
+  END
+END
