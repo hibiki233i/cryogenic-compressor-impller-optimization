@@ -92,6 +92,36 @@ class ImpellerAppTests(unittest.TestCase):
             self.assertEqual(len(rebuilt), 1)
             self.assertIn("MassFlow", rebuilt.columns)
 
+    @mock.patch("impeller_app.runner.external.run_cfx_pipeline")
+    def test_recover_runs_reprocesses_res_without_result_txt(self, mock_run_cfx_pipeline):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = self.make_config(root)
+            run_dir = root / "Runs" / "Run_000"
+            run_dir.mkdir(parents=True)
+            (run_dir / "Impeller_001.res").write_text("placeholder", encoding="utf-8")
+            mock_run_cfx_pipeline.return_value = (
+                True,
+                {
+                    "Efficiency": 0.72,
+                    "PressureRatio": 1.93,
+                    "Power": 120.0,
+                    "MassFlow": 4.1,
+                    "totalpressureratio": 2.03,
+                },
+                "Success",
+            )
+
+            result = RunnerAPI(config).recover_runs()
+
+            self.assertEqual(result.status, "succeeded")
+            self.assertEqual(result.metrics["reposted_runs"], 1)
+            self.assertEqual(result.metrics["partial_runs"], 0)
+            rebuilt = pd.read_csv(root / "Compressor_Training_Data.csv")
+            self.assertEqual(len(rebuilt), 1)
+            self.assertEqual(rebuilt.loc[0, "Efficiency"], 0.72)
+            mock_run_cfx_pipeline.assert_called_once()
+
     def test_build_geometry_command_rounds_nbl(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

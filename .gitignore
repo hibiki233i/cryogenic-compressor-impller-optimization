@@ -18,3 +18,5 @@ patent_materials/
 *.md
 *.docx
 *.pdf
+*.json
+*.xml
