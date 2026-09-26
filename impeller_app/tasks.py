@@ -9,11 +9,12 @@ def start_doe(config: AppConfig, progress_callback=None):
     return RunnerAPI(config).run_doe_batch(progress_callback=progress_callback)
 
 
-def start_active_learning(config: AppConfig, progress_callback=None):
+def start_active_learning(config: AppConfig, progress_callback=None, cancel_event=None):
     service = ActiveLearningService(config)
     return service.run_active_learning_iteration(
         additional_iters=config.runtime.active_learning_additional_iters,
         progress_callback=progress_callback,
+        cancel_event=cancel_event,
     )
 
 

@@ -20,6 +20,7 @@ from ..models import TaskResult, TaskUpdate
 from cfx_runner import is_current_cfx_result, run_cfx_pipeline
 from design_variables import (
     ensure_training_csv,
+    geometry_variable_names,
     load_variable_specs,
     lower_bounds,
     require_current_performance_data,
@@ -28,9 +29,16 @@ from design_variables import (
     variable_names,
     write_performance_data_metadata,
 )
+from geometry_constraints import (
+    GeometryConstraintConfig,
+    explicit_geometry_safe_mask,
+)
 from failure_records import (
+    GEOMETRY_FAILURE_STAGES,
+    OPERATING_FAILURE_STAGES,
     classify_cfx_failure_stage,
     classify_geometry_failure_stage,
+    load_run_outcome,
     load_structured_failure_status,
     record_run_outcome,
 )
@@ -65,8 +73,27 @@ class RunnerAPI:
         self.config = config.resolved()
         self.variable_specs = load_variable_specs(self.config.workspace.design_variables_json)
         self.variable_names = variable_names(self.variable_specs)
+        self.geometry_names = geometry_variable_names(self.variable_specs)
         self.l_bounds = lower_bounds(self.variable_specs)
         self.u_bounds = upper_bounds(self.variable_specs)
+        self.geometry_indices = np.array(
+            [self.variable_names.index(name) for name in self.geometry_names],
+            dtype=int,
+        )
+        self.fixed_doe_p_out = float(
+            self.config.runtime.optimization_outlet_static_pressure_pa
+        )
+        self.geometry_constraint_config = GeometryConstraintConfig(
+            min_d2_d1s_gap=float(self.config.runtime.default_min_d2_d1s_gap),
+            max_le_sweep_diff=float(self.config.runtime.default_max_le_sweep_diff),
+            max_exit_angle_diff=float(self.config.runtime.default_max_exit_angle_diff),
+            min_rake_te_s_by_nbl={
+                9: float(self.config.runtime.default_min_rake_te_s_nbl_9),
+                10: float(self.config.runtime.default_min_rake_te_s_nbl_10),
+                11: float(self.config.runtime.default_min_rake_te_s_nbl_11),
+                12: float(self.config.runtime.default_min_rake_te_s_nbl_12),
+            },
+        )
         self.min_discard_flow_g_s = float(self.config.runtime.default_discard_flow_g_s)
         self.boundary_flow_g_s = float(self.config.runtime.default_boundary_flow_g_s)
 
@@ -77,8 +104,8 @@ class RunnerAPI:
         status: str,
         failure_stage: str = "",
         reason: str = "",
-    ) -> None:
-        record_run_outcome(
+    ) -> dict:
+        return record_run_outcome(
             self.config.workspace.failure_records_csv,
             self.variable_names,
             sample,
@@ -188,9 +215,41 @@ class RunnerAPI:
         )
 
     def generate_lhs_samples(self, count: int, seed: int = 42) -> list[dict]:
-        sampler = qmc.LatinHypercube(d=len(self.variable_names), seed=seed)
-        sample_real = qmc.scale(sampler.random(n=count), self.l_bounds, self.u_bounds)
-        return [dict(zip(self.variable_names, row)) for row in sample_real]
+        accepted: list[dict] = []
+        rng = np.random.default_rng(seed)
+        geom_lower = self.l_bounds[self.geometry_indices]
+        geom_upper = self.u_bounds[self.geometry_indices]
+        while len(accepted) < count:
+            batch_size = max(32, count - len(accepted))
+            sampler = qmc.LatinHypercube(
+                d=len(self.geometry_names),
+                seed=int(rng.integers(0, 2**32 - 1)),
+            )
+            values = qmc.scale(
+                sampler.random(n=batch_size), geom_lower, geom_upper
+            )
+            for row in values:
+                sample = dict(zip(self.geometry_names, row))
+                sample["P_out"] = self.fixed_doe_p_out
+                if self._geometry_safe(sample):
+                    accepted.append(sample)
+                    if len(accepted) >= count:
+                        break
+        return accepted
+
+    def _geometry_safe(self, sample: dict) -> bool:
+        row = np.array(
+            [[float(sample[name]) for name in self.variable_names]], dtype=float
+        )
+        return bool(
+            explicit_geometry_safe_mask(
+                row,
+                self.variable_names,
+                self.l_bounds,
+                self.u_bounds,
+                config=self.geometry_constraint_config,
+            )[0]
+        )
 
     def _columns(self) -> list[str]:
         return training_csv_columns(self.variable_specs)
@@ -198,7 +257,10 @@ class RunnerAPI:
     def _load_extra_samples(self) -> list[dict]:
         path = self.config.workspace.extra_samples_json
         if path.exists():
-            return json.loads(path.read_text(encoding="utf-8"))
+            extras = json.loads(path.read_text(encoding="utf-8"))
+            for sample in extras:
+                sample["P_out"] = self.fixed_doe_p_out
+            return extras
         return []
 
     def _save_extra_samples(self, payload: list[dict]) -> None:
@@ -214,9 +276,9 @@ class RunnerAPI:
         return str(backup)
 
     def _new_extra_sample(self) -> dict:
-        norm = qmc.LatinHypercube(d=len(self.variable_names)).random(1)
-        sample_real = qmc.scale(norm, self.l_bounds, self.u_bounds)[0]
-        sample = dict(zip(self.variable_names, sample_real))
+        sample = self.generate_lhs_samples(
+            1, seed=int(np.random.default_rng().integers(0, 2**32 - 1))
+        )[0]
         extras = self._load_extra_samples()
         extras.append(sample)
         self._save_extra_samples(extras)
@@ -284,8 +346,22 @@ class RunnerAPI:
                 sample = self._sample_for_index(idx, base_samples, extra_samples)
             if sample is None:
                 continue
+            previous_outcome = load_run_outcome(
+                self.config.workspace.failure_records_csv,
+                source="doe",
+                run_id=run_dir.name,
+            )
+            terminal_failure_stages = (
+                GEOMETRY_FAILURE_STAGES | OPERATING_FAILURE_STAGES
+            )
+            is_terminal_failure = (
+                previous_outcome is not None
+                and previous_outcome["status"] == "failed"
+                and bool(previous_outcome["confirmed"])
+                and previous_outcome["failure_stage"] in terminal_failure_stages
+            )
             result_txt = run_dir / "CFX_Results.txt"
-            if is_current_cfx_result(result_txt):
+            if is_current_cfx_result(result_txt, self.config.runtime.cfx_residual_threshold):
                 try:
                     row = self._read_result_file(result_txt, sample)
                     if row is not None:
@@ -304,11 +380,19 @@ class RunnerAPI:
                 except Exception:
                     partial_runs += 1
                     retry_indices.append(idx)
+            elif is_terminal_failure or (previous_outcome is not None and previous_outcome.get("failure_stage") == "residual_unconverged"):
+                # Numerical discard is terminal for scheduling, never a physical negative label.
+                partial_runs += 1
+                _emit(
+                    progress_callback,
+                    f"{run_dir.name}: skipping confirmed terminal failure "
+                    f"({previous_outcome['failure_stage']}); a new DOE point will be used.",
+                )
             elif list(run_dir.glob("*.res")):
                 _emit(
                     progress_callback,
                     f"{run_dir.name}: result is missing or uses the legacy total-pressure definition; "
-                    "running CFX-Post recovery...",
+                    "checking final RMS and resuming from RES if needed before CFX-Post...",
                 )
                 cfx_result = self.run_cfx_case(
                     run_dir,
@@ -338,7 +422,8 @@ class RunnerAPI:
                 else:
                     partial_runs += 1
                     repost_failed_runs += 1
-                    retry_indices.append(idx)
+                    if classify_cfx_failure_stage(cfx_result.message) != "residual_unconverged":
+                        retry_indices.append(idx)
                     self._record_doe_outcome(
                         sample,
                         run_dir.name,
@@ -415,6 +500,9 @@ class RunnerAPI:
             cfx_bin_dir=str(self.config.solver.cfx_bin_dir),
             template_cfx=str(self.config.solver.template_cfx),
             template_cse=str(self.config.solver.template_cse),
+            residual_threshold=self.config.runtime.cfx_residual_threshold,
+            max_extra_iterations=self.config.runtime.cfx_max_extra_iterations,
+            restart_chunk=self.config.runtime.cfx_restart_chunk,
             cancel_event=cancel_event,
         )
         status = "succeeded" if success else ("canceled" if message == "canceled" else "failed")
@@ -505,14 +593,22 @@ class RunnerAPI:
         )
 
     def run_doe_sample(self, index: int, sample: dict, progress_callback=None, cancel_event=None, force: bool = False) -> TaskResult:
+        sample = dict(sample)
+        sample["P_out"] = self.fixed_doe_p_out
         run_id = f"Run_{index:03d}"
         working_dir = self.config.workspace.doe_runs_dir / run_id
         working_dir.mkdir(parents=True, exist_ok=True)
+        if not self._geometry_safe(sample):
+            return TaskResult(
+                status="failed",
+                message=f"{run_id}: rejected by shared geometry constraints before execution.",
+                artifacts={"working_dir": str(working_dir)},
+            )
         self._write_run_sample(working_dir, sample)
         if _is_cancelled(cancel_event):
             return TaskResult(status="canceled", message=f"{run_id}: canceled before start.", artifacts={"working_dir": str(working_dir)})
         result_txt = working_dir / "CFX_Results.txt"
-        if not force and is_current_cfx_result(result_txt):
+        if not force and is_current_cfx_result(result_txt, self.config.runtime.cfx_residual_threshold):
             row = self._read_result_file(result_txt, sample)
             if row is None:
                 self._record_doe_outcome(
@@ -558,12 +654,19 @@ class RunnerAPI:
         cfx_result = self.run_cfx_case(working_dir, run_id, float(sample["P_out"]), int(round(float(sample["nBl"]))), cancel_event=cancel_event)
         if cfx_result.status != "succeeded":
             if cfx_result.status == "failed":
-                self._record_doe_outcome(
+                failure_stage = classify_cfx_failure_stage(cfx_result.message)
+                failure_record = self._record_doe_outcome(
                     sample,
                     run_id,
                     "failed",
-                    classify_cfx_failure_stage(cfx_result.message),
+                    failure_stage,
                     cfx_result.message,
+                )
+                cfx_result.metrics.update(
+                    {
+                        "failure_stage": failure_stage,
+                        "failure_confirmed": bool(failure_record["confirmed"]),
+                    }
                 )
             return cfx_result
         row = self._result_row_from_cfx_metrics(sample, cfx_result.metrics)
@@ -596,6 +699,15 @@ class RunnerAPI:
             force=force,
         )
         if result.status != "failed" or "diverged" in result.message.lower():
+            return result
+        if result.metrics.get("failure_stage") == "residual_unconverged" or "residual_unconverged" in result.message:
+            return result
+        if bool(result.metrics.get("failure_confirmed")):
+            _emit(
+                progress_callback,
+                f"Run_{index:03d}: confirmed terminal failure "
+                f"({result.metrics.get('failure_stage', 'unknown')}); skipping retry.",
+            )
             return result
         _emit(
             progress_callback,

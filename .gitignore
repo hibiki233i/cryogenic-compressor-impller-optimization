@@ -20,6 +20,12 @@ patent_materials/
 *.pdf
 *.json
 *.xml
+*.log
+*.pth
 
 pareto_cft_cases/
 *.csv
+tests/
+_diagnostics/
+
+ansys_work/

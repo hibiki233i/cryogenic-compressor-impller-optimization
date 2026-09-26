@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import json
 import os
+import joblib
+from cfx_convergence import digest
+from .artifacts import validate_model_bundle
 from pathlib import Path
 
 from design_variables import is_current_performance_data, write_performance_data_metadata
@@ -41,6 +44,11 @@ class ParetoService:
         write_performance_data_metadata(cfg.workspace.pareto_engineering_csv)
         self.pareto.save_pareto_plot(front, str(cfg.workspace.pareto_plot_png))
         report = {
+            "source_csv": str(source_csv),
+            "source_sha256": digest(source_csv),
+            "front_sha256": digest(cfg.workspace.pareto_front_csv),
+            "engineering_sha256": digest(cfg.workspace.pareto_engineering_csv),
+            "runtime": cfg.to_dict()["runtime"],
             "front_size": int(len(front)),
             "recommended_front_index": int(ranked.iloc[0]["front_index"]),
             "recommended_engineering_rank": int(ranked.iloc[0]["engineering_rank"]),
@@ -74,8 +82,12 @@ class ParetoService:
             ranked = self.pareto.pd.read_csv(cfg.workspace.pareto_engineering_csv)
             payload = self.pareto.exact_front_selection(ranked, int(selection["front_index"]))
         elif selection.get("target_eff") is not None and selection.get("target_pr") is not None:
+            validate_model_bundle(cfg.workspace.best_regressor_pth, cfg.workspace.scaler_x_pkl,
+                                  cfg.workspace.scaler_y_pkl, df, self.pareto.VAR_NAMES,
+                                  self.pareto.SURROGATE_OUTPUT_NAMES)
             model = self.pareto.load_surrogate_model(str(cfg.workspace.best_regressor_pth))
-            scaler_x, scaler_y = self.pareto.make_scalers(df)
+            scaler_x = joblib.load(cfg.workspace.scaler_x_pkl)
+            scaler_y = joblib.load(cfg.workspace.scaler_y_pkl)
             payload = self.pareto.inverse_design_search(
                 model=model,
                 scaler_x=scaler_x,
@@ -107,6 +119,15 @@ class ParetoService:
         progress_callback=None,
     ) -> TaskResult:
         cfg = self.config
+        source_csv = (cfg.workspace.pool_checkpoint_csv if is_current_performance_data(cfg.workspace.pool_checkpoint_csv)
+                      else cfg.workspace.training_csv)
+        if not cfg.workspace.pareto_engineering_json.exists():
+            return TaskResult(status="failed", message="Pareto provenance missing. Recompute the front before export.")
+        provenance = json.loads(cfg.workspace.pareto_engineering_json.read_text(encoding="utf-8"))
+        files = [(source_csv,"source_sha256"),(cfg.workspace.pareto_front_csv,"front_sha256"),
+                 (cfg.workspace.pareto_engineering_csv,"engineering_sha256")]
+        if any(not path.exists() or digest(path) != provenance.get(key) for path,key in files) or provenance.get("runtime") != cfg.to_dict()["runtime"]:
+            return TaskResult(status="failed", message="Pareto results are stale. Recompute the front before export.")
         resolved_base_cft = base_cft or str(cfg.solver.base_cft)
         resolved_batch_template = cft_batch_template or str(cfg.solver.cft_batch_template)
         engineering_df = self.exporter.load_csv(str(cfg.workspace.pareto_engineering_csv))

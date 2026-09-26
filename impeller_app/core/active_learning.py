@@ -8,12 +8,15 @@ from pathlib import Path
 
 import joblib
 import numpy as np
-from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import MinMaxScaler
 
 from ..config import AppConfig
 from ..legacy import active_learning_module
 from ..models import TaskResult, TaskUpdate
+
+
+class _NeverCancelledError(Exception):
+    pass
 
 
 def _emit(progress_callback, status: str, message: str, progress=None, metrics=None, artifacts=None):
@@ -100,7 +103,8 @@ class ActiveLearningService:
         try:
             _emit(progress_callback, "running", "Loading training data...")
             legacy = self.legacy
-            df = legacy.load_and_clean_data(str(self.config.workspace.training_csv))
+            df = (legacy._load_nsga2_training_dataframe(True) if self.config.workspace.pool_checkpoint_csv.exists()
+                  else legacy.load_and_clean_data(str(self.config.workspace.training_csv)))
             x_pool, x_test, y_pool, y_test, w_pool, w_test = legacy.split_with_fixed_testset(
                 df,
                 test_csv=str(self.config.workspace.project_root / "fixed_test_set.csv"),
@@ -108,23 +112,22 @@ class ActiveLearningService:
             x_pool = legacy.snap_discrete_vars(x_pool)
             x_test = legacy.snap_discrete_vars(x_test)
 
-            scaler_x = MinMaxScaler()
+            scaler_x = legacy.make_categorical_nbl_scaler(
+                legacy.VAR_NAMES, legacy.L_BOUNDS, legacy.U_BOUNDS
+            )
             scaler_y = MinMaxScaler()
-            x_pool_norm = scaler_x.fit_transform(x_pool)
             y_pool_surr = y_pool[:, legacy.SURROGATE_OUTPUT_IDX]
-            y_pool_norm = scaler_y.fit_transform(y_pool_surr)
             y_test_surr = y_test[:, legacy.SURROGATE_OUTPUT_IDX]
 
-            stratify_labels = w_pool if len(set(w_pool)) > 1 else None
-            train_idx, val_idx = train_test_split(
-                np.arange(len(x_pool)),
-                test_size=0.2,
-                random_state=42,
-                stratify=stratify_labels,
+            train_idx, val_idx, _ = legacy.split_training_validation_indices(
+                x_pool, w_pool,
             )
+            scaler_x.fit(x_pool[train_idx])
+            scaler_y.fit(y_pool_surr[train_idx])
+            x_pool_norm = scaler_x.transform(x_pool)
+            y_pool_norm = scaler_y.transform(y_pool_surr)
             x_tr, x_val = x_pool_norm[train_idx], x_pool_norm[val_idx]
             y_tr, y_val = y_pool_norm[train_idx], y_pool_norm[val_idx]
-            w_tr, w_val = w_pool[train_idx], w_pool[val_idx]
             nbl_idx = legacy.VAR_NAMES.index("nBl")
             train_weights, weight_diagnostics = legacy.compute_density_nbl_sample_weights(
                 x_tr,
@@ -138,16 +141,26 @@ class ActiveLearningService:
             model, history = legacy.train_regressor(
                 x_tr,
                 y_tr,
-                w_tr,
+                (y_pool_surr[train_idx, 2] < legacy.BOUNDARY_FLOW_G_S).astype(float),
                 x_val,
                 y_val,
-                w_val,
+                (y_pool_surr[val_idx, 2] < legacy.BOUNDARY_FLOW_G_S).astype(float),
                 save_path=str(self.config.workspace.best_regressor_pth),
                 sample_weights_train=train_weights,
                 random_seed=1000,
             )
             joblib.dump(scaler_x, self.config.workspace.scaler_x_pkl)
             joblib.dump(scaler_y, self.config.workspace.scaler_y_pkl)
+            import pandas as pd
+            from .artifacts import write_model_manifest, stage_info
+            frame = pd.DataFrame(x_pool, columns=legacy.VAR_NAMES)
+            for j, name in enumerate(legacy.SURROGATE_OUTPUT_NAMES):
+                frame[name] = y_pool_surr[:, j]
+            write_model_manifest(self.config.workspace.best_regressor_pth,
+                self.config.workspace.scaler_x_pkl, self.config.workspace.scaler_y_pkl,
+                frame, legacy.VAR_NAMES, legacy.SURROGATE_OUTPUT_NAMES,
+                stage_info(self.config.workspace.checkpoint_meta_json)["stage_id"])
+
 
             y_pred = legacy.deterministic_predict(model, scaler_x.transform(x_test), scaler_y)
             fixed_metrics = legacy.regression_metrics(
@@ -216,21 +229,70 @@ class ActiveLearningService:
                 },
             )
 
-    def run_active_learning_iteration(self, additional_iters: int = 1, progress_callback=None) -> TaskResult:
+    def run_active_learning_iteration(
+        self,
+        additional_iters: int = 1,
+        progress_callback=None,
+        cancel_event=None,
+    ) -> TaskResult:
+        if cancel_event is not None and cancel_event.is_set():
+            return TaskResult(
+                status="canceled",
+                message="Active learning canceled before start.",
+            )
+        legacy = self.legacy
+        cancellation_error = getattr(
+            legacy, "ActiveLearningCancelled", _NeverCancelledError
+        )
         try:
-            checkpoint = int(self.legacy.get_resume_iter())
+            checkpoint = int(legacy.get_resume_iter())
             target = checkpoint + max(1, int(additional_iters))
             _emit(progress_callback, "running", f"Starting active learning until iteration {target}...")
             emitter = _LineEmitter(progress_callback)
             with contextlib.redirect_stdout(emitter), contextlib.redirect_stderr(emitter):
-                self.legacy.main_multiobjective_active_learning(max_al_iters=target)
+                run_summary = legacy.main_multiobjective_active_learning(
+                    max_al_iters=target,
+                    cancel_event=cancel_event,
+                )
             hv_csv = self.config.workspace.hv_history_csv
-            metrics = {"completed_iters": target}
+            completed_iters = int(legacy.get_resume_iter())
+            stopped_early = False
+            stop_reason = ""
+            if isinstance(run_summary, dict):
+                completed_iters = int(
+                    run_summary.get("completed_iters", completed_iters)
+                )
+                stopped_early = bool(run_summary.get("stopped_early", False))
+                stop_reason = str(run_summary.get("stop_reason", ""))
+            metrics = {
+                "completed_iters": completed_iters,
+                "target_iters": target,
+                "stopped_early": stopped_early,
+            }
+            if isinstance(run_summary, dict):
+                for key in (
+                    "rolling_true_hv_gain",
+                    "hv_stagnation_triggered",
+                    "hv_stagnation_window",
+                    "min_true_hv_gain",
+                    "hv_stagnation_action",
+                    "model_reliability",
+                    "local_online_max_nrmse",
+                    "local_online_max_abs_bias_norm",
+                    "local_flow_brier",
+                    "local_flow_ece",
+                ):
+                    if key in run_summary:
+                        metrics[key] = run_summary[key]
             if hv_csv.exists():
                 metrics["hv_history_csv"] = str(hv_csv)
             return TaskResult(
                 status="succeeded",
-                message=f"Active learning completed through iteration {target}.",
+                message=(
+                    f"主动学习已在第 {completed_iters} 轮暂停审查：{stop_reason}"
+                    if stopped_early
+                    else f"主动学习已完成至第 {completed_iters} 轮。"
+                ),
                 metrics=metrics,
                 artifacts={
                     "hv_history": str(hv_csv),
@@ -241,6 +303,16 @@ class ActiveLearningService:
                     "fixed_test_predictions": str(self.config.workspace.fixed_test_predictions_csv),
                     "query_validation": str(self.config.workspace.al_query_validation_csv),
                     "failure_records": str(self.config.workspace.failure_records_csv),
+                },
+            )
+        except cancellation_error as exc:
+            _emit(progress_callback, "canceled", str(exc))
+            return TaskResult(
+                status="canceled",
+                message=str(exc),
+                artifacts={
+                    "pool_checkpoint": str(self.config.workspace.pool_checkpoint_csv),
+                    "query_validation": str(self.config.workspace.al_query_validation_csv),
                 },
             )
         except ValueError as exc:
@@ -256,7 +328,7 @@ class ActiveLearningService:
 
     def run_nsga2_only(self, progress_callback=None, use_pool_checkpoint: bool = False) -> TaskResult:
         try:
-            _emit(progress_callback, "running", "Starting NSGA-II from current DOE/LHS training data...")
+            _emit(progress_callback, "running", ("Starting NSGA-II from DOE + AL..." if use_pool_checkpoint else "Starting DOE-only NSGA-II baseline (AL samples excluded)..."))
             emitter = _LineEmitter(progress_callback)
             with contextlib.redirect_stdout(emitter), contextlib.redirect_stderr(emitter):
                 summary = self.legacy.run_nsga2_only_from_lhs(
@@ -280,9 +352,9 @@ class ActiveLearningService:
                 artifacts={
                     "surrogate_pareto_csv": str(self.config.workspace.nsga2_surrogate_pareto_csv),
                     "summary_json": str(self.config.workspace.nsga2_surrogate_summary_json),
-                    "model": str(self.config.workspace.best_regressor_pth),
-                    "scaler_x": str(self.config.workspace.scaler_x_pkl),
-                    "scaler_y": str(self.config.workspace.scaler_y_pkl),
+                    "model": str(summary.get("model", self.config.workspace.best_regressor_pth)),
+                    "scaler_x": str(summary.get("scaler_x", self.config.workspace.scaler_x_pkl)),
+                    "scaler_y": str(summary.get("scaler_y", self.config.workspace.scaler_y_pkl)),
                 },
             )
         except ValueError as exc:

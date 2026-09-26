@@ -11,12 +11,17 @@ from cfx_runner import is_current_cfx_result, run_cfx_pipeline
 import glob
 from design_variables import (
     ensure_training_csv,
+    geometry_variable_names,
     load_variable_specs,
     lower_bounds,
     training_csv_columns,
     upper_bounds,
     variable_names,
     write_performance_data_metadata,
+)
+from geometry_constraints import (
+    GeometryConstraintConfig,
+    explicit_geometry_safe_mask,
 )
 from failure_records import (
     classify_cfx_failure_stage,
@@ -60,7 +65,6 @@ CREATE_NO_WINDOW = 0x08000000 if os.name == 'nt' else 0
 # 1. 定义设计空间与样本阈值
 # =============================================================================
 num_samples = 300
-input_dim = 14
 MIN_VALID = _env_float("IMPELLER_MIN_VALID_FLOW_G_S", 0.1)
 MIN_DISCARD = _env_float("IMPELLER_MIN_DISCARD_FLOW_G_S", 0.0001)
 MIN_NORMAL = _env_float("IMPELLER_BOUNDARY_FLOW_G_S", 3.6)
@@ -69,14 +73,58 @@ MIN_NORMAL = _env_float("IMPELLER_BOUNDARY_FLOW_G_S", 3.6)
 # 加载设计变量名称及上下界
 variable_specs = load_variable_specs()
 var_names = variable_names(variable_specs)
+geometry_names = geometry_variable_names(variable_specs)
 L_BOUNDS = lower_bounds(variable_specs)
 U_BOUNDS = upper_bounds(variable_specs)
+GEOMETRY_IDX = np.array([var_names.index(name) for name in geometry_names], dtype=int)
+DOE_P_OUT = _env_float(
+    "IMPELLER_DOE_P_OUT",
+    os.environ.get("IMPELLER_OPTIMIZATION_P_OUT", 12.0),
+)
+GEOMETRY_CONFIG = GeometryConstraintConfig(
+    min_d2_d1s_gap=_env_float("IMPELLER_MIN_D2_D1S_GAP", 0.070),
+    max_le_sweep_diff=_env_float("IMPELLER_MAX_LE_SWEEP_DIFF", 52.0),
+    max_exit_angle_diff=_env_float("IMPELLER_MAX_EXIT_ANGLE_DIFF", 13.5),
+)
 
-# 初始化 LHS 采样器并生成样本
-sampler = qmc.LatinHypercube(d=input_dim, seed=42)
-sample_norm = sampler.random(n=num_samples)
-sample_real = qmc.scale(sample_norm, L_BOUNDS, U_BOUNDS)
-samples = [dict(zip(var_names, row)) for row in sample_real]
+
+def _geometry_safe(sample: dict) -> bool:
+    row = np.array([[float(sample[name]) for name in var_names]], dtype=float)
+    return bool(
+        explicit_geometry_safe_mask(
+            row,
+            var_names,
+            L_BOUNDS,
+            U_BOUNDS,
+            config=GEOMETRY_CONFIG,
+        )[0]
+    )
+
+
+def _draw_feasible_samples(count: int, seed=None) -> list[dict]:
+    """Sample geometry only, apply the shared hard rules, then pin P_out."""
+    accepted: list[dict] = []
+    rng = np.random.default_rng(seed)
+    geometry_lower = L_BOUNDS[GEOMETRY_IDX]
+    geometry_upper = U_BOUNDS[GEOMETRY_IDX]
+    while len(accepted) < count:
+        batch_size = max(32, count - len(accepted))
+        batch_seed = int(rng.integers(0, 2**32 - 1))
+        sampler = qmc.LatinHypercube(d=len(geometry_names), seed=batch_seed)
+        geometry_real = qmc.scale(
+            sampler.random(n=batch_size), geometry_lower, geometry_upper
+        )
+        for geometry_row in geometry_real:
+            sample = dict(zip(geometry_names, geometry_row))
+            sample["P_out"] = float(DOE_P_OUT)
+            if _geometry_safe(sample):
+                accepted.append(sample)
+                if len(accepted) >= count:
+                    break
+    return accepted
+
+# DOE 只在 13 个几何变量上采样；P_out 是固定工况上下文。
+samples = _draw_feasible_samples(num_samples, seed=42)
 # =====================================================================
 # 2. Python 循环驱动 PowerShell
 # =====================================================================
@@ -95,9 +143,7 @@ def get_new_sample():
     生成一个新的随机补充样本，并追加保存到 extra_samples.json，
     保证断点续跑时不丢失已生成的补充点序列。
     """
-    norm  = qmc.LatinHypercube(d=input_dim).random(1)   # 无 seed，每次随机
-    real  = qmc.scale(norm, L_BOUNDS, U_BOUNDS)
-    new_p = dict(zip(var_names, real[0]))
+    new_p = _draw_feasible_samples(1)[0]
 
     extras = []
     if os.path.exists(EXTRA_SAMPLES_FILE):
@@ -113,7 +159,10 @@ def load_extra_samples():
     """读取上次已保存的动态补充点列表。"""
     if os.path.exists(EXTRA_SAMPLES_FILE):
         with open(EXTRA_SAMPLES_FILE, 'r') as f:
-            return json.load(f)
+            extras = json.load(f)
+        for sample in extras:
+            sample["P_out"] = float(DOE_P_OUT)
+        return extras
     return []
 # =====================================================================
 # 4. 断点恢复：扫描 Runs 目录，重建进度
@@ -314,9 +363,9 @@ def run_single_sample(i, p):
     # ------------------------------------------------------------------
     # 5-B  硬失败预检：参数畸形 → 直接返回，不重试，不占用成功名额
     # ------------------------------------------------------------------
-    d1s_d2_ratio = p['d1s'] / p['d2']
-    if d1s_d2_ratio < 0.50 or d1s_d2_ratio > 0.85:
-        return False, run_id, f"[硬失败] d1s/d2={d1s_d2_ratio:.3f} 超出[0.50,0.85]，跳过", 1
+    p['P_out'] = float(DOE_P_OUT)
+    if not _geometry_safe(p):
+        return False, run_id, "[硬失败] 违反主动学习共享几何约束，跳过", 1
     os.makedirs(current_work_dir, exist_ok=True)
     with open(os.path.join(current_work_dir, "input_parameters.json"), "w", encoding="utf-8") as f:
         json.dump({name: float(p[name]) for name in var_names}, f, ensure_ascii=False, indent=2)

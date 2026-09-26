@@ -93,6 +93,9 @@ class WorkspacePaths:
 @dataclass
 class RuntimeSettings:
     cfx_cores: int = 8
+    cfx_residual_threshold: float = 1e-4
+    cfx_max_extra_iterations: int = 1500
+    cfx_restart_chunk: int = 500
     rpm: float = 10000.0
     mass_flow: float = 0.0036
     alpha0: float = 0.0
@@ -149,6 +152,13 @@ class AppConfig:
         ws = cfg.workspace
         runtime = cfg.runtime
         return {
+            "CFX_RESIDUAL_THRESHOLD": float(runtime.cfx_residual_threshold),
+            "CFX_MAX_EXTRA_ITERATIONS": int(runtime.cfx_max_extra_iterations),
+            "CFX_RESTART_CHUNK": int(runtime.cfx_restart_chunk),
+            "CFX_CORES": int(runtime.cfx_cores),
+            "CFX_BIN_DIR": str(cfg.solver.cfx_bin_dir),
+            "CFX_TEMPLATE": str(cfg.solver.template_cfx),
+            "CFX_POST_TEMPLATE": str(cfg.solver.template_cse),
             "PS_SCRIPT_PATH": str(cfg.solver.geometry_script_path),
             "TURBOGRID_TEMPLATE": str(cfg.solver.turbogrid_template),
             "AL_WORKING_BASE": str(ws.active_learning_runs_dir),
@@ -161,6 +171,7 @@ class AppConfig:
             "HV_PLOT_PATH": str(ws.hv_plot_png),
             "SURROGATE_METRICS_CSV": str(ws.surrogate_metrics_csv),
             "CV_FOLD_METRICS_CSV": str(ws.cv_fold_metrics_csv),
+            "TEST_SET_CSV": str(ws.project_root / "fixed_test_set.csv"),
             "FIXED_TEST_PREDICTIONS_CSV": str(ws.fixed_test_predictions_csv),
             "AL_QUERY_VALIDATION_CSV": str(ws.al_query_validation_csv),
             "FAILED_POINTS_PATH": str(ws.failed_points_npy),

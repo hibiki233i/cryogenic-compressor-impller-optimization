@@ -1,8 +1,10 @@
 import os
+from pathlib import Path
 import json
 import argparse
 import subprocess
 import warnings
+import psutil
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -17,7 +19,6 @@ from sklearn.metrics import (
     mean_absolute_error,
     mean_squared_error,
     r2_score,
-    roc_auc_score,
 )
 from sklearn.ensemble import RandomForestClassifier
 import torch
@@ -28,6 +29,8 @@ from pymoo.algorithms.moo.nsga2 import NSGA2
 from pymoo.optimize import minimize
 from pymoo.indicators.hv import HV
 from cfx_runner import run_cfx_pipeline
+from impeller_app.core.artifacts import data_digest, stage_info, write_model_manifest
+from cfx_convergence import digest, atomic_json
 warnings.filterwarnings("ignore", category=UserWarning)
 import joblib
 from pymoo.util.nds.non_dominated_sorting import NonDominatedSorting
@@ -49,8 +52,70 @@ from failure_records import (
     load_failure_training_sets,
     record_run_outcome,
 )
+from geometry_constraints import (
+    GeometryConstraintConfig,
+    geometry_rule_violations as shared_geometry_rule_violations,
+    overlap_proxy_violation as shared_overlap_proxy_violation,
+)
+from surrogate_features import make_categorical_nbl_scaler
 
 CREATE_NO_WINDOW = 0x08000000 if os.name == 'nt' else 0
+
+
+class ActiveLearningCancelled(RuntimeError):
+    """Raised when the GUI requests cooperative active-learning cancellation."""
+
+
+def _is_cancelled(cancel_event=None) -> bool:
+    return bool(cancel_event is not None and cancel_event.is_set())
+
+
+def _raise_if_cancelled(cancel_event=None) -> None:
+    if _is_cancelled(cancel_event):
+        raise ActiveLearningCancelled("Active learning canceled by user.")
+
+
+def _kill_process_tree(pid: int) -> None:
+    try:
+        root = psutil.Process(pid)
+        targets = root.children(recursive=True) + [root]
+    except psutil.NoSuchProcess:
+        return
+    for process in targets:
+        try:
+            process.kill()
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+
+
+def _run_cancellable_capture(cmd, cwd, cancel_event=None):
+    """Run geometry tooling while allowing the GUI to kill its process tree."""
+    _raise_if_cancelled(cancel_event)
+    process = subprocess.Popen(
+        cmd,
+        cwd=cwd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        creationflags=CREATE_NO_WINDOW,
+    )
+    while True:
+        try:
+            stdout, stderr = process.communicate(timeout=0.5)
+            return subprocess.CompletedProcess(
+                cmd, int(process.returncode or 0), stdout, stderr
+            )
+        except subprocess.TimeoutExpired:
+            if _is_cancelled(cancel_event):
+                _kill_process_tree(process.pid)
+                try:
+                    process.communicate(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.communicate()
+                raise ActiveLearningCancelled(
+                    "Active learning canceled during geometry generation."
+                )
 
 
 def _env_or_default(name: str, default):
@@ -176,18 +241,29 @@ TEST_SPLIT_PATH = _env_or_default("IMPELLER_TEST_SPLIT_PATH", "fixed_test_set.np
 TEST_SET_CSV = _env_or_default("IMPELLER_TEST_SET_CSV", "fixed_test_set.csv")
 POOL_CHECKPOINT_CSV = _env_or_default("IMPELLER_POOL_CHECKPOINT_CSV", "al_training_pool_checkpoint.csv")
 CHECKPOINT_META_PATH = _env_or_default("IMPELLER_CHECKPOINT_META_PATH", "al_checkpoint_meta.json")
+CFX_RESIDUAL_THRESHOLD = 1e-4
+CFX_MAX_EXTRA_ITERATIONS = 1500
+CFX_RESTART_CHUNK = 500
+CFX_CORES = 8
+CFX_BIN_DIR = None
+CFX_TEMPLATE = None
+CFX_POST_TEMPLATE = None
 GEOMETRY_SUMMARY_PATH = _env_or_default("IMPELLER_GEOMETRY_SUMMARY_PATH", "geometry_summary.json")
 ENABLE_INTERACTIVE_PLOT = _env_or_default("IMPELLER_ENABLE_PLOT", "0").lower() in {"1", "true", "yes"}
 
 HV_HISTORY_COLUMNS = [
-    "iter", "hv_policy_version", "n_samples", "train_samples_before_cfd",
-    "true_hv", "surrogate_hv",
+    "iter", "stage_id", "seed", "model_sha256", "pool_digest", "hv_policy_version", "n_samples", "attempted_queries", "accepted_al_queries", "train_samples_before_cfd",
+    "true_hv", "surrogate_hv", "rolling_true_hv_gain",
+    "hv_stagnation_triggered", "hv_stagnation_action",
     "mse_eff", "mse_pr", "mse_mf", "rmse_eff", "rmse_pr", "rmse_mf",
     "mae_eff", "mae_pr", "mae_mf", "r2_eff", "r2_pr", "r2_mf",
     "cv_rmse_eff_mean", "cv_rmse_pr_mean", "cv_rmse_mf_mean",
     "cv_r2_eff_mean", "cv_r2_pr_mean", "cv_r2_mf_mean",
+    "local_online_samples", "local_online_max_nrmse",
+    "local_online_max_abs_bias_norm", "local_flow_brier",
+    "local_flow_ece", "local_reliability",
 ]
-HV_POLICY_VERSION = 2  # v2: verified CFD front is not vetoed by soft overlap proxy
+HV_POLICY_VERSION = 3  # v3: stage-local verified HV with initial baseline and provenance
 
 
 def read_optional_csv(path: str, columns: list[str] | None = None) -> pd.DataFrame:
@@ -237,7 +313,21 @@ MAX_AL_ITERS    = 80
 MC_SAMPLES      = 30
 N_CANDIDATES    = 5000
 
-BOUNDARY_WEIGHT = 2.0
+INFEASIBLE_PERFORMANCE_WEIGHT = float(
+    _env_or_default("IMPELLER_INFEASIBLE_PERFORMANCE_WEIGHT", 0.25)
+)
+MIN_MEANINGFUL_EHVI = float(
+    _env_or_default("IMPELLER_MIN_MEANINGFUL_EHVI", 1.0e-5)
+)
+GLOBAL_ACCURACY_MODE = _env_or_default(
+    "IMPELLER_GLOBAL_ACCURACY_MODE", "1"
+).lower() in {"1", "true", "yes"}
+HV_STAGNATION_ACTION = _env_or_default(
+    "IMPELLER_HV_STAGNATION_ACTION", "stop"
+).strip().lower()
+MIN_TRUE_HV_GAIN = float(
+    _env_or_default("IMPELLER_MIN_TRUE_HV_GAIN", 1.0e-4)
+)
 DEVICE = "cpu"
 
 
@@ -256,6 +346,50 @@ class ALConfig:
     geom_safe_prob_threshold_pick: float = 0.45
 
     train_distance_soft_limit: float = 0.16
+    min_meaningful_ehvi: float = MIN_MEANINGFUL_EHVI
+    surrogate_front_sample_ratio: float = 0.20
+
+    # EHVI reliability is evaluated online in the actual Pareto/trust-region
+    # neighbourhood.  The normalization scales are fixed engineering scales,
+    # so NRMSE does not explode merely because a local target range is narrow.
+    local_reliability_window_iters: int = 5
+    local_reliability_radius_norm: float = 0.25
+    local_reliability_min_samples: int = 8
+    local_nrmse_scales: tuple[float, float, float] = (0.05, 0.50, 1.00)
+    reliable_max_nrmse: float = 0.50
+    usable_max_nrmse: float = 0.90
+    reliable_max_abs_bias_norm: float = 0.20
+    usable_max_abs_bias_norm: float = 0.45
+    reliable_flow_brier: float = 0.15
+    usable_flow_brier: float = 0.30
+    reliable_flow_ece: float = 0.20
+    usable_flow_ece: float = 0.35
+
+    # Global-accuracy mode reserves one CFD slot for a sparse global point.
+    # Set IMPELLER_GLOBAL_ACCURACY_MODE=0 for a Pareto-only campaign.
+    reserve_global_coverage_point: bool = GLOBAL_ACCURACY_MODE
+    coverage_preferred_nbl: tuple[int, ...] = (10, 11, 12)
+    coverage_safe_flow_probability_min: float = 0.80
+    coverage_safe_flow_lcb_g_s: float = 3.55
+    coverage_boundary_flow_probability_min: float = 0.30
+    coverage_boundary_flow_probability_max: float = 0.80
+    coverage_solver_safe_probability_min: float = 0.55
+    coverage_geometry_safe_probability_min: float = 0.55
+    coverage_flow_target_scale_g_s: float = 0.35
+    # Three deterministic boundary-learning rounds per ten rounds; all other
+    # rounds choose a safer sparse point near the 3.6 g/s constraint.
+    coverage_boundary_cycle: int = 10
+    coverage_boundary_cycle_slots: tuple[int, ...] = (2, 5, 8)
+    boundary_local_sample_ratio: float = 0.15
+    boundary_seed_band_g_s: float = 0.20
+    boundary_local_sigma: float = 0.025
+    coverage_boundary_max_train_distance_norm: float = 0.25
+
+    # A gain below the threshold across the latest window triggers either a
+    # hard stop or an auditable review mode.  Review mode caps EHVI at one.
+    hv_stagnation_window: int = 3
+    min_true_hv_gain: float = MIN_TRUE_HV_GAIN
+    hv_stagnation_action: str = HV_STAGNATION_ACTION
 
     pop_size: int = 120
     n_gen: int = 120
@@ -320,14 +454,9 @@ def configure_runtime(**overrides):
             dtype=int,
         )
 
-    p_out_lower = float(globals_dict["L_BOUNDS"][globals_dict["P_OUT_IDX"]])
-    p_out_upper = float(globals_dict["U_BOUNDS"][globals_dict["P_OUT_IDX"]])
-    fixed_p_out = float(globals_dict["OPTIMIZATION_P_OUT"])
-    if not p_out_lower <= fixed_p_out <= p_out_upper:
-        raise ValueError(
-            f"OPTIMIZATION_P_OUT={fixed_p_out} Pa must be within "
-            f"the surrogate training bounds [{p_out_lower}, {p_out_upper}] Pa."
-        )
+    # P_out is a single runtime operating condition.  Its historical metadata
+    # bounds are retained for compatibility but do not constrain the fixed GUI
+    # value; data-support checks use OPERATING_POINT_PRESSURE_TOLERANCE instead.
 
 
 def parse_runtime_args():
@@ -358,9 +487,11 @@ def parse_runtime_args():
     )
     parser.add_argument(
         "--nsga2-use-pool-checkpoint",
-        action="store_true",
-        help="Use al_training_pool_checkpoint.csv as the NSGA-II training source when it exists. Defaults to pure TRAINING_CSV/LHS data.",
+        action="store_true", default=False,
+        help="Explicitly use DOE + AL instead of the default DOE-only baseline.",
     )
+    parser.add_argument("--nsga2-doe-only", action="store_false", dest="nsga2_use_pool_checkpoint",
+                        help="Explicit DOE-only baseline experiment; excludes AL samples.")
     return parser.parse_args()
 
 
@@ -463,7 +594,14 @@ def save_checkpoint(
     if completed_iters is None:
         completed_iters = al_iter + 1
 
+    prior_meta = {}
+    if os.path.exists(checkpoint_meta_path):
+        with open(checkpoint_meta_path, encoding="utf-8") as stream:
+            prior_meta = json.load(stream)
     meta = {
+        **prior_meta,
+        "stage_id": stage_info(checkpoint_meta_path)["stage_id"],
+        "pool_digest": data_digest(df_pool, VAR_NAMES, SURROGATE_OUTPUT_NAMES),
         "completed_iters": int(completed_iters),
         "in_progress_iter": None if in_progress_iter is None else int(in_progress_iter),
         "pool_samples": int(len(X_pool)),
@@ -482,8 +620,10 @@ def save_checkpoint(
         "performance_data_schema_version": PERFORMANCE_DATA_SCHEMA_VERSION,
         "total_pressure_definition": TOTAL_PRESSURE_DEFINITION,
     }
-    with open(checkpoint_meta_path, "w", encoding="utf-8") as f:
-        json.dump(meta, f, ensure_ascii=False, indent=2)
+    atomic_json(checkpoint_meta_path, meta)
+    if in_progress_iter is None and meta.get("stage_id") != "legacy":
+        from impeller_app.core.al_stages import export_true_hv_curve
+        export_true_hv_curve(hv_csv_path, os.path.dirname(os.path.abspath(hv_csv_path)))
 # =============================================================================
 # 基础工具
 # =============================================================================
@@ -684,6 +824,43 @@ def compute_density_nbl_sample_weights(
     return weights, diagnostics
 
 
+def categorical_stratification_labels(
+    X_raw: np.ndarray,
+    boundary_labels: np.ndarray,
+    min_class_count: int = 2,
+) -> tuple[np.ndarray | None, str]:
+    """Prefer nBl-aware strata and gracefully fall back when classes are sparse."""
+    X_raw = snap_discrete_vars(X_raw)
+    nbl = np.rint(X_raw[:, VAR_NAMES.index("nBl")]).astype(int)
+    boundary = np.asarray(boundary_labels, dtype=int)
+    candidates = [
+        (np.array([f"{blade}:{flag}" for blade, flag in zip(nbl, boundary)]), "nBl_boundary"),
+        (nbl.astype(str), "nBl"),
+        (boundary.astype(str), "boundary"),
+    ]
+    for labels, name in candidates:
+        _, counts = np.unique(labels, return_counts=True)
+        if len(counts) > 1 and int(counts.min()) >= int(min_class_count):
+            return labels, name
+    return None, "unstratified"
+
+
+def split_training_validation_indices(X_raw, boundary_labels, random_state=42):
+    """Choose a feasible stratified holdout, including for small outer folds."""
+    n_samples = len(X_raw)
+    if n_samples < 3:
+        raise ValueError("At least three samples are required for training and early stopping.")
+    labels, method = categorical_stratification_labels(X_raw, boundary_labels, 2)
+    n_validation = max(1, int(np.ceil(0.2 * n_samples)))
+    if labels is not None and len(np.unique(labels)) > min(n_validation, n_samples - n_validation):
+        labels, method = None, "unstratified"
+    train_idx, val_idx = train_test_split(
+        np.arange(n_samples), test_size=n_validation, random_state=random_state,
+        stratify=labels,
+    )
+    return train_idx, val_idx, method
+
+
 def infer_boundary_from_outputs(y: np.ndarray) -> float:
     eff, pr, power, mf = y
     return float(
@@ -700,23 +877,15 @@ def geometry_rule_violations(X: np.ndarray) -> np.ndarray:
     这些规则你需要按工程经验继续细化。
     """
     X = snap_discrete_vars(X)
-    d1s, dH, beta1hb, beta1sb, d2, b2, beta2hb, beta2sb, Lz, t, TipClear, nBl, rake_te_s, P_out = X.T
-    lower = {name: L_BOUNDS[idx] for idx, name in enumerate(VAR_NAMES)}
-    upper = {name: U_BOUNDS[idx] for idx, name in enumerate(VAR_NAMES)}
-
-    g1 = MIN_D2_D1S_GAP - (d2 - d1s)
-    g2 = lower["b2"] - b2
-    g3 = t - upper["t"]
-    g4 = lower["TipClear"] - TipClear
-    g5 = TipClear - upper["TipClear"]
-    g6 = (beta1hb - beta1sb) - MAX_LE_SWEEP_DIFF
-    g7 = np.abs(beta2hb - beta2sb) - MAX_EXIT_ANGLE_DIFF
-    g8 = lower["Lz"] - Lz
-    g9 = Lz - upper["Lz"]
-    g10 = rake_te_s - upper["rake_te_s"]
-    g11 = lower["rake_te_s"] - rake_te_s
-
-    return np.column_stack([g1, g2, g3, g4, g5, g6, g7, g8, g9, g10, g11])
+    config = GeometryConstraintConfig(
+        min_d2_d1s_gap=MIN_D2_D1S_GAP,
+        max_le_sweep_diff=MAX_LE_SWEEP_DIFF,
+        max_exit_angle_diff=MAX_EXIT_ANGLE_DIFF,
+        min_rake_te_s_by_nbl=MIN_RAKE_TE_S_BY_NBL,
+    )
+    return shared_geometry_rule_violations(
+        X, VAR_NAMES, L_BOUNDS, U_BOUNDS, config=config
+    )
 
 
 def overlap_proxy_violation(X: np.ndarray) -> np.ndarray:
@@ -725,14 +894,13 @@ def overlap_proxy_violation(X: np.ndarray) -> np.ndarray:
     目前只作为软惩罚使用，不直接判为硬不可行。
     """
     X = snap_discrete_vars(X)
-    nbl_idx = VAR_NAMES.index("nBl")
-    nBl = np.clip(np.round(X[:, nbl_idx]), L_BOUNDS[nbl_idx], U_BOUNDS[nbl_idx]).astype(int)
-    rake_te_s = X[:, 12]
-    min_rake_for_overlap = np.array(
-        [min_rake_te_s_for_nbl(int(n_bl)) for n_bl in nBl],
-        dtype=float
+    config = GeometryConstraintConfig(
+        min_d2_d1s_gap=MIN_D2_D1S_GAP,
+        max_le_sweep_diff=MAX_LE_SWEEP_DIFF,
+        max_exit_angle_diff=MAX_EXIT_ANGLE_DIFF,
+        min_rake_te_s_by_nbl=MIN_RAKE_TE_S_BY_NBL,
     )
-    return np.maximum(0.0, min_rake_for_overlap - rake_te_s)
+    return shared_overlap_proxy_violation(X, VAR_NAMES, config=config)
 
 
 def geometry_safe_mask(
@@ -820,7 +988,7 @@ def split_with_fixed_testset(df: pd.DataFrame, test_csv=None, test_size=0.15):
 
         # 用设计变量做匹配键
         def make_key(dataframe):
-            return dataframe[VAR_NAMES].round(10).astype(str).agg('|'.join, axis=1)
+            return pd.Series([tuple(row) for row in np.round(dataframe[VAR_NAMES].to_numpy(float), 10)], index=dataframe.index)
 
         all_keys = make_key(df)
         test_keys = set(make_key(test_df))
@@ -836,7 +1004,11 @@ def split_with_fixed_testset(df: pd.DataFrame, test_csv=None, test_size=0.15):
             raise ValueError("固定测试集未能在当前 TRAINING_CSV 中匹配到任何样本，请检查 fixed_test_set.csv 是否与当前数据一致。")
 
     else:
-        stratify_labels = df['is_boundary'] if len(np.unique(df['is_boundary'])) > 1 else None
+        stratify_labels, _ = categorical_stratification_labels(
+            df[VAR_NAMES].to_numpy(dtype=float),
+            df["is_boundary"].to_numpy(dtype=float),
+            min_class_count=2,
+        )
         df_train, df_test = train_test_split(
             df,
             test_size=test_size,
@@ -930,35 +1102,100 @@ def _batch_hvi_2d(
 
 def _generate_candidates_mixed(
     current_pareto_X: np.ndarray,
-    cfg: ALConfig
-) -> np.ndarray:
+    cfg: ALConfig,
+    surrogate_pareto_X: np.ndarray | None = None,
+    use_surrogate_front: bool = False,
+    return_sources: bool = False,
+    observed_boundary_X: np.ndarray | None = None,
+) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
     """
-    混合候选点生成：
-    (1-ratio) 全局 LHS + ratio 在当前 Pareto 前沿设计变量附近高斯扰动。
+    混合候选点生成：全局 LHS、真实 CFD 前沿邻域，以及（模型可靠时）
+    surrogate NSGA-II 前沿邻域。来源标签供自适应配额选择局部探索点。
     """
-    n_local  = int(cfg.n_candidates * cfg.local_sample_ratio)
-    n_global = cfg.n_candidates - n_local
+    has_true_front = current_pareto_X is not None and len(current_pareto_X) > 0
+    has_surrogate_front = (
+        use_surrogate_front
+        and surrogate_pareto_X is not None
+        and len(surrogate_pareto_X) > 0
+    )
+    n_true_local = int(cfg.n_candidates * cfg.local_sample_ratio) if has_true_front else 0
+    n_surrogate_local = (
+        int(cfg.n_candidates * cfg.surrogate_front_sample_ratio)
+        if has_surrogate_front
+        else 0
+    )
+    if n_true_local + n_surrogate_local > cfg.n_candidates:
+        scale = cfg.n_candidates / float(n_true_local + n_surrogate_local)
+        n_true_local = int(n_true_local * scale)
+        n_surrogate_local = int(n_surrogate_local * scale)
+    n_boundary_local = (
+        min(
+            int(cfg.n_candidates * cfg.boundary_local_sample_ratio),
+            cfg.n_candidates - n_true_local - n_surrogate_local,
+        )
+        if observed_boundary_X is not None and len(observed_boundary_X) > 0
+        else 0
+    )
+    n_global = cfg.n_candidates - n_true_local - n_surrogate_local - n_boundary_local
 
-    sampler = qmc.LatinHypercube(d=len(VAR_NAMES), seed=None)
+    sampler = qmc.LatinHypercube(d=len(VAR_NAMES), seed=int(np.random.randint(0, 2**31 - 1)))
     X_global = snap_discrete_vars(
         qmc.scale(sampler.random(n_global), L_BOUNDS, U_BOUNDS)
     )
     X_global = pin_optimization_operating_point(X_global)
 
-    if current_pareto_X is not None and len(current_pareto_X) > 0:
-        sigma = (U_BOUNDS - L_BOUNDS) * 0.06   # 各维度范围的 6%
-        idx = np.random.choice(len(current_pareto_X), n_local, replace=True)
-        X_local = current_pareto_X[idx] + np.random.randn(n_local, len(VAR_NAMES)) * sigma
-        X_local = np.clip(X_local, L_BOUNDS, U_BOUNDS)
-        X_local = pin_optimization_operating_point(X_local)
-    else:
-        sampler2 = qmc.LatinHypercube(d=len(VAR_NAMES), seed=None)
-        X_local = snap_discrete_vars(
-            qmc.scale(sampler2.random(n_local), L_BOUNDS, U_BOUNDS)
-        )
-        X_local = pin_optimization_operating_point(X_local)
+    pieces = [X_global]
+    sources = [np.full(n_global, "global", dtype=object)]
 
-    return np.vstack([X_global, X_local])
+    def perturb(front: np.ndarray, count: int) -> np.ndarray:
+        sigma = (U_BOUNDS - L_BOUNDS) * 0.06   # 各维度范围的 6%
+        idx = np.random.choice(len(front), count, replace=True)
+        X_local = front[idx] + np.random.randn(count, len(VAR_NAMES)) * sigma
+        X_local = np.clip(X_local, L_BOUNDS, U_BOUNDS)
+        return pin_optimization_operating_point(X_local)
+
+    if n_true_local > 0:
+        pieces.append(perturb(np.asarray(current_pareto_X), n_true_local))
+        sources.append(np.full(n_true_local, "true_front_local", dtype=object))
+    if n_surrogate_local > 0:
+        pieces.append(perturb(np.asarray(surrogate_pareto_X), n_surrogate_local))
+        sources.append(
+            np.full(n_surrogate_local, "surrogate_front_local", dtype=object)
+        )
+    if n_boundary_local > 0:
+        anchors = np.asarray(observed_boundary_X, dtype=float)
+        base = anchors[np.random.choice(len(anchors), n_boundary_local, replace=True)]
+        noise = np.random.randn(*base.shape) * (U_BOUNDS - L_BOUNDS) * cfg.boundary_local_sigma
+        # Neighbourhood evidence belongs to the same categorical blade count.
+        noise[:, VAR_NAMES.index("nBl")] = 0.0
+        noise[:, VAR_NAMES.index("P_out")] = 0.0
+        pieces.append(pin_optimization_operating_point(np.clip(base + noise, L_BOUNDS, U_BOUNDS)))
+        sources.append(np.full(n_boundary_local, "observed_boundary_local", dtype=object))
+
+    candidates = np.vstack(pieces)
+    candidate_sources = np.concatenate(sources)
+    if return_sources:
+        return candidates, candidate_sources
+    return candidates
+
+
+def observed_flow_boundary_points(X_pool_raw, Y_pool_raw, cfg: ALConfig) -> np.ndarray:
+    """Successful CFD anchors near the flow constraint at this operating point."""
+    if Y_pool_raw is None or len(X_pool_raw) == 0:
+        return np.empty((0, len(VAR_NAMES)))
+    X = np.asarray(X_pool_raw, dtype=float)
+    Y = np.asarray(Y_pool_raw, dtype=float)
+    if Y.shape != (len(X), len(ALL_OUTPUT_NAMES)):
+        raise ValueError("Y_pool_raw must contain all CFD outputs aligned with X_pool_raw.")
+    eligible = (
+        np.all(np.isfinite(X), axis=1)
+        & np.all(np.isfinite(Y), axis=1)
+        & (np.abs(Y[:, ALL_OUTPUT_NAMES.index("MassFlow")] - BOUNDARY_FLOW_G_S)
+           <= cfg.boundary_seed_band_g_s)
+        & (np.abs(X[:, VAR_NAMES.index("P_out")] - OPTIMIZATION_P_OUT)
+           <= OPERATING_POINT_P_OUT_TOLERANCE)
+    )
+    return np.unique(snap_discrete_vars(X[eligible]), axis=0)
 def compute_true_cumulative_hv(
     X_pool: np.ndarray,
     Y_pool: np.ndarray,
@@ -1021,7 +1258,8 @@ def extract_surrogate_front_and_hv(
     scaler_X,
     scaler_Y,
     ref_eff: float = TRUE_HV_REF_EFF,
-    ref_pr: float = TRUE_HV_REF_PR
+    ref_pr: float = TRUE_HV_REF_PR,
+    cancel_event=None,
 ):
     """
     辅指标：基于 NSGA-II 返回的 res.X，重新做纯 surrogate 性能预测，
@@ -1033,7 +1271,13 @@ def extract_surrogate_front_and_hv(
     X_pf = expand_geometry_decisions(np.atleast_2d(res.X))
     X_pf_norm = scaler_X.transform(X_pf)
 
-    mean_real, _ = mc_dropout_predict(reg_model, X_pf_norm, scaler_Y, n_samples=50)
+    mean_real, _ = mc_dropout_predict(
+        reg_model,
+        X_pf_norm,
+        scaler_Y,
+        n_samples=50,
+        cancel_event=cancel_event,
+    )
     Y_perf = mean_real[:, :2]   # [eff, pr]
 
     pareto_idx = NonDominatedSorting().do(-Y_perf, only_non_dominated_front=True)
@@ -1074,69 +1318,64 @@ class PerformanceSurrogate(nn.Module):
         return self.net(x)
 
 
-class BoundaryClassifierNN(nn.Module):
-    """
-    可选：边界分类网络
-    """
-    def __init__(self, input_dim=14):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, 64),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(64, 32),
-            nn.ReLU(),
-            nn.Linear(32, 1)
-        )
-
-    def forward(self, x):
-        return self.net(x).squeeze(1)
-
-
 # =============================================================================
 # 损失函数
 # =============================================================================
 def weighted_regression_loss(
     pred,
     target,
-    is_boundary,
+    flow_infeasible,
     sample_weights=None,
 ):
-    per_sample = ((pred - target) ** 2).mean(dim=1)
-    weights = 1.0 + (BOUNDARY_WEIGHT - 1.0) * is_boundary
+    squared_error = (pred - target) ** 2
+    # Efficiency and pressure-ratio heads focus on flow-feasible successful
+    # CFD points.  The mass-flow head still learns from every successful CFD
+    # result, including near-boundary cases.
+    performance_weights = (
+        1.0 - flow_infeasible * (1.0 - INFEASIBLE_PERFORMANCE_WEIGHT)
+    )
+    weights = torch.column_stack([
+        performance_weights,
+        performance_weights,
+        torch.ones_like(performance_weights),
+    ])
     if sample_weights is not None:
-        weights = weights * sample_weights
-    return (per_sample * weights).mean()
+        weights = weights * sample_weights[:, None]
+    per_output_loss = (squared_error * weights).sum(dim=0) / weights.sum(dim=0).clamp_min(1e-12)
+    return per_output_loss.mean()
 
 
 # =============================================================================
 # 训练与推断
 # =============================================================================
 def train_regressor(
-    X_train, Y_train, W_train,
-    X_val, Y_val, W_val,
-    save_path=BEST_REG_PATH,
+    X_train, Y_train, flow_infeasible_train,
+    X_val, Y_val, flow_infeasible_val,
+    save_path=None,
     sample_weights_train=None,
     max_epochs: int = 1200,
     patience: int = 40,
     random_seed: int | None = None,
+    cancel_event=None,
 ):
+    save_path = BEST_REG_PATH if save_path is None else save_path
+    _raise_if_cancelled(cancel_event)
     if random_seed is not None:
         torch.manual_seed(int(random_seed))
 
     model = PerformanceSurrogate(
-        input_dim=len(VAR_NAMES),
+        input_dim=X_train.shape[1],
         output_dim=len(SURROGATE_OUTPUT_NAMES),
     ).to(DEVICE)
     optimizer = optim.Adam(model.parameters(), lr=0.0015, weight_decay=1e-5)
 
     Xtr = torch.tensor(X_train, dtype=torch.float32, device=DEVICE)
     Ytr = torch.tensor(Y_train, dtype=torch.float32, device=DEVICE)
-    Wtr = torch.tensor(W_train, dtype=torch.float32, device=DEVICE)
+    Wtr = torch.tensor(flow_infeasible_train, dtype=torch.float32, device=DEVICE)
 
     Xva = torch.tensor(X_val, dtype=torch.float32, device=DEVICE)
     Yva = torch.tensor(Y_val, dtype=torch.float32, device=DEVICE)
-    Wva = torch.tensor(W_val, dtype=torch.float32, device=DEVICE)
+    Wva = torch.tensor(flow_infeasible_val, dtype=torch.float32, device=DEVICE)
     Str = (
         torch.tensor(sample_weights_train, dtype=torch.float32, device=DEVICE)
         if sample_weights_train is not None
@@ -1150,6 +1389,7 @@ def train_regressor(
     history = []
 
     for epoch in range(int(max_epochs)):
+        _raise_if_cancelled(cancel_event)
         model.train()
         optimizer.zero_grad()
         pred = model(Xtr)
@@ -1242,74 +1482,46 @@ def train_feasibility_classifier(X_success, X_failed, min_failed_required=4):
     return clf
 
 
-def train_boundary_classifier(X_norm, y_boundary):
-    if len(np.unique(y_boundary)) < 2:
-        return None
-
-    Xtr, Xva, ytr, yva = train_test_split(
-        X_norm, y_boundary, test_size=0.2, random_state=42, stratify=y_boundary
-    )
-
-    model = BoundaryClassifierNN(input_dim=14).to(DEVICE)
-    opt = optim.Adam(model.parameters(), lr=0.001)
-
-    Xtr_t = torch.tensor(Xtr, dtype=torch.float32, device=DEVICE)
-    ytr_t = torch.tensor(ytr, dtype=torch.float32, device=DEVICE)
-
-    Xva_t = torch.tensor(Xva, dtype=torch.float32, device=DEVICE)
-    yva_t = torch.tensor(yva, dtype=torch.float32, device=DEVICE)
-
-    bce = nn.BCEWithLogitsLoss()
-
-    best_auc = -np.inf
-    best_state = None
-    patience = 30
-    counter = 0
-
-    for epoch in range(500):
-        model.train()
-        opt.zero_grad()
-        logits = model(Xtr_t)
-        loss = bce(logits, ytr_t)
-        loss.backward()
-        opt.step()
-
-        model.eval()
-        with torch.no_grad():
-            val_logits = model(Xva_t).cpu().numpy()
-            val_prob = 1 / (1 + np.exp(-val_logits))
-            auc = roc_auc_score(yva, val_prob)
-
-        if auc > best_auc:
-            best_auc = auc
-            counter = 0
-            best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-        else:
-            counter += 1
-
-        if counter >= patience:
-            break
-
-    if best_state is not None:
-        model.load_state_dict(best_state)
-
-    return model
-
-
-def mc_dropout_predict(model, X_norm, scaler_Y, n_samples=MC_SAMPLES):
+def mc_dropout_distribution(
+    model,
+    X_norm,
+    scaler_Y,
+    n_samples=MC_SAMPLES,
+    cancel_event=None,
+):
+    """Generate one reusable MC distribution for a complete candidate set."""
     model.train()
     X_t = torch.tensor(X_norm, dtype=torch.float32, device=DEVICE)
 
     preds = []
     with torch.no_grad():
         for _ in range(n_samples):
+            _raise_if_cancelled(cancel_event)
             preds.append(model(X_t).cpu().numpy())
 
     preds = np.stack(preds, axis=0)              # (S, N, 3)
     mean_norm = preds.mean(axis=0)
     std_norm = preds.std(axis=0)
+    real = scaler_Y.inverse_transform(
+        preds.reshape(-1, preds.shape[-1])
+    ).reshape(preds.shape)
+    return real, scaler_Y.inverse_transform(mean_norm), std_norm
 
-    mean_real = scaler_Y.inverse_transform(mean_norm)
+
+def mc_dropout_predict(
+    model,
+    X_norm,
+    scaler_Y,
+    n_samples=MC_SAMPLES,
+    cancel_event=None,
+):
+    _, mean_real, std_norm = mc_dropout_distribution(
+        model,
+        X_norm,
+        scaler_Y,
+        n_samples=n_samples,
+        cancel_event=cancel_event,
+    )
     return mean_real, std_norm
 
 
@@ -1334,14 +1546,15 @@ def run_kfold_surrogate_validation(
     W_boundary: np.ndarray,
     al_iter: int,
     cfg: ALConfig,
+    cancel_event=None,
 ) -> tuple[list[dict], dict]:
-    """Leakage-safe K-fold validation with fold-local scalers and train weights."""
+    """Outer-fold evaluation with an independent inner early-stopping holdout."""
     X_raw = snap_discrete_vars(X_raw)
     Y_surr = np.asarray(Y_surr, dtype=float)
     W_boundary = np.asarray(W_boundary, dtype=float)
     n_samples = len(X_raw)
     n_splits = min(int(cfg.cv_folds), n_samples)
-    if n_splits < 2:
+    if n_splits < 2 or n_samples - int(np.ceil(n_samples / n_splits)) < 3:
         return [], {
             "cv_status": "insufficient_samples",
             "cv_folds": int(n_splits),
@@ -1349,31 +1562,39 @@ def run_kfold_surrogate_validation(
 
     nbl_idx = VAR_NAMES.index("nBl")
     nbl_values = np.rint(X_raw[:, nbl_idx]).astype(int)
-    strat_labels = np.array(
-        [f"{nbl}:{int(boundary)}" for nbl, boundary in zip(nbl_values, W_boundary)]
+    strat_labels, strata_name = categorical_stratification_labels(
+        X_raw, W_boundary, min_class_count=n_splits
     )
-    _, strat_counts = np.unique(strat_labels, return_counts=True)
-    if len(strat_counts) > 0 and int(strat_counts.min()) >= n_splits:
+    if strat_labels is not None:
         splitter = StratifiedKFold(
             n_splits=n_splits,
             shuffle=True,
             random_state=42,
         )
         split_iter = splitter.split(X_raw, strat_labels)
-        split_method = "stratified_nBl_boundary"
+        split_method = f"stratified_{strata_name}"
     else:
         splitter = KFold(n_splits=n_splits, shuffle=True, random_state=42)
         split_iter = splitter.split(X_raw)
         split_method = "kfold"
 
     fold_rows = []
-    for fold_idx, (train_idx, val_idx) in enumerate(split_iter, start=1):
-        fold_scaler_X = MinMaxScaler()
+    for fold_idx, (outer_train_idx, val_idx) in enumerate(split_iter, start=1):
+        _raise_if_cancelled(cancel_event)
+        inner_train_idx, inner_stop_idx, inner_method = split_training_validation_indices(
+            X_raw[outer_train_idx], W_boundary[outer_train_idx], random_state=42,
+        )
+        train_idx = outer_train_idx[inner_train_idx]
+        stop_idx = outer_train_idx[inner_stop_idx]
+        fold_scaler_X = make_categorical_nbl_scaler(
+            VAR_NAMES, L_BOUNDS, U_BOUNDS
+        )
         fold_scaler_Y = MinMaxScaler()
         X_train_norm = fold_scaler_X.fit_transform(X_raw[train_idx])
+        X_stop_norm = fold_scaler_X.transform(X_raw[stop_idx])
         X_val_norm = fold_scaler_X.transform(X_raw[val_idx])
         Y_train_norm = fold_scaler_Y.fit_transform(Y_surr[train_idx])
-        Y_val_norm = fold_scaler_Y.transform(Y_surr[val_idx])
+        Y_stop_norm = fold_scaler_Y.transform(Y_surr[stop_idx])
 
         train_weights, weight_diag = compute_density_nbl_sample_weights(
             X_train_norm,
@@ -1385,23 +1606,29 @@ def run_kfold_surrogate_validation(
         fold_model, fold_history = train_regressor(
             X_train_norm,
             Y_train_norm,
-            W_boundary[train_idx],
-            X_val_norm,
-            Y_val_norm,
-            W_boundary[val_idx],
+            (Y_surr[train_idx, 2] < BOUNDARY_FLOW_G_S).astype(float),
+            X_stop_norm,
+            Y_stop_norm,
+            (Y_surr[stop_idx, 2] < BOUNDARY_FLOW_G_S).astype(float),
             save_path=None,
             sample_weights_train=train_weights,
             max_epochs=cfg.cv_max_epochs,
             patience=cfg.cv_patience,
-            random_seed=10000 + int(al_iter) * 100 + fold_idx,
+            # Keep fold initialization fixed across AL rounds.  Changes in the
+            # validation curve should come from new CFD data, not a new seed.
+            random_seed=10000 + fold_idx,
+            cancel_event=cancel_event,
         )
         fold_pred = deterministic_predict(fold_model, X_val_norm, fold_scaler_Y)
         row = {
             "iter": int(al_iter),
             "fold": int(fold_idx),
             "n_train": int(len(train_idx)),
+            "n_early_stopping": int(len(stop_idx)),
             "n_validation": int(len(val_idx)),
             "split_method": split_method,
+            "early_stopping_split_method": inner_method,
+            "cv_protocol": "outer_test_inner_early_stopping_v2",
             "epochs": int(len(fold_history)),
             "recorded_at_utc": utc_timestamp(),
             **regression_metrics(Y_surr[val_idx], fold_pred),
@@ -1418,22 +1645,13 @@ def run_kfold_surrogate_validation(
         "cv_status": "completed",
         "cv_folds": int(n_splits),
         "cv_split_method": split_method,
+        "cv_protocol": "outer_test_inner_early_stopping_v2",
     }
     for column in metric_columns:
         values = np.array([row[column] for row in fold_rows], dtype=float)
         summary[f"cv_mean_{column}"] = float(np.nanmean(values))
         summary[f"cv_std_{column}"] = float(np.nanstd(values, ddof=1)) if len(values) > 1 else 0.0
     return fold_rows, summary
-
-
-def predict_boundary_prob(boundary_model, X_norm):
-    if boundary_model is None:
-        return np.zeros(len(X_norm))
-    boundary_model.eval()
-    X_t = torch.tensor(X_norm, dtype=torch.float32, device=DEVICE)
-    with torch.no_grad():
-        logits = boundary_model(X_t).cpu().numpy()
-    return 1 / (1 + np.exp(-logits))
 
 
 def _classifier_positive_probability(clf, features, positive_label=1):
@@ -1593,12 +1811,13 @@ def load_geometry_warning_dataset():
     return X, y
 
 
-def load_recorded_failure_datasets():
+def load_recorded_failure_datasets(sources=None):
     """Load confirmed DOE/AL failures using the correct feature spaces."""
     return load_failure_training_sets(
         FAILURE_RECORDS_CSV,
         VAR_NAMES,
         GEOMETRY_VAR_NAMES,
+        sources=sources,
     )
 
 
@@ -1702,7 +1921,8 @@ def predict_geometry_safe_prob(geom_warn_clf, X_raw):
 # =============================================================================
 # CFD 调用
 # =============================================================================
-def run_single_cfd(x_cand: np.ndarray, run_id: str):
+def run_single_cfd(x_cand: np.ndarray, run_id: str, cancel_event=None):
+    _raise_if_cancelled(cancel_event)
     current_work_dir = os.path.join(AL_WORKING_BASE, run_id)
     os.makedirs(current_work_dir, exist_ok=True)
 
@@ -1727,8 +1947,10 @@ def run_single_cfd(x_cand: np.ndarray, run_id: str):
 
     try:
         print(f"     [{run_id}] 正在生成几何与网格...")
-        ps_result = subprocess.run(
-            cmd, capture_output=True, text=True, creationflags=CREATE_NO_WINDOW
+        ps_result = _run_cancellable_capture(
+            cmd,
+            cwd=current_work_dir,
+            cancel_event=cancel_event,
         )
 
         geometry_summary = load_geometry_summary(current_work_dir)
@@ -1753,15 +1975,28 @@ def run_single_cfd(x_cand: np.ndarray, run_id: str):
                 ),
             }
 
+        _raise_if_cancelled(cancel_event)
         p_out_val = param_dict['P_out']
         nbl_val = int(round(param_dict['nBl']))
 
         print(f"     [{run_id}] 网格完成，启动 CFX（背压: {p_out_val:.3f} Pa）...")
         success_cfx, cfx_res, msg = run_cfx_pipeline(
-            current_work_dir, run_id, p_out=p_out_val, cores=8, n_blades=nbl_val
+            current_work_dir,
+            run_id,
+            p_out=p_out_val,
+            cores=CFX_CORES,
+            n_blades=nbl_val,
+            cfx_bin_dir=CFX_BIN_DIR, template_cfx=CFX_TEMPLATE, template_cse=CFX_POST_TEMPLATE,
+            residual_threshold=CFX_RESIDUAL_THRESHOLD, max_extra_iterations=CFX_MAX_EXTRA_ITERATIONS,
+            restart_chunk=CFX_RESTART_CHUNK,
+            cancel_event=cancel_event,
         )
 
         if not success_cfx:
+            if msg == "canceled" or _is_cancelled(cancel_event):
+                raise ActiveLearningCancelled(
+                    "Active learning canceled during CFX execution."
+                )
             print(f"     [{run_id}] CFD 失败: {msg}")
             return False, None, geometry_summary, {
                 "stage": classify_cfx_failure_stage(msg),
@@ -1791,6 +2026,8 @@ def run_single_cfd(x_cand: np.ndarray, run_id: str):
 
         return True, true_y, geometry_summary, None
 
+    except ActiveLearningCancelled:
+        raise
     except Exception as e:
         print(f"     [{run_id}] 未知异常: {e}")
         return False, None, None, {
@@ -1826,6 +2063,286 @@ def print_geometry_summary(geometry_summary: dict | None):
 # =============================================================================
 # 主动学习采集：EHVI
 # =============================================================================
+def expected_calibration_error(
+    probabilities: np.ndarray,
+    outcomes: np.ndarray,
+    n_bins: int = 5,
+) -> float:
+    """Return a bounded equal-width expected calibration error."""
+    probabilities = np.clip(np.asarray(probabilities, dtype=float), 0.0, 1.0)
+    outcomes = np.asarray(outcomes, dtype=float)
+    if len(probabilities) == 0:
+        return float("nan")
+    edges = np.linspace(0.0, 1.0, int(n_bins) + 1)
+    total = float(len(probabilities))
+    ece = 0.0
+    for bin_idx in range(int(n_bins)):
+        lower, upper = edges[bin_idx], edges[bin_idx + 1]
+        if bin_idx == int(n_bins) - 1:
+            mask = (probabilities >= lower) & (probabilities <= upper)
+        else:
+            mask = (probabilities >= lower) & (probabilities < upper)
+        if not np.any(mask):
+            continue
+        ece += (float(mask.sum()) / total) * abs(
+            float(probabilities[mask].mean()) - float(outcomes[mask].mean())
+        )
+    return float(ece)
+
+
+def compute_local_online_metrics(
+    query_csv_path: str,
+    current_pareto_X: np.ndarray | None,
+    scaler_X,
+    completed_iter: int,
+    cfg: ALConfig,
+) -> dict:
+    """Prequential reliability metrics in the current decision neighbourhood.
+
+    Only predictions written before CFD are compared with later successful CFD
+    outcomes.  Current-round candidates are therefore never used to authorize
+    their own EHVI selection.
+    """
+    base = {
+        "local_online_status": "insufficient",
+        "local_online_samples": 0,
+        "local_online_round_start": np.nan,
+        "local_online_round_end": np.nan,
+    }
+    if current_pareto_X is None or len(current_pareto_X) == 0:
+        return base
+    history = read_optional_csv(query_csv_path)
+    required = set(VAR_NAMES) | {
+        "iter", "status", "pred_eff", "pred_pr", "pred_mf",
+        "true_eff", "true_pr", "true_mf",
+        "pred_flow_feasible_probability",
+    }
+    if history.empty or not required.issubset(history.columns):
+        return base
+
+    active_stage = stage_info(CHECKPOINT_META_PATH)["stage_id"]
+    if active_stage != "legacy":
+        if "stage_id" not in history:
+            return base
+        history = history[history.stage_id.eq(active_stage)]
+    if "result_valid" in history:
+        history = history[history.result_valid.astype(str).str.lower().isin(["true", "1", "1.0"])]
+    numeric_iter = pd.to_numeric(history["iter"], errors="coerce")
+    min_iter = max(
+        1,
+        int(completed_iter) - int(cfg.local_reliability_window_iters) + 1,
+    )
+    mask = (
+        history["status"].astype(str).str.lower().eq("success")
+        & numeric_iter.between(min_iter, int(completed_iter), inclusive="both")
+    )
+    local = history.loc[mask].copy()
+    if local.empty:
+        return base
+
+    numeric_columns = (
+        VAR_NAMES
+        + [
+            "pred_eff", "pred_pr", "pred_mf",
+            "true_eff", "true_pr", "true_mf",
+            "pred_flow_feasible_probability",
+        ]
+    )
+    for column in numeric_columns:
+        local[column] = pd.to_numeric(local[column], errors="coerce")
+    local = local.dropna(subset=numeric_columns)
+    if local.empty:
+        return base
+
+    X_query = snap_discrete_vars(local[VAR_NAMES].to_numpy(dtype=float))
+    X_front = snap_discrete_vars(np.asarray(current_pareto_X, dtype=float))
+    distance = calc_distance_to_set(
+        scaler_X.transform(X_query),
+        scaler_X.transform(X_front),
+    )
+    local = local.loc[
+        distance <= float(cfg.local_reliability_radius_norm)
+    ].copy()
+    if local.empty:
+        return base
+
+    y_pred = local[["pred_eff", "pred_pr", "pred_mf"]].to_numpy(dtype=float)
+    y_true = local[["true_eff", "true_pr", "true_mf"]].to_numpy(dtype=float)
+    errors = y_pred - y_true
+    scales = np.asarray(cfg.local_nrmse_scales, dtype=float)
+    if scales.shape != (len(SURROGATE_OUTPUT_NAMES),) or np.any(scales <= 0.0):
+        raise ValueError("local_nrmse_scales must contain three positive values.")
+
+    suffixes = ("eff", "pr", "mf")
+    metrics = dict(base)
+    metrics.update({
+        "local_online_status": (
+            "ready"
+            if len(local) >= int(cfg.local_reliability_min_samples)
+            else "insufficient"
+        ),
+        "local_online_samples": int(len(local)),
+        "local_online_round_start": int(pd.to_numeric(local["iter"]).min()),
+        "local_online_round_end": int(pd.to_numeric(local["iter"]).max()),
+        "local_online_radius_norm": float(cfg.local_reliability_radius_norm),
+    })
+    nrmse_values = []
+    abs_bias_norm_values = []
+    for output_idx, suffix in enumerate(suffixes):
+        output_error = errors[:, output_idx]
+        mae = float(np.mean(np.abs(output_error)))
+        rmse = float(np.sqrt(np.mean(output_error ** 2)))
+        bias = float(np.mean(output_error))
+        nrmse = rmse / scales[output_idx]
+        bias_norm = bias / scales[output_idx]
+        metrics.update({
+            f"local_online_mae_{suffix}": mae,
+            f"local_online_rmse_{suffix}": rmse,
+            f"local_online_nrmse_{suffix}": float(nrmse),
+            f"local_online_bias_{suffix}": bias,
+            f"local_online_bias_norm_{suffix}": float(bias_norm),
+        })
+        nrmse_values.append(float(nrmse))
+        abs_bias_norm_values.append(abs(float(bias_norm)))
+
+    flow_probability = np.clip(
+        local["pred_flow_feasible_probability"].to_numpy(dtype=float),
+        0.0,
+        1.0,
+    )
+    flow_outcome = (
+        local["true_mf"].to_numpy(dtype=float) >= BOUNDARY_FLOW_G_S
+    ).astype(float)
+    metrics.update({
+        "local_online_max_nrmse": float(max(nrmse_values)),
+        "local_online_max_abs_bias_norm": float(max(abs_bias_norm_values)),
+        "local_flow_brier": float(np.mean((flow_probability - flow_outcome) ** 2)),
+        "local_flow_ece": expected_calibration_error(
+            flow_probability, flow_outcome
+        ),
+        "local_flow_probability_bias": float(
+            flow_probability.mean() - flow_outcome.mean()
+        ),
+        "local_flow_observed_feasible_rate": float(flow_outcome.mean()),
+        "local_flow_predicted_feasible_rate": float(flow_probability.mean()),
+        "local_flow_outcome_classes": int(len(np.unique(flow_outcome))),
+    })
+    return metrics
+
+
+def assess_model_reliability(
+    local_metrics: dict,
+    cfg: ALConfig,
+) -> tuple[str, int, float]:
+    """Map local prequential error and calibration evidence to EHVI capacity."""
+    if (
+        local_metrics.get("local_online_status") != "ready"
+        or int(local_metrics.get("local_online_samples", 0))
+        < int(cfg.local_reliability_min_samples)
+    ):
+        return "failed", 0, 0.0
+
+    max_nrmse = float(local_metrics.get("local_online_max_nrmse", np.inf))
+    max_bias = float(
+        local_metrics.get("local_online_max_abs_bias_norm", np.inf)
+    )
+    brier = float(local_metrics.get("local_flow_brier", np.inf))
+    ece = float(local_metrics.get("local_flow_ece", np.inf))
+    finite = np.asarray([max_nrmse, max_bias, brier, ece], dtype=float)
+    if not np.all(np.isfinite(finite)):
+        return "failed", 0, 0.0
+
+    reliable = (
+        max_nrmse <= cfg.reliable_max_nrmse
+        and max_bias <= cfg.reliable_max_abs_bias_norm
+        and brier <= cfg.reliable_flow_brier
+        and ece <= cfg.reliable_flow_ece
+    )
+    usable = (
+        max_nrmse <= cfg.usable_max_nrmse
+        and max_bias <= cfg.usable_max_abs_bias_norm
+        and brier <= cfg.usable_flow_brier
+        and ece <= cfg.usable_flow_ece
+    )
+    quality_ratio = max(
+        max_nrmse / max(cfg.usable_max_nrmse, 1e-12),
+        max_bias / max(cfg.usable_max_abs_bias_norm, 1e-12),
+        brier / max(cfg.usable_flow_brier, 1e-12),
+        ece / max(cfg.usable_flow_ece, 1e-12),
+    )
+    score = float(1.0 / (1.0 + quality_ratio))
+
+    # A single observed flow class can support a Brier check but cannot prove
+    # two-sided probability calibration, so it is capped at general.
+    has_both_flow_classes = int(
+        local_metrics.get("local_flow_outcome_classes", 0)
+    ) >= 2
+    if reliable and has_both_flow_classes:
+        return "reliable", 3, score
+    if usable or reliable:
+        # Any weak error/calibration dimension can reduce exploitation. A low
+        # NRMSE must not conceal bias close to the model-failure threshold.
+        supports_two = (
+            max_nrmse <= 0.5 * (cfg.reliable_max_nrmse + cfg.usable_max_nrmse)
+            and max_bias <= 0.5 * (cfg.reliable_max_abs_bias_norm + cfg.usable_max_abs_bias_norm)
+            and brier <= 0.5 * (cfg.reliable_flow_brier + cfg.usable_flow_brier)
+            and ece <= 0.5 * (cfg.reliable_flow_ece + cfg.usable_flow_ece)
+        )
+        return "general", (2 if supports_two else 1), score
+    return "failed", 0, score
+
+
+def assess_hv_stagnation(hv_history: list[dict], cfg: ALConfig) -> dict:
+    """Evaluate net verified-HV gain over the latest completed increments."""
+    window = max(1, int(cfg.hv_stagnation_window))
+    rows = []
+    for row in hv_history:
+        try:
+            iteration = int(row.get("iter"))
+            true_hv = float(row.get("true_hv"))
+        except (TypeError, ValueError):
+            continue
+        if np.isfinite(true_hv):
+            rows.append((iteration, true_hv))
+    rows = sorted(dict(rows).items())
+    result = {
+        "hv_stagnation_triggered": False,
+        "hv_stagnation_action": str(cfg.hv_stagnation_action),
+        "rolling_true_hv_gain": np.nan,
+        "hv_stagnation_window": window,
+    }
+    if len(rows) < window + 1:
+        return result
+    start_iter, start_hv = rows[-window - 1]
+    end_iter, end_hv = rows[-1]
+    gain = float(end_hv - start_hv)
+    result.update({
+        "rolling_true_hv_gain": gain,
+        "hv_gain_start_iter": int(start_iter),
+        "hv_gain_end_iter": int(end_iter),
+        "hv_stagnation_triggered": bool(gain < float(cfg.min_true_hv_gain)),
+    })
+    return result
+
+
+def numerical_discard_mask(X_raw):
+    """Do not re-query exhausted designs; this is scheduling, not a negative label."""
+    history = read_optional_csv(AL_QUERY_VALIDATION_CSV)
+    required = set(VAR_NAMES) | {"status", "failure_stage"}
+    if history.empty or not required.issubset(history):
+        return np.zeros(len(X_raw), dtype=bool)
+    active_stage = stage_info(CHECKPOINT_META_PATH)["stage_id"]
+    if active_stage != "legacy":
+        if "stage_id" not in history:
+            return np.zeros(len(X_raw), dtype=bool)
+        history = history[history.stage_id.eq(active_stage)]
+    key = lambda frame: {tuple(row) for row in np.round(frame[VAR_NAMES].to_numpy(float),10)}
+    rejected = history[history.status.eq("failed") & history.failure_stage.eq("residual_unconverged")]
+    successes = history[history.status.eq("success")]
+    discarded = key(rejected) - key(successes)
+    return np.array([tuple(row) in discarded for row in np.round(X_raw,10)], dtype=bool)
+
+
 def compute_ehvi_acquisition(
     reg_model,
     feas_clf,
@@ -1838,41 +2355,61 @@ def compute_ehvi_acquisition(
     current_pareto_X: np.ndarray,   # 真实 Pareto 前沿 X，用于局部采样
     ref_eff: float,
     ref_pr: float,
-    cfg: ALConfig
+    cfg: ALConfig,
+    surrogate_pareto_X: np.ndarray | None = None,
+    model_reliability: str = "general",
+    cancel_event=None,
+    Y_pool_raw: np.ndarray | None = None,
 ):
+    _raise_if_cancelled(cancel_event)
     ref = np.array([ref_eff, ref_pr])
 
     # ------------------------------------------------------------------
     # 1. 混合候选点生成
     # ------------------------------------------------------------------
-    X_cand = _generate_candidates_mixed(current_pareto_X, cfg)
+    X_cand, candidate_source = _generate_candidates_mixed(
+        current_pareto_X,
+        cfg,
+        surrogate_pareto_X=surrogate_pareto_X,
+        use_surrogate_front=(model_reliability == "reliable"),
+        return_sources=True,
+        observed_boundary_X=observed_flow_boundary_points(X_pool_raw, Y_pool_raw, cfg),
+    )
     X_norm = scaler_X.transform(X_cand)
     N = len(X_cand)
 
     # ------------------------------------------------------------------
-    # 2. 预筛选（只用 5 次 MC 快速估计，避免对无效点做完整 EHVI）
+    # 2. 整个候选池只生成一次 MC 分布。筛选、EHVI、选点和日志都复用它。
     # ------------------------------------------------------------------
     p_feas = predict_feasible_prob(feas_clf, X_cand)
     p_geom_safe = predict_geometry_safe_prob(geom_warn_clf, X_cand)
     geom_g = geometry_rule_violations(X_cand)
     invalid_geom = np.any(geom_g > 0.0, axis=1)
-
-    # 快速均值预测（5 次 MC，仅用于剪枝）
-    mean_quick, std_quick_norm = mc_dropout_predict(
-        reg_model, X_norm, scaler_Y, n_samples=5
+    numerical_discarded = numerical_discard_mask(X_cand)
+    mc_preds, pred_mean, pred_std_norm = mc_dropout_distribution(
+        reg_model,
+        X_norm,
+        scaler_Y,
+        n_samples=cfg.mc_samples,
+        cancel_event=cancel_event,
     )
-    pred_eff_q = mean_quick[:, 0]
-    pred_mf_q  = mean_quick[:, 2]
+    pred_eff = pred_mean[:, 0]
+    flow_feasible_probability = np.mean(
+        mc_preds[:, :, 2] >= BOUNDARY_FLOW_G_S,
+        axis=0,
+    )
+    flow_lower_confidence_bound = np.quantile(
+        mc_preds[:, :, 2], 0.10, axis=0
+    )
 
-    # Exploitation is deliberately conservative: it uses both learned
-    # feasibility models and the surrogate's predicted performance limits.
     exploitation_mask = (
         (p_feas >= cfg.feasible_prob_threshold_pick) &
         (p_geom_safe >= cfg.geom_safe_prob_threshold_pick) &
         (~invalid_geom) &
-        (pred_mf_q >= max(MIN_DISCARD_FLOW_G_S, BOUNDARY_FLOW_G_S - 0.05)) &
-        (pred_eff_q >= MIN_EFFICIENCY) &
-        (pred_eff_q <= 0.85)
+        (~numerical_discarded) &
+        (flow_feasible_probability > 0.0) &
+        (pred_eff >= MIN_EFFICIENCY) &
+        (pred_eff <= 0.85)
     )
 
     # Exploration must be able to challenge the learned models.  Restrict it
@@ -1881,8 +2418,9 @@ def compute_ehvi_acquisition(
     # the uncertainty/coverage slots from ever collecting corrective CFD data.
     exploration_mask = (
         (~invalid_geom)
-        & np.all(np.isfinite(mean_quick), axis=1)
-        & np.all(np.isfinite(std_quick_norm), axis=1)
+        & (~numerical_discarded)
+        & np.all(np.isfinite(pred_mean), axis=1)
+        & np.all(np.isfinite(pred_std_norm), axis=1)
     )
 
     # 失败点距离过滤（太近的直接排除）
@@ -1895,6 +2433,11 @@ def compute_ehvi_acquisition(
         exploitation_mask &= sufficiently_far_from_failure
         exploration_mask &= sufficiently_far_from_failure
 
+    train_distance = calc_distance_to_set(X_norm, scaler_X.transform(X_pool_raw))
+    trust_region_mask = (
+        exploration_mask & (train_distance <= cfg.train_distance_soft_limit)
+    )
+
     valid_idx = np.where(exploitation_mask)[0]
 
     ehvi = np.full(N, -np.inf)
@@ -1905,31 +2448,27 @@ def compute_ehvi_acquisition(
             f"仍保留 {int(exploration_mask.sum())} 个探索候选。"
         )
         return X_cand, ehvi, {
-            "pred_mean": mean_quick,
-            "pred_std_norm": std_quick_norm,
+            "pred_mean": pred_mean,
+            "pred_std_norm": pred_std_norm,
             "p_feas": p_feas,
             "p_geom_safe": p_geom_safe,
+            "flow_feasible_probability": flow_feasible_probability,
+            "flow_lower_confidence_bound": flow_lower_confidence_bound,
             "valid_mask": exploitation_mask,
             "exploration_mask": exploration_mask,
+            "trust_region_mask": trust_region_mask,
+            "candidate_source": candidate_source,
+            "model_reliability": model_reliability,
+            "mc_sample_count": int(cfg.mc_samples),
             "overlap_proxy_violation": overlap_proxy_violation(X_cand),
         }
 
     # ------------------------------------------------------------------
-    # 3. 对有效候选点做完整 MC Dropout（cfg.mc_samples 次）
+    # 3. 对有效候选点复用整池 MC 样本计算 EHVI
     # ------------------------------------------------------------------
     X_valid      = X_cand[valid_idx]
     X_valid_norm = X_norm[valid_idx]
-
-    reg_model.train()
-    X_t = torch.tensor(X_valid_norm, dtype=torch.float32, device=DEVICE)
-    mc_preds_norm = []
-    with torch.no_grad():
-        for _ in range(cfg.mc_samples):
-            mc_preds_norm.append(reg_model(X_t).cpu().numpy())
-    mc_preds_norm = np.stack(mc_preds_norm, axis=0)  # (S, N_valid, 3)
-    mc_preds = scaler_Y.inverse_transform(
-        mc_preds_norm.reshape(-1, mc_preds_norm.shape[-1])
-    ).reshape(mc_preds_norm.shape)
+    mc_valid = mc_preds[:, valid_idx, :]
 
     # ------------------------------------------------------------------
     # 4. EHVI 计算
@@ -1939,13 +2478,16 @@ def compute_ehvi_acquisition(
                     else np.zeros((0, 2)))
     hv_base = _hv2d_exact(pareto_Y_cur, ref)
 
-    S = mc_preds.shape[0]
+    S = mc_valid.shape[0]
     ehvi_valid = np.zeros(len(valid_idx))
 
     for s in range(S):
-        Y_s   = mc_preds[s, :, :2]                              # (N_valid, 2)
+        _raise_if_cancelled(cancel_event)
+        Y_s   = mc_valid[s, :, :2]                              # (N_valid, 2)
         hvi_s = _batch_hvi_2d(Y_s, pareto_Y_cur, ref, hv_base)  # (N_valid,)
-        ehvi_valid += hvi_s
+        # Objectives and flow share one network and one dropout draw. Their
+        # joint expectation must not be replaced by a product of marginals.
+        ehvi_valid += hvi_s * (mc_valid[s, :, 2] >= BOUNDARY_FLOW_G_S)
 
     ehvi_valid /= S
 
@@ -1969,15 +2511,20 @@ def compute_ehvi_acquisition(
           f"最大EHVI: {ehvi_valid.max():.6f}")
 
     info = {
-        "pred_mean": mean_quick,
-        "pred_std_norm": std_quick_norm,
+        "pred_mean": pred_mean,
+        "pred_std_norm": pred_std_norm,
         "p_feas": p_feas,
         "p_geom_safe": p_geom_safe,
+        "flow_feasible_probability": flow_feasible_probability,
+        "flow_lower_confidence_bound": flow_lower_confidence_bound,
         "valid_mask": exploitation_mask,
         "exploration_mask": exploration_mask,
+        "trust_region_mask": trust_region_mask,
+        "candidate_source": candidate_source,
+        "model_reliability": model_reliability,
+        "mc_sample_count": int(cfg.mc_samples),
         "overlap_proxy_violation": overlap_proxy_violation(X_cand),
     }
-    info["pred_std_norm"][valid_idx] = mc_preds_norm.std(axis=0)
     return X_cand, ehvi, info
 
 
@@ -1997,6 +2544,7 @@ class CompressorMOOProblem(Problem):
         Y_pool_raw,
         cfg: ALConfig,
         fixed_p_out: float | None = None,
+        cancel_event=None,
     ):
         self.reg_model = reg_model
         self.feas_clf = feas_clf
@@ -2006,6 +2554,7 @@ class CompressorMOOProblem(Problem):
         self.X_pool_raw = snap_discrete_vars(X_pool_raw)
         self.Y_pool_raw = Y_pool_raw
         self.cfg = cfg
+        self.cancel_event = cancel_event
         self.fixed_p_out = float(
             OPTIMIZATION_P_OUT if fixed_p_out is None else fixed_p_out
         )
@@ -2026,11 +2575,16 @@ class CompressorMOOProblem(Problem):
         )
 
     def _evaluate(self, X, out, *args, **kwargs):
+        _raise_if_cancelled(self.cancel_event)
         X_full = expand_geometry_decisions(X, fixed_p_out=self.fixed_p_out)
         X_norm = self.scaler_X.transform(X_full)
 
         mean_real, std_norm = mc_dropout_predict(
-            self.reg_model, X_norm, self.scaler_Y, n_samples=20
+            self.reg_model,
+            X_norm,
+            self.scaler_Y,
+            n_samples=20,
+            cancel_event=self.cancel_event,
         )
 
         eff_raw = mean_real[:, 0]
@@ -2063,7 +2617,7 @@ class CompressorMOOProblem(Problem):
 # 选点策略
 # =============================================================================
 # =============================================================================
-# 选点策略：2 个 EHVI + 1 个最大不确定性 + 1 个欠采样 nBl/空间填充
+# 选点策略：按模型可靠性自适应分配 EHVI、局部探索与信赖域填充
 # =============================================================================
 def select_candidates_diverse(
     acq_X: np.ndarray,
@@ -2074,17 +2628,29 @@ def select_candidates_diverse(
     X_failed_raw: np.ndarray | list | None = None,
     n_pick: int = 4,
     min_dist_norm: float = 0.08,
-    n_ehvi: int = 2,
+    n_ehvi: int | None = None,
+    model_reliability: str | None = None,
+    min_meaningful_ehvi: float = MIN_MEANINGFUL_EHVI,
+    reserve_coverage: bool = False,
+    coverage_preferred_nbl: tuple[int, ...] = (10, 11, 12),
+    coverage_iteration: int | None = None,
+    coverage_safe_flow_probability_min: float = 0.80,
+    coverage_safe_flow_lcb_g_s: float = 3.55,
+    coverage_boundary_flow_probability_min: float = 0.30,
+    coverage_boundary_flow_probability_max: float = 0.80,
+    coverage_solver_safe_probability_min: float = 0.55,
+    coverage_geometry_safe_probability_min: float = 0.55,
+    coverage_flow_target_scale_g_s: float = 0.35,
+    coverage_boundary_cycle: int = 10,
+    coverage_boundary_cycle_slots: tuple[int, ...] = (2, 5, 8),
+    coverage_boundary_max_train_distance_norm: float = 0.25,
 ):
     """
-    固定配额批量选点：
-      1) 2 个 Pareto/EHVI 点；
-      2) 1 个 MC-Dropout 最大不确定性点；
-      3) 1 个训练池中欠采样 nBl 类别内的空间填充点。
+    Reliability-adaptive selection without quota-filling zero-EHVI points.
 
-    EHVI 使用保守开发掩码；不确定性与覆盖槽位使用仅含显式规则和
-    已确认失败距离的探索掩码，使它们能够纠正分类器/代理模型误判。
-    所有策略共享批内最小距离约束。
+    reliable: up to three meaningful EHVI points plus one safe local
+    uncertainty point; general: one or two EHVI points and safe local
+    exploration; failed: trust-region maximin filling only.
     """
     X_cand = snap_discrete_vars(np.asarray(acq_X, dtype=float))
     X_cand_norm = scaler_X.transform(X_cand)
@@ -2094,8 +2660,15 @@ def select_candidates_diverse(
 
     valid_mask = np.ones(n_candidates, dtype=bool)
     exploration_mask = None
+    trust_region_mask = None
     exploration_support = np.ones(n_candidates, dtype=float)
     pred_std_norm = np.zeros((n_candidates, len(SURROGATE_OUTPUT_NAMES)))
+    candidate_source = np.full(n_candidates, "global", dtype=object)
+    p_flow = np.ones(n_candidates, dtype=float)
+    p_feas = np.ones(n_candidates, dtype=float)
+    p_geom_safe = np.ones(n_candidates, dtype=float)
+    pred_mean = np.zeros((n_candidates, len(SURROGATE_OUTPUT_NAMES)))
+    flow_lcb = np.full(n_candidates, np.inf, dtype=float)
     if acq_info is not None:
         if "valid_mask" in acq_info:
             valid_mask = np.asarray(acq_info["valid_mask"], dtype=bool).copy()
@@ -2103,6 +2676,24 @@ def select_candidates_diverse(
             exploration_mask = np.asarray(
                 acq_info["exploration_mask"], dtype=bool
             ).copy()
+        if "trust_region_mask" in acq_info:
+            trust_region_mask = np.asarray(
+                acq_info["trust_region_mask"], dtype=bool
+            ).copy()
+        if "candidate_source" in acq_info:
+            candidate_source = np.asarray(
+                acq_info["candidate_source"], dtype=object
+            )
+        if "flow_feasible_probability" in acq_info:
+            p_flow = np.asarray(
+                acq_info["flow_feasible_probability"], dtype=float
+            )
+        if "flow_lower_confidence_bound" in acq_info:
+            flow_lcb = np.asarray(
+                acq_info["flow_lower_confidence_bound"], dtype=float
+            )
+        if "pred_mean" in acq_info:
+            pred_mean = np.asarray(acq_info["pred_mean"], dtype=float)
         if "pred_std_norm" in acq_info:
             pred_std_norm = np.asarray(acq_info["pred_std_norm"], dtype=float)
         if "p_feas" in acq_info and "p_geom_safe" in acq_info:
@@ -2112,9 +2703,10 @@ def select_candidates_diverse(
                 raise ValueError(
                     "acq_info feasibility probabilities must match the candidate count."
                 )
-            exploration_support = np.sqrt(
+            exploration_support = np.cbrt(
                 np.clip(p_feas, 0.0, 1.0)
                 * np.clip(p_geom_safe, 0.0, 1.0)
+                * np.clip(p_flow, 0.0, 1.0)
             )
             exploration_support = np.nan_to_num(
                 exploration_support, nan=0.0, posinf=0.0, neginf=0.0
@@ -2129,6 +2721,22 @@ def select_candidates_diverse(
         )
     if pred_std_norm.shape[0] != n_candidates:
         raise ValueError("acq_info['pred_std_norm'] must match the candidate count.")
+    if trust_region_mask is None:
+        trust_region_mask = exploration_mask.copy()
+    if trust_region_mask.shape != (n_candidates,):
+        raise ValueError("acq_info['trust_region_mask'] must match the candidate count.")
+    if candidate_source.shape != (n_candidates,):
+        raise ValueError("acq_info['candidate_source'] must match the candidate count.")
+    if p_flow.shape != (n_candidates,):
+        raise ValueError(
+            "acq_info['flow_feasible_probability'] must match the candidate count."
+        )
+    if flow_lcb.shape != (n_candidates,):
+        raise ValueError(
+            "acq_info['flow_lower_confidence_bound'] must match the candidate count."
+        )
+    if pred_mean.shape != (n_candidates, len(SURROGATE_OUTPUT_NAMES)):
+        raise ValueError("acq_info['pred_mean'] must match the candidate count.")
 
     X_pool = (
         snap_discrete_vars(np.asarray(X_pool_raw, dtype=float))
@@ -2140,17 +2748,12 @@ def select_candidates_diverse(
         if len(X_pool) > 0
         else np.empty((0, X_cand.shape[1]), dtype=float)
     )
-    X_failed = (
-        snap_discrete_vars(np.asarray(X_failed_raw, dtype=float))
-        if X_failed_raw is not None and len(X_failed_raw) > 0
-        else np.empty((0, X_cand.shape[1]), dtype=float)
-    )
-
     selected = []
     labels = []
     selected_idx = []
     exploitation_available = valid_mask.copy()
     exploration_available = exploration_mask.copy()
+    trust_region_available = trust_region_mask.copy()
 
     # 不重复查询训练池中已有的设计点。
     if len(X_pool_norm) > 0:
@@ -2159,6 +2762,7 @@ def select_candidates_diverse(
         )
         exploitation_available &= not_in_training_pool
         exploration_available &= not_in_training_pool
+        trust_region_available &= not_in_training_pool
 
     def refresh_batch_distance():
         if not selected_idx:
@@ -2169,6 +2773,7 @@ def select_candidates_diverse(
         too_close = d_selected < min_dist_norm
         exploitation_available[too_close] = False
         exploration_available[too_close] = False
+        trust_region_available[too_close] = False
 
     def add_candidate(idx: int, label: str):
         selected_idx.append(int(idx))
@@ -2176,18 +2781,140 @@ def select_candidates_diverse(
         labels.append(label)
         exploitation_available[idx] = False
         exploration_available[idx] = False
+        trust_region_available[idx] = False
         refresh_batch_distance()
 
-    # 1) Pareto exploitation: exactly two EHVI slots when possible.
+    reliability = (
+        model_reliability
+        or (acq_info or {}).get("model_reliability", "general")
+    )
+    if reliability not in {"reliable", "general", "failed"}:
+        raise ValueError(f"Unsupported model reliability: {reliability}")
+    default_ehvi_quota = {"reliable": 3, "general": 2, "failed": 0}
+    ehvi_quota = default_ehvi_quota[reliability] if n_ehvi is None else int(n_ehvi)
+    if reliability == "failed":
+        ehvi_quota = 0
+
+    # 0) In global-accuracy mode reserve exactly one sparse nBl=10--12 slot.
+    # Seven rounds out of ten prefer a flow-safe point near the 3.6 g/s
+    # boundary; three rounds deliberately sample the uncertain boundary band.
+    # All quantities reuse the same full-pool MC distribution used by EHVI.
+    if reserve_coverage and reliability != "failed" and len(selected) < n_pick:
+        nbl_idx = VAR_NAMES.index("nBl")
+        candidate_nbl = np.rint(X_cand[:, nbl_idx]).astype(int)
+        global_available = exploration_available & np.isin(
+            candidate_source, ["global", "observed_boundary_local"]
+        )
+        coverage_distance = (
+            calc_distance_to_set(X_cand_norm, X_pool_norm)
+            if len(X_pool_norm) > 0
+            else np.full(n_candidates, np.inf)
+        )
+        cycle = max(1, int(coverage_boundary_cycle))
+        cycle_slot = (
+            int(coverage_iteration) % cycle
+            if coverage_iteration is not None
+            else 0
+        )
+        boundary_mode = cycle_slot in {
+            int(slot) % cycle for slot in coverage_boundary_cycle_slots
+        }
+        model_safe = (
+            (p_feas >= float(coverage_solver_safe_probability_min))
+            & (p_geom_safe >= float(coverage_geometry_safe_probability_min))
+        )
+        if boundary_mode:
+            policy_available = (
+                global_available
+                & model_safe
+                & (p_flow >= float(coverage_boundary_flow_probability_min))
+                & (p_flow < float(coverage_boundary_flow_probability_max))
+                & (coverage_distance <= float(coverage_boundary_max_train_distance_norm))
+            )
+            coverage_policy = "边界辨识覆盖"
+        else:
+            policy_available = (
+                global_available
+                & model_safe
+                & (p_flow >= float(coverage_safe_flow_probability_min))
+                & (flow_lcb >= float(coverage_safe_flow_lcb_g_s))
+            )
+            coverage_policy = "安全边界覆盖"
+        # Preferences may narrow only candidates that already passed policy.
+        # Never silently relax solver, geometry, flow, or support constraints.
+        coverage_available = policy_available
+        if boundary_mode:
+            anchored = coverage_available & (candidate_source == "observed_boundary_local")
+            if np.any(anchored):
+                coverage_available = anchored
+        preferred = coverage_available & np.isin(
+            candidate_nbl, np.asarray(coverage_preferred_nbl, dtype=int)
+        )
+        if np.any(preferred):
+            coverage_available = preferred
+        if np.any(coverage_available):
+            coverage_distance = (
+                calc_distance_to_set(X_cand_norm, X_pool_norm)
+                if len(X_pool_norm) > 0
+                else np.ones(n_candidates, dtype=float)
+            )
+            target_scale = max(float(coverage_flow_target_scale_g_s), 1e-12)
+            flow_target_score = np.exp(
+                -np.abs(pred_mean[:, 2] - BOUNDARY_FLOW_G_S) / target_scale
+            )
+            if boundary_mode:
+                boundary_probability_score = np.clip(
+                    1.0 - 2.0 * np.abs(p_flow - 0.5), 0.0, 1.0
+                )
+                policy_score = (
+                    0.35 + 0.35 * flow_target_score
+                    + 0.30 * boundary_probability_score
+                )
+            else:
+                lcb_margin = np.clip(
+                    (flow_lcb - float(coverage_safe_flow_lcb_g_s))
+                    / target_scale,
+                    0.0,
+                    1.0,
+                )
+                policy_score = (
+                    0.30 + 0.35 * flow_target_score + 0.35 * lcb_margin
+                )
+            coverage_score = coverage_distance * (
+                0.25 + 0.75 * exploration_support
+            ) * policy_score
+            idx = int(
+                np.argmax(
+                    np.where(coverage_available, coverage_score, -np.inf)
+                )
+            )
+            add_candidate(
+                idx,
+                f"{coverage_policy} (nBl={candidate_nbl[idx]}, "
+                f"d={coverage_distance[idx]:.4f}, "
+                f"p_flow={p_flow[idx]:.3f}, "
+                f"mf_p10={flow_lcb[idx]:.3f}, "
+                f"safety_support={exploration_support[idx]:.3f})",
+            )
+
+    # Leave one slot for local uncertainty whenever such a slot is part of the
+    # reliability policy. With a four-point batch and one coverage point this
+    # yields at most two EHVI points, rather than silently dropping exploration.
+    local_slots_to_reserve = (
+        1 if reliability in {"reliable", "general"} and len(selected) < n_pick else 0
+    )
+    ehvi_quota = min(
+        ehvi_quota,
+        max(0, n_pick - len(selected) - local_slots_to_reserve),
+    )
+
+    # 1) Exploitation requires strictly meaningful positive EHVI.
     ehvi_scores = np.asarray(ehvi_vals, dtype=float)
-    for slot in range(min(n_ehvi, n_pick)):
-        # Zero-EHVI candidates are still Pareto-directed samples from the
-        # acquisition pool. Keeping them eligible preserves the fixed 2-slot
-        # exploitation quota when the current front yields no positive HVI.
+    for slot in range(min(ehvi_quota, n_pick)):
         eligible = (
             exploitation_available
             & np.isfinite(ehvi_scores)
-            & (ehvi_scores >= 0.0)
+            & (ehvi_scores > float(min_meaningful_ehvi))
         )
         if not np.any(eligible):
             break
@@ -2197,104 +2924,52 @@ def select_candidates_diverse(
             f"Pareto/EHVI#{slot + 1} (ehvi={ehvi_scores[idx]:.5f})",
         )
 
-    # 2) Exploration: largest normalized MC-Dropout uncertainty.
-    if len(selected) < min(n_pick, n_ehvi + 1):
-        uncertainty = np.nanmean(pred_std_norm, axis=1)
-        # Learned safety remains a soft preference, never a veto. The 0.25
-        # floor preserves counterexample collection in regions the classifier
-        # currently considers risky.
-        support_weight = 0.25 + 0.75 * exploration_support
-        uncertainty_score = uncertainty * support_weight
-        eligible = exploration_available & np.isfinite(uncertainty_score)
+    uncertainty = np.nanmean(pred_std_norm, axis=1)
+    local_mask = candidate_source != "global"
+    local_model_safe = (
+        (p_feas >= float(coverage_solver_safe_probability_min))
+        & (p_geom_safe >= float(coverage_geometry_safe_probability_min))
+    )
+    safe_local_available = (
+        exploration_available
+        & trust_region_available
+        & local_mask
+        & local_model_safe
+        & (exploration_support >= 0.5)
+    )
+
+    # 2) Reliable/general models use one uncertainty-first local exploration.
+    if reliability in {"reliable", "general"} and len(selected) < n_pick:
+        uncertainty_score = uncertainty * (0.25 + 0.75 * exploration_support)
+        eligible = safe_local_available & np.isfinite(uncertainty_score)
         if np.any(eligible):
-            idx = int(
-                np.argmax(np.where(eligible, uncertainty_score, -np.inf))
-            )
+            idx = int(np.argmax(np.where(eligible, uncertainty_score, -np.inf)))
             add_candidate(
                 idx,
-                f"最大不确定性 (u_norm={uncertainty[idx]:.5f}, "
+                f"安全局部不确定性 (u_norm={uncertainty[idx]:.5f}, "
+                f"source={candidate_source[idx]}, "
                 f"safety_support={exploration_support[idx]:.3f})",
             )
 
-    # 3) Coverage: least represented blade-count class, then maximin fill.
-    if len(selected) < min(n_pick, n_ehvi + 2):
-        nbl_idx = VAR_NAMES.index("nBl")
-        allowed_nbl = np.arange(
-            int(np.ceil(L_BOUNDS[nbl_idx])),
-            int(np.floor(U_BOUNDS[nbl_idx])) + 1,
-        )
-        pool_nbl = (
-            np.rint(X_pool[:, nbl_idx]).astype(int)
-            if len(X_pool) > 0
-            else np.empty(0, dtype=int)
-        )
-        failed_nbl = (
-            np.rint(X_failed[:, nbl_idx]).astype(int)
-            if len(X_failed) > 0
-            else np.empty(0, dtype=int)
-        )
-        success_counts = {
-            int(nbl): int(np.count_nonzero(pool_nbl == nbl))
-            for nbl in allowed_nbl
-        }
-        failure_counts = {
-            int(nbl): int(np.count_nonzero(failed_nbl == nbl))
-            for nbl in allowed_nbl
-        }
-        evaluated_counts = {
-            int(nbl): success_counts[int(nbl)] + failure_counts[int(nbl)]
-            for nbl in allowed_nbl
-        }
-        candidate_nbl = np.rint(X_cand[:, nbl_idx]).astype(int)
-        target_nbl = None
-        eligible = np.zeros(n_candidates, dtype=bool)
-        for nbl in sorted(
-            evaluated_counts,
-            key=lambda value: (
-                evaluated_counts[value],
-                success_counts[value],
-                value,
-            ),
-        ):
-            eligible_for_nbl = exploration_available & (candidate_nbl == nbl)
-            if np.any(eligible_for_nbl):
-                target_nbl = nbl
-                eligible = eligible_for_nbl
-                break
+    # A reliable model has exactly one exploration slot and never backfills a
+    # missing EHVI slot. A general model uses the remaining batch for safe
+    # local maximin exploration. A failed model ignores EHVI entirely.
+    if reliability == "reliable":
+        return selected[:n_pick], labels[:n_pick]
 
-        if target_nbl is not None:
-            same_nbl_pool = X_pool_norm[pool_nbl == target_nbl]
-            references = same_nbl_pool
-            if len(references) == 0:
-                references = X_pool_norm
-            if selected_idx:
-                selected_norm = X_cand_norm[np.asarray(selected_idx, dtype=int)]
-                references = (
-                    np.vstack([references, selected_norm])
-                    if len(references) > 0
-                    else selected_norm
-                )
-            fill_distance = (
-                calc_distance_to_set(X_cand_norm, references)
-                if len(references) > 0
-                else np.ones(n_candidates)
+    def current_fill_available():
+        if reliability == "general":
+            return (
+                exploration_available
+                & trust_region_available
+                & local_mask
+                & local_model_safe
+                & (exploration_support >= 0.5)
             )
-            fill_score = fill_distance * (
-                0.25 + 0.75 * exploration_support
-            )
-            idx = int(np.argmax(np.where(eligible, fill_score, -np.inf)))
-            add_candidate(
-                idx,
-                f"欠采样nBl/空间填充 (nBl={target_nbl}, "
-                f"success={success_counts[target_nbl]}, "
-                f"failed={failure_counts[target_nbl]}, "
-                f"evaluated={evaluated_counts[target_nbl]}, "
-                f"d={fill_distance[idx]:.4f}, "
-                f"safety_support={exploration_support[idx]:.3f})",
-            )
+        return trust_region_available.copy()
 
-    # Any unavailable quota is filled by a valid maximin point.
-    while len(selected) < n_pick and np.any(exploration_available):
+    fill_available = current_fill_available()
+    while len(selected) < n_pick and np.any(fill_available):
         references = X_pool_norm
         if selected_idx:
             selected_norm = X_cand_norm[np.asarray(selected_idx, dtype=int)]
@@ -2311,50 +2986,35 @@ def select_candidates_diverse(
         fill_score = fill_distance * (0.25 + 0.75 * exploration_support)
         idx = int(
             np.argmax(
-                np.where(exploration_available, fill_score, -np.inf)
+                np.where(fill_available, fill_score, -np.inf)
             )
         )
-        add_candidate(idx, f"有效候选空间回填 (d={fill_distance[idx]:.4f})")
-
-    # 不足时随机补充
-    attempts = 0
-    while len(selected) < n_pick and attempts < 200:
-        attempts += 1
-        sampler = qmc.LatinHypercube(d=len(VAR_NAMES), seed=None)
-        x_rand  = snap_discrete_vars(
-            qmc.scale(sampler.random(1), L_BOUNDS, U_BOUNDS)
-        )[0]
-        x_rand = pin_optimization_operating_point(x_rand)[0]
-
-        # 即使在随机补充阶段，也尽量不要把明显违反几何规则的点送去 CFD。
-        if np.any(geometry_rule_violations(x_rand[None, :]) > 0.0):
-            continue
-        x_rand_norm = scaler_X.transform(x_rand[None, :])
-        if len(X_pool_norm) > 0:
-            if calc_distance_to_set(x_rand_norm, X_pool_norm)[0] <= 1e-10:
-                continue
-        if selected:
-            selected_norm = scaler_X.transform(np.asarray(selected))
-            if calc_distance_to_set(x_rand_norm, selected_norm)[0] < min_dist_norm:
-                continue
-
-        selected.append(x_rand)
-        labels.append("几何安全随机回填")
+        strategy = "安全局部空间填充" if reliability == "general" else "信赖域空间填充"
+        add_candidate(
+            idx,
+            f"{strategy} (d={fill_distance[idx]:.4f}, "
+            f"source={candidate_source[idx]})",
+        )
+        fill_available = current_fill_available()
 
     return selected[:n_pick], labels[:n_pick]
 
 
 def _load_nsga2_training_dataframe(use_pool_checkpoint: bool = False) -> pd.DataFrame:
-    """
-    NSGA-II-only mode defaults to TRAINING_CSV so an LHS/DOE baseline is not
-    silently contaminated by active-learning checkpoint samples.
-    """
-    if use_pool_checkpoint and os.path.exists(POOL_CHECKPOINT_CSV):
-        print(f"[NSGA-II] 使用主动学习训练池 checkpoint: {POOL_CHECKPOINT_CSV}")
-        return load_and_clean_data(POOL_CHECKPOINT_CSV)
-
-    print(f"[NSGA-II] 使用训练数据 CSV: {TRAINING_CSV}")
-    return load_and_clean_data(TRAINING_CSV)
+    """Pool already excludes fixed tests: reunite solely for the shared splitter."""
+    if not use_pool_checkpoint:
+        return load_and_clean_data(TRAINING_CSV)
+    if not os.path.exists(POOL_CHECKPOINT_CSV):
+        raise ValueError("AL training pool is missing; initialize an AL stage before NSGA-II")
+    pool = load_pool_checkpoint()
+    if pool is None:
+        raise ValueError("AL training pool metadata is invalid")
+    test = load_and_clean_data(TEST_SET_CSV)
+    def keys(frame):
+        return {tuple(row) for row in np.round(frame[VAR_NAMES].to_numpy(float), 10)}
+    if keys(pool) & keys(test):
+        raise ValueError("AL training pool overlaps fixed test set; refusing leakage")
+    return pd.concat([pool, test], ignore_index=True)
 
 
 def run_nsga2_only_from_lhs(
@@ -2373,28 +3033,31 @@ def run_nsga2_only_from_lhs(
     if summary_json:
         os.makedirs(os.path.dirname(os.path.abspath(summary_json)), exist_ok=True)
 
+    model_dir = Path(output_csv).resolve().parent / ("nsga2_pool_model" if use_pool_checkpoint else "nsga2_doe_model")
+    model_dir.mkdir(parents=True, exist_ok=True)
+    model_path = str(model_dir / "best_regressor.pth")
+    scaler_x_path = str(model_dir / "scaler_X.pkl")
+    scaler_y_path = str(model_dir / "scaler_Y.pkl")
+    geom_path = str(model_dir / "geometry_classifier.pkl")
     df = _load_nsga2_training_dataframe(use_pool_checkpoint=use_pool_checkpoint)
     X_pool, X_test_fixed, Y_pool, Y_test_fixed, W_pool, W_test_fixed = split_with_fixed_testset(df)
     X_pool = snap_discrete_vars(X_pool)
     X_test_fixed = snap_discrete_vars(X_test_fixed)
 
-    scaler_X = MinMaxScaler()
+    scaler_X = make_categorical_nbl_scaler(VAR_NAMES, L_BOUNDS, U_BOUNDS)
     scaler_Y = MinMaxScaler()
-    X_pool_norm = scaler_X.fit_transform(X_pool)
     Y_pool_surr = Y_pool[:, SURROGATE_OUTPUT_IDX]
     Y_test_fixed_surr = Y_test_fixed[:, SURROGATE_OUTPUT_IDX]
-    Y_pool_norm = scaler_Y.fit_transform(Y_pool_surr)
 
-    stratify_labels = W_pool if len(np.unique(W_pool)) > 1 else None
-    train_idx, val_idx = train_test_split(
-        np.arange(len(X_pool)),
-        test_size=0.2,
-        random_state=42,
-        stratify=stratify_labels,
+    train_idx, val_idx, _ = split_training_validation_indices(
+        X_pool, W_pool,
     )
+    scaler_X.fit(X_pool[train_idx])
+    scaler_Y.fit(Y_pool_surr[train_idx])
+    X_pool_norm = scaler_X.transform(X_pool)
+    Y_pool_norm = scaler_Y.transform(Y_pool_surr)
     X_tr, X_val = X_pool_norm[train_idx], X_pool_norm[val_idx]
     Y_tr, Y_val = Y_pool_norm[train_idx], Y_pool_norm[val_idx]
-    W_tr, W_val = W_pool[train_idx], W_pool[val_idx]
     nbl_idx = VAR_NAMES.index("nBl")
     train_sample_weights, weight_diagnostics = compute_density_nbl_sample_weights(
         X_tr,
@@ -2408,15 +3071,21 @@ def run_nsga2_only_from_lhs(
     reg_model, reg_hist = train_regressor(
         X_tr,
         Y_tr,
-        W_tr,
+        (Y_pool_surr[train_idx, 2] < BOUNDARY_FLOW_G_S).astype(float),
         X_val,
         Y_val,
-        W_val,
+        (Y_pool_surr[val_idx, 2] < BOUNDARY_FLOW_G_S).astype(float),
+        save_path=model_path,
         sample_weights_train=train_sample_weights,
         random_seed=1000,
     )
-    joblib.dump(scaler_X, SCALER_X_PATH)
-    joblib.dump(scaler_Y, SCALER_Y_PATH)
+    joblib.dump(scaler_X, scaler_x_path)
+    joblib.dump(scaler_Y, scaler_y_path)
+    bundle_frame = pd.DataFrame(X_pool, columns=VAR_NAMES)
+    for j, target in enumerate(SURROGATE_OUTPUT_NAMES):
+        bundle_frame[target] = Y_pool_surr[:, j]
+    write_model_manifest(model_path, scaler_x_path, scaler_y_path, bundle_frame,
+                         VAR_NAMES, SURROGATE_OUTPUT_NAMES, stage_info(CHECKPOINT_META_PATH)["stage_id"])
 
     X_test_norm = scaler_X.transform(X_test_fixed)
     Y_test_pred = deterministic_predict(reg_model, X_test_norm, scaler_Y)
@@ -2439,7 +3108,7 @@ def run_nsga2_only_from_lhs(
 
     failed_points = []
     geometry_failures, operating_failures, _ = (
-        load_recorded_failure_datasets()
+        load_recorded_failure_datasets(sources=None if use_pool_checkpoint else ("doe",))
     )
     if len(geometry_failures) > 0:
         failed_points.extend(expand_geometry_decisions(geometry_failures).tolist())
@@ -2456,8 +3125,11 @@ def run_nsga2_only_from_lhs(
     )
     geom_warn_clf = train_geometry_feasibility_classifier(X_geom_warn, y_geom_warn)
     if geom_warn_clf is not None:
-        joblib.dump(geom_warn_clf, GEOM_FEAS_CLF_PATH)
+        joblib.dump(geom_warn_clf, geom_path)
 
+    optimization_seed = int(stage_info(CHECKPOINT_META_PATH).get("seed", 42))
+    np.random.seed(optimization_seed)
+    torch.manual_seed(optimization_seed)
     print(f"[NSGA-II] 开始优化 | pop_size={CFG.pop_size} | n_gen={CFG.n_gen}")
     problem = CompressorMOOProblem(
         reg_model=reg_model,
@@ -2470,7 +3142,7 @@ def run_nsga2_only_from_lhs(
         cfg=CFG,
     )
     algorithm = NSGA2(pop_size=CFG.pop_size, eliminate_duplicates=True)
-    res = minimize(problem, algorithm, ("n_gen", CFG.n_gen), verbose=False)
+    res = minimize(problem, algorithm, ("n_gen", CFG.n_gen), seed=optimization_seed, verbose=False)
 
     pareto_X, pareto_Y, surrogate_hv = extract_surrogate_front_and_hv(
         res=res,
@@ -2497,6 +3169,12 @@ def run_nsga2_only_from_lhs(
 
     summary = {
         "mode": "nsga2_only",
+        "model": model_path, "scaler_x": scaler_x_path, "scaler_y": scaler_y_path,
+        "training_scope": "doe_al" if use_pool_checkpoint else "doe_only",
+        "stage_id": stage_info(CHECKPOINT_META_PATH)["stage_id"],
+        "seed": optimization_seed,
+        "model_sha256": digest(model_path),
+        "pool_digest": data_digest(bundle_frame, VAR_NAMES, SURROGATE_OUTPUT_NAMES),
         "training_csv": TRAINING_CSV,
         "used_pool_checkpoint": bool(use_pool_checkpoint and os.path.exists(POOL_CHECKPOINT_CSV)),
         "train_samples": int(len(X_pool)),
@@ -2527,10 +3205,37 @@ def run_nsga2_only_from_lhs(
 # =============================================================================
 # 主流程
 # =============================================================================
-def main_multiobjective_active_learning(max_al_iters: int | None = None):
+def main_multiobjective_active_learning(
+    max_al_iters: int | None = None,
+    cancel_event=None,
+):
+    _raise_if_cancelled(cancel_event)
     # -------------------------------------------------------------------------
     # 0. 读取并清洗数据
     # -------------------------------------------------------------------------
+    stage = stage_info(CHECKPOINT_META_PATH)
+    if stage["stage_id"] != "legacy":
+        fixed_frame = load_and_clean_data(TEST_SET_CSV)
+        if data_digest(fixed_frame, VAR_NAMES, SURROGATE_OUTPUT_NAMES) != stage["fixed_test_digest"]:
+            raise ValueError("Fixed test data changed inside AL experiment; prepare a new stage")
+        ref = [TRUE_HV_REF_EFF, TRUE_HV_REF_PR]
+        if stage.get("hv_reference") != ref:
+            raise ValueError("HV reference changed inside AL experiment")
+        expected = stage.get("runtime", {})
+        for name, actual in [("default_boundary_flow_g_s", BOUNDARY_FLOW_G_S),
+                             ("default_min_efficiency", MIN_EFFICIENCY),
+                             ("optimization_outlet_static_pressure_pa", OPTIMIZATION_P_OUT),
+                             ("cfx_residual_threshold", CFX_RESIDUAL_THRESHOLD),
+                             ("cfx_max_extra_iterations", CFX_MAX_EXTRA_ITERATIONS)]:
+            if name in expected and expected[name] != actual:
+                raise ValueError("AL experiment protocol changed: " + name)
+    if os.path.exists(CHECKPOINT_META_PATH):
+        with open(CHECKPOINT_META_PATH, encoding="utf-8") as stream:
+            meta_before = json.load(stream)
+        if meta_before.get("pool_digest"):
+            current_pool = load_pool_checkpoint()
+            if current_pool is None or data_digest(current_pool, VAR_NAMES, SURROGATE_OUTPUT_NAMES) != meta_before["pool_digest"]:
+                raise ValueError("Training pool changed outside this AL stage; create a new stage to preserve HV provenance")
     df = load_and_clean_data(TRAINING_CSV)
 
     X_all = df[VAR_NAMES].values.astype(float)
@@ -2565,7 +3270,7 @@ def main_multiobjective_active_learning(max_al_iters: int | None = None):
     if len(recorded_operating_failures) > 0:
         failed_points.extend(recorded_operating_failures.tolist())
 
-    scaler_X = MinMaxScaler()
+    scaler_X = make_categorical_nbl_scaler(VAR_NAMES, L_BOUNDS, U_BOUNDS)
     scaler_Y = MinMaxScaler()
     start_iter = get_resume_iter()
     effective_max_al_iters = CFG.max_al_iters if max_al_iters is None else int(max_al_iters)
@@ -2575,6 +3280,8 @@ def main_multiobjective_active_learning(max_al_iters: int | None = None):
         HV_HISTORY_COLUMNS,
     ).to_dict('records')
 
+    if stage["stage_id"] != "legacy":
+        hv_history = [r for r in hv_history if r.get("stage_id") == stage["stage_id"]]
     total_attempts = 0
     total_success = 0
     resumed_in_progress_iter = None
@@ -2636,7 +3343,34 @@ def main_multiobjective_active_learning(max_al_iters: int | None = None):
     # =========================================================================
     # 主动学习循环
     # =========================================================================
+    stopped_early = False
+    stop_reason = ""
     for al_iter in range(start_iter, effective_max_al_iters):
+        optimization_seed = int(stage.get("seed", 42)) + al_iter + 1
+        np.random.seed(optimization_seed)
+        torch.manual_seed(optimization_seed)
+        _raise_if_cancelled(cancel_event)
+        hv_review_state = assess_hv_stagnation(hv_history, CFG)
+        if hv_review_state["hv_stagnation_triggered"]:
+            gain = hv_review_state["rolling_true_hv_gain"]
+            action = str(CFG.hv_stagnation_action).lower()
+            if action not in {"review", "stop"}:
+                raise ValueError(
+                    "hv_stagnation_action must be either 'review' or 'stop'."
+                )
+            print(
+                "  [真实HV停滞] 最近 "
+                f"{CFG.hv_stagnation_window} 轮净增益={gain:.6g}，"
+                f"低于阈值 {CFG.min_true_hv_gain:.6g}；动作={action}。"
+            )
+            if action == "stop":
+                stopped_early = True
+                stop_reason = (
+                    f"verified HV gain {gain:.6g} below "
+                    f"{CFG.min_true_hv_gain:.6g} over "
+                    f"{CFG.hv_stagnation_window} rounds"
+                )
+                break
         print("\n" + "=" * 70)
         print(f"[主动学习] 第 {al_iter + 1}/{effective_max_al_iters} 轮 | 当前训练池: {len(X_pool)}")
         print("=" * 70)
@@ -2647,22 +3381,20 @@ def main_multiobjective_active_learning(max_al_iters: int | None = None):
         X_pool = snap_discrete_vars(X_pool)
         X_test_fixed = snap_discrete_vars(X_test_fixed)
 
-        X_pool_norm = scaler_X.fit_transform(X_pool)
         Y_pool_surr = Y_pool[:, SURROGATE_OUTPUT_IDX]
         Y_test_fixed_surr = Y_test_fixed[:, SURROGATE_OUTPUT_IDX]
-        Y_pool_norm = scaler_Y.fit_transform(Y_pool_surr)
 
         # 每轮内部验证划分
-        stratify_labels = W_pool if len(np.unique(W_pool)) > 1 else None
-        train_idx, val_idx = train_test_split(
-            np.arange(len(X_pool)),
-            test_size=0.2,
-            random_state=42 + al_iter,
-            stratify=stratify_labels
+        train_idx, val_idx, split_strata = split_training_validation_indices(
+            X_pool, W_pool,
         )
+        print(f"  [验证划分] {split_strata} 分层；nBl 按类别处理。")
+        scaler_X.fit(X_pool[train_idx])
+        scaler_Y.fit(Y_pool_surr[train_idx])
+        X_pool_norm = scaler_X.transform(X_pool)
+        Y_pool_norm = scaler_Y.transform(Y_pool_surr)
         X_tr, X_val = X_pool_norm[train_idx], X_pool_norm[val_idx]
         Y_tr, Y_val = Y_pool_norm[train_idx], Y_pool_norm[val_idx]
-        W_tr, W_val = W_pool[train_idx], W_pool[val_idx]
         nbl_idx = VAR_NAMES.index("nBl")
         train_sample_weights, weight_diagnostics = compute_density_nbl_sample_weights(
             X_tr,
@@ -2678,15 +3410,22 @@ def main_multiobjective_active_learning(max_al_iters: int | None = None):
         reg_model, reg_hist = train_regressor(
             X_tr,
             Y_tr,
-            W_tr,
+            (Y_pool_surr[train_idx, 2] < BOUNDARY_FLOW_G_S).astype(float),
             X_val,
             Y_val,
-            W_val,
+            (Y_pool_surr[val_idx, 2] < BOUNDARY_FLOW_G_S).astype(float),
+            save_path=BEST_REG_PATH,
             sample_weights_train=train_sample_weights,
-            random_seed=1000 + al_iter,
+            random_seed=1000,
+            cancel_event=cancel_event,
         )
         joblib.dump(scaler_X, SCALER_X_PATH)
         joblib.dump(scaler_Y, SCALER_Y_PATH)
+        bundle_frame = pd.DataFrame(X_pool, columns=VAR_NAMES)
+        for j, target in enumerate(SURROGATE_OUTPUT_NAMES):
+            bundle_frame[target] = Y_pool_surr[:, j]
+        write_model_manifest(BEST_REG_PATH, SCALER_X_PATH, SCALER_Y_PATH, bundle_frame,
+                             VAR_NAMES, SURROGATE_OUTPUT_NAMES, stage_info(CHECKPOINT_META_PATH)["stage_id"])
 
         # 固定测试集评估
         X_test_norm = scaler_X.transform(X_test_fixed)
@@ -2720,6 +3459,7 @@ def main_multiobjective_active_learning(max_al_iters: int | None = None):
             row = {
                 "iter": int(al_iter + 1),
                 "test_index": int(test_idx),
+                "stage_id": stage["stage_id"],
                 "recorded_at_utc": utc_timestamp(),
             }
             row.update({name: float(value) for name, value in zip(VAR_NAMES, x_test)})
@@ -2742,6 +3482,7 @@ def main_multiobjective_active_learning(max_al_iters: int | None = None):
             W_boundary=W_pool,
             al_iter=al_iter + 1,
             cfg=CFG,
+            cancel_event=cancel_event,
         )
         if cv_fold_rows:
             upsert_csv_records(
@@ -2759,7 +3500,34 @@ def main_multiobjective_active_learning(max_al_iters: int | None = None):
                 f"{cv_summary['cv_std_rmse_mf']:.6f}"
             )
 
+        local_metrics = compute_local_online_metrics(
+            query_csv_path=AL_QUERY_VALIDATION_CSV,
+            current_pareto_X=true_front_X,
+            scaler_X=scaler_X,
+            completed_iter=al_iter,
+            cfg=CFG,
+        )
+        model_reliability, adaptive_ehvi_quota, reliability_score = (
+            assess_model_reliability(local_metrics, CFG)
+        )
+        if (
+            hv_review_state["hv_stagnation_triggered"]
+            and str(CFG.hv_stagnation_action).lower() == "review"
+        ):
+            adaptive_ehvi_quota = min(adaptive_ehvi_quota, 1)
+        print(
+            "  [局部在线可靠性] "
+            f"status={local_metrics.get('local_online_status')} | "
+            f"样本={int(local_metrics.get('local_online_samples', 0))} | "
+            f"max NRMSE={local_metrics.get('local_online_max_nrmse', np.nan):.4f} | "
+            f"max |bias|/scale={local_metrics.get('local_online_max_abs_bias_norm', np.nan):.4f} | "
+            f"flow Brier={local_metrics.get('local_flow_brier', np.nan):.4f} | "
+            f"flow ECE={local_metrics.get('local_flow_ece', np.nan):.4f}"
+        )
+
         validation_row = {
+            "stage_id": stage["stage_id"], "seed": optimization_seed,
+            "model_sha256": digest(BEST_REG_PATH),
             "iter": int(al_iter + 1),
             "train_pool_samples_before_cfd": int(len(X_pool)),
             "fixed_test_samples": int(len(X_test_fixed)),
@@ -2768,17 +3536,25 @@ def main_multiobjective_active_learning(max_al_iters: int | None = None):
             **fixed_metrics,
             **cv_summary,
             **weight_diagnostics,
+            **local_metrics,
+            **hv_review_state,
         }
         upsert_csv_records(
             SURROGATE_METRICS_CSV,
             validation_row,
             key_columns=["iter"],
         )
+        print(
+            f"  [模型可靠性] {model_reliability} | "
+            f"局部质量分数={reliability_score:.4f} | "
+            f"EHVI 上限={adaptive_ehvi_quota}"
+        )
 
         # ---------------------------------------------------------------------
         # 3. 训练可行性分类器
         # ---------------------------------------------------------------------
         geometry_failures, operating_failures, _ = load_recorded_failure_datasets()
+        _raise_if_cancelled(cancel_event)
         failed_points = []
         if len(geometry_failures) > 0:
             failed_points.extend(
@@ -2800,16 +3576,7 @@ def main_multiobjective_active_learning(max_al_iters: int | None = None):
             )
 
         # ---------------------------------------------------------------------
-        # 4. 训练边界分类器
-        # ---------------------------------------------------------------------
-        boundary_model = train_boundary_classifier(X_pool_norm, W_pool.astype(int))
-        if boundary_model is None:
-            print("  [边界分类器] 当前类别不足，跳过。")
-        else:
-            print("  [边界分类器] 已训练。")
-
-        # ---------------------------------------------------------------------
-        # 4.5 训练不含 nBl 的几何可生成性分类器（仅使用已确认的 DOE/AL 失败）
+        # 4. 训练不含 nBl 的几何可生成性分类器（仅使用已确认的 DOE/AL 失败）
         # ---------------------------------------------------------------------
         X_geom_warn, y_geom_warn = build_geometry_classifier_dataset(
             X_pool,
@@ -2854,11 +3621,16 @@ def main_multiobjective_active_learning(max_al_iters: int | None = None):
             scaler_Y=scaler_Y,
             X_pool_raw=X_pool,
             Y_pool_raw=Y_pool,
-            cfg=CFG
+            cfg=CFG,
+            cancel_event=cancel_event,
         )
 
+        _raise_if_cancelled(cancel_event)
+        np.random.seed(optimization_seed)
+        torch.manual_seed(optimization_seed)
         algorithm = NSGA2(pop_size=CFG.pop_size, eliminate_duplicates=True)
-        res = minimize(problem, algorithm, ('n_gen', CFG.n_gen), verbose=False)
+        res = minimize(problem, algorithm, ('n_gen', CFG.n_gen), seed=optimization_seed, verbose=False)
+        _raise_if_cancelled(cancel_event)
 
         pareto_X = None
         pareto_Y = None
@@ -2873,7 +3645,8 @@ def main_multiobjective_active_learning(max_al_iters: int | None = None):
                 scaler_X=scaler_X,
                 scaler_Y=scaler_Y,
                 ref_eff=TRUE_HV_REF_EFF,
-                ref_pr=TRUE_HV_REF_PR
+                ref_pr=TRUE_HV_REF_PR,
+                cancel_event=cancel_event,
             )
             if pareto_X is not None and len(pareto_X) > 0:
                 print(f"  [辅指标] surrogate HV = {surrogate_hv_val:.6f}")
@@ -2894,7 +3667,11 @@ def main_multiobjective_active_learning(max_al_iters: int | None = None):
             current_pareto_X=true_front_X,
             ref_eff=TRUE_HV_REF_EFF,
             ref_pr=TRUE_HV_REF_PR,
-            cfg=CFG
+            cfg=CFG,
+            surrogate_pareto_X=pareto_X,
+            model_reliability=model_reliability,
+            cancel_event=cancel_event,
+            Y_pool_raw=Y_pool,
         )
 
         # ---------------------------------------------------------------------
@@ -2909,24 +3686,49 @@ def main_multiobjective_active_learning(max_al_iters: int | None = None):
             X_failed_raw=failed_points,
             n_pick=CFG.n_eval_candidates_per_iter,
             min_dist_norm=CFG.diversity_min_dist,
-            n_ehvi=2,
+            n_ehvi=adaptive_ehvi_quota,
+            model_reliability=model_reliability,
+            min_meaningful_ehvi=CFG.min_meaningful_ehvi,
+            reserve_coverage=CFG.reserve_global_coverage_point,
+            coverage_preferred_nbl=CFG.coverage_preferred_nbl,
+            coverage_iteration=al_iter + 1,
+            coverage_safe_flow_probability_min=CFG.coverage_safe_flow_probability_min,
+            coverage_safe_flow_lcb_g_s=CFG.coverage_safe_flow_lcb_g_s,
+            coverage_boundary_flow_probability_min=CFG.coverage_boundary_flow_probability_min,
+            coverage_boundary_flow_probability_max=CFG.coverage_boundary_flow_probability_max,
+            coverage_solver_safe_probability_min=CFG.coverage_solver_safe_probability_min,
+            coverage_geometry_safe_probability_min=CFG.coverage_geometry_safe_probability_min,
+            coverage_flow_target_scale_g_s=CFG.coverage_flow_target_scale_g_s,
+            coverage_boundary_cycle=CFG.coverage_boundary_cycle,
+            coverage_boundary_cycle_slots=CFG.coverage_boundary_cycle_slots,
+            coverage_boundary_max_train_distance_norm=CFG.coverage_boundary_max_train_distance_norm,
         )
-        print("  [选点配额] " + " | ".join(labels))
+        if labels:
+            print("  [自适应选点] " + " | ".join(labels))
+        else:
+            print("  [自适应选点] 没有满足实际意义阈值和安全条件的候选点，本轮不强行补点。")
 
         if candidates_X:
             selected_array = np.asarray(candidates_X, dtype=float)
-            selected_norm = scaler_X.transform(selected_array)
-            pre_cfd_mean, pre_cfd_std_norm = mc_dropout_predict(
-                reg_model,
-                selected_norm,
-                scaler_Y,
-                n_samples=CFG.mc_samples,
-            )
+            selected_indices = []
+            for selected_point in selected_array:
+                matched = np.where(
+                    np.all(
+                        np.isclose(acq_X, selected_point, rtol=0.0, atol=1e-12),
+                        axis=1,
+                    )
+                )[0]
+                if len(matched) == 0:
+                    raise RuntimeError("Selected point is missing from the acquisition pool.")
+                selected_indices.append(int(matched[0]))
+            pre_cfd_mean = np.asarray(acq_info["pred_mean"])[selected_indices]
+            pre_cfd_std_norm = np.asarray(acq_info["pred_std_norm"])[selected_indices]
             pre_cfd_std_real = normalized_std_to_real(
                 pre_cfd_std_norm,
                 scaler_Y,
             )
         else:
+            selected_indices = []
             pre_cfd_mean = np.empty((0, len(SURROGATE_OUTPUT_NAMES)))
             pre_cfd_std_norm = np.empty_like(pre_cfd_mean)
             pre_cfd_std_real = np.empty_like(pre_cfd_mean)
@@ -2935,6 +3737,7 @@ def main_multiobjective_active_learning(max_al_iters: int | None = None):
         # 8. CFD 闭环更新
         # ---------------------------------------------------------------------
         for i, (x_cand, label) in enumerate(zip(candidates_X, labels)):
+            _raise_if_cancelled(cancel_event)
             next_attempt = total_attempts + 1
             run_id = (
                 f"AL_Iter{al_iter+1:02d}_P{i+1}_A{next_attempt:05d}"
@@ -2942,11 +3745,11 @@ def main_multiobjective_active_learning(max_al_iters: int | None = None):
             print(f"\n  -> [候选 {i+1}/{len(candidates_X)}] {label}")
             total_attempts = next_attempt
 
-            matched = np.where(
-                np.all(np.isclose(acq_X, x_cand, rtol=0.0, atol=1e-12), axis=1)
-            )[0]
-            acq_idx = int(matched[0]) if len(matched) > 0 else None
+            acq_idx = selected_indices[i]
             query_record = {
+                "stage_id": stage["stage_id"], "seed": optimization_seed,
+                "model_sha256": digest(BEST_REG_PATH),
+                "result_valid": False,
                 "run_id": run_id,
                 "iter": int(al_iter + 1),
                 "candidate_slot": int(i + 1),
@@ -2970,6 +3773,17 @@ def main_multiobjective_active_learning(max_al_iters: int | None = None):
                     if acq_idx is not None and "p_geom_safe" in acq_info
                     else np.nan
                 ),
+                "pred_flow_feasible_probability": float(
+                    acq_info["flow_feasible_probability"][acq_idx]
+                ),
+                "mc_sample_count": int(acq_info["mc_sample_count"]),
+                "acquisition_policy_version": 4,
+                "ehvi_estimator": "joint_mc_flow_constrained",
+                "pred_flow_p10": float(acq_info["flow_lower_confidence_bound"][acq_idx]),
+                "flow_p10_is_calibrated": False,
+                "model_reliability": model_reliability,
+                "model_reliability_score": reliability_score,
+                "candidate_source": str(acq_info["candidate_source"][acq_idx]),
                 "pred_eff": float(pre_cfd_mean[i, 0]),
                 "pred_pr": float(pre_cfd_mean[i, 1]),
                 "pred_mf": float(pre_cfd_mean[i, 2]),
@@ -2998,10 +3812,41 @@ def main_multiobjective_active_learning(max_al_iters: int | None = None):
             evaluation_attempts = 0
             for evaluation_attempt in range(1, 3):
                 evaluation_attempts = evaluation_attempt
-                success, true_y, geometry_summary, failure_info = run_single_cfd(
-                    x_cand,
-                    run_id,
-                )
+                try:
+                    success, true_y, geometry_summary, failure_info = run_single_cfd(
+                        x_cand,
+                        run_id,
+                        cancel_event=cancel_event,
+                    )
+                except ActiveLearningCancelled:
+                    query_record.update({
+                        "status": "canceled",
+                        "completed_at_utc": utc_timestamp(),
+                        "evaluation_attempts": int(evaluation_attempts),
+                        "failure_stage": "",
+                        "failure_reason": "Canceled by user; not used as a failure label.",
+                    })
+                    upsert_csv_records(
+                        AL_QUERY_VALIDATION_CSV,
+                        query_record,
+                        key_columns=["run_id"],
+                    )
+                    save_checkpoint(
+                        al_iter=al_iter,
+                        X_pool=X_pool,
+                        Y_pool=Y_pool,
+                        W_pool=W_pool,
+                        X_test_fixed=X_test_fixed,
+                        Y_test_fixed=Y_test_fixed,
+                        W_test_fixed=W_test_fixed,
+                        failed_points=failed_points,
+                        hv_history=hv_history,
+                        total_attempts=total_attempts,
+                        total_success=total_success,
+                        completed_iters=al_iter,
+                        in_progress_iter=al_iter + 1,
+                    )
+                    raise
                 if success:
                     record_run_outcome(
                         FAILURE_RECORDS_CSV,
@@ -3022,6 +3867,8 @@ def main_multiobjective_active_learning(max_al_iters: int | None = None):
                     failure_stage=(failure_info or {}).get("stage", "infrastructure"),
                     reason=(failure_info or {}).get("reason", ""),
                 )
+                if (failure_info or {}).get("stage") == "residual_unconverged":
+                    break  # bounded convergence budget already exhausted; do not regenerate/retry
                 if bool(failure_record.get("confirmed")):
                     break
                 if evaluation_attempt < 2:
@@ -3045,6 +3892,7 @@ def main_multiobjective_active_learning(max_al_iters: int | None = None):
                 true_surr = np.asarray(true_y, dtype=float)[SURROGATE_OUTPUT_IDX]
                 query_record.update({
                     "status": "success",
+                    "result_valid": True,
                     "completed_at_utc": utc_timestamp(),
                     "true_eff": float(true_surr[0]),
                     "true_pr": float(true_surr[1]),
@@ -3134,13 +3982,31 @@ def main_multiobjective_active_learning(max_al_iters: int | None = None):
             ref_eff=TRUE_HV_REF_EFF,
             ref_pr=TRUE_HV_REF_PR
         )
+        post_hv_review_state = assess_hv_stagnation(
+            hv_history
+            + [{"iter": al_iter + 1, "true_hv": true_hv_val}],
+            CFG,
+        )
         hv_history.append({
+            "stage_id": stage["stage_id"], "seed": optimization_seed,
+            "model_sha256": digest(BEST_REG_PATH),
+            "pool_digest": data_digest(pd.DataFrame(np.column_stack([X_pool, Y_pool[:, SURROGATE_OUTPUT_IDX]]), columns=VAR_NAMES+SURROGATE_OUTPUT_NAMES), VAR_NAMES, SURROGATE_OUTPUT_NAMES),
             "iter": al_iter + 1,
             "hv_policy_version": HV_POLICY_VERSION,
             "n_samples": len(X_pool),
+            "attempted_queries": total_attempts, "accepted_al_queries": total_success,
             "train_samples_before_cfd": validation_row["train_pool_samples_before_cfd"],
             "true_hv": true_hv_val,
             "surrogate_hv": surrogate_hv_val,
+            "rolling_true_hv_gain": post_hv_review_state[
+                "rolling_true_hv_gain"
+            ],
+            "hv_stagnation_triggered": post_hv_review_state[
+                "hv_stagnation_triggered"
+            ],
+            "hv_stagnation_action": post_hv_review_state[
+                "hv_stagnation_action"
+            ],
             "mse_eff": mse_eff,
             "mse_pr": mse_pr,
             "mse_mf": mse_mf,
@@ -3159,6 +4025,18 @@ def main_multiobjective_active_learning(max_al_iters: int | None = None):
             "cv_r2_eff_mean": cv_summary.get("cv_mean_r2_eff", np.nan),
             "cv_r2_pr_mean": cv_summary.get("cv_mean_r2_pr", np.nan),
             "cv_r2_mf_mean": cv_summary.get("cv_mean_r2_mf", np.nan),
+            "local_online_samples": local_metrics.get(
+                "local_online_samples", 0
+            ),
+            "local_online_max_nrmse": local_metrics.get(
+                "local_online_max_nrmse", np.nan
+            ),
+            "local_online_max_abs_bias_norm": local_metrics.get(
+                "local_online_max_abs_bias_norm", np.nan
+            ),
+            "local_flow_brier": local_metrics.get("local_flow_brier", np.nan),
+            "local_flow_ece": local_metrics.get("local_flow_ece", np.nan),
+            "local_reliability": model_reliability,
         })
         save_checkpoint(
             al_iter=al_iter,
@@ -3187,6 +4065,7 @@ def main_multiobjective_active_learning(max_al_iters: int | None = None):
     # =========================================================================
     # 收尾：HV 历史
     # =========================================================================
+    _raise_if_cancelled(cancel_event)
     hv_df = write_hv_history(HV_CSV_PATH, hv_history)
     
     print(f"\n[完成] HV 历史已保存: {HV_CSV_PATH}")
@@ -3238,6 +4117,34 @@ def main_multiobjective_active_learning(max_al_iters: int | None = None):
         f"最终成功样本: {len(X_pool)} | "
         f"失败样本累计: {len(failed_points)}"
     )
+    final_hv_review_state = assess_hv_stagnation(hv_history, CFG)
+    final_hv_row = hv_history[-1] if hv_history else {}
+    return {
+        "completed_iters": int(get_resume_iter()),
+        "target_iters": int(effective_max_al_iters),
+        "stopped_early": bool(stopped_early),
+        "stop_reason": stop_reason,
+        "rolling_true_hv_gain": final_hv_review_state.get(
+            "rolling_true_hv_gain", np.nan
+        ),
+        "hv_stagnation_triggered": final_hv_review_state.get(
+            "hv_stagnation_triggered", False
+        ),
+        "hv_stagnation_window": int(CFG.hv_stagnation_window),
+        "min_true_hv_gain": float(CFG.min_true_hv_gain),
+        "hv_stagnation_action": str(CFG.hv_stagnation_action),
+        "model_reliability": str(
+            final_hv_row.get("local_reliability", "unknown")
+        ),
+        "local_online_max_nrmse": final_hv_row.get(
+            "local_online_max_nrmse", np.nan
+        ),
+        "local_online_max_abs_bias_norm": final_hv_row.get(
+            "local_online_max_abs_bias_norm", np.nan
+        ),
+        "local_flow_brier": final_hv_row.get("local_flow_brier", np.nan),
+        "local_flow_ece": final_hv_row.get("local_flow_ece", np.nan),
+    }
 
 
 if __name__ == "__main__":

@@ -71,14 +71,17 @@ class SobolService:
             raise ImportError("SALib is required for Sobol analysis. Please install it first.")
 
     def load_model_and_scalers(self, model_path: Path, scaler_x_path: Path, scaler_y_path: Path):
-        model = PerformanceSurrogate(input_dim=len(self.var_names), output_dim=len(self.output_names))
-        
         if not model_path.exists():
             raise FileNotFoundError(f"Model weights not found at {model_path}")
         if not scaler_x_path.exists() or not scaler_y_path.exists():
             raise FileNotFoundError("Scalers not found.")
 
-        model.load_state_dict(torch.load(model_path, map_location="cpu"))
+        state = torch.load(model_path, map_location="cpu")
+        input_dim = int(state["net.0.weight"].shape[1])
+        model = PerformanceSurrogate(
+            input_dim=input_dim, output_dim=len(self.output_names)
+        )
+        model.load_state_dict(state)
         model.eval()
         scaler_x = joblib.load(scaler_x_path)
         scaler_y = joblib.load(scaler_y_path)

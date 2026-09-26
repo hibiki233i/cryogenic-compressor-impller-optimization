@@ -2,16 +2,151 @@ import subprocess
 import os
 import glob
 import json
+import re
 import threading
 import time
 import signal
-import psutil 
+import psutil
+import uuid
+from pathlib import Path
+from cfx_convergence import (inspect_out, latest_pair, restart_ccl, atomic_json, digest, reject_result, legacy_restart_budget)
+
+from dataclasses import dataclass
 
 CREATE_NO_WINDOW = 0x08000000 if os.name == 'nt' else 0
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_TEMPLATE_CSE = os.path.join(PROJECT_DIR, "cfx_post", "Extract_Results.cse")
 RESULT_SCHEMA_VERSION = 2
 RESULT_METADATA_FILENAME = "CFX_Results.meta.json"
+
+
+@dataclass(frozen=True)
+class BoundaryBlockageStatus:
+    iteration: int
+    inlet_faces_pct: float | None
+    inlet_area_pct: float | None
+    outlet_faces_pct: float | None
+    outlet_area_pct: float | None
+
+    @property
+    def inlet_is_100_percent(self) -> bool:
+        return self.inlet_faces_pct == 100.0 and self.inlet_area_pct == 100.0
+
+    @property
+    def outlet_is_100_percent(self) -> bool:
+        return self.outlet_faces_pct == 100.0 and self.outlet_area_pct == 100.0
+
+    @property
+    def both_are_100_percent(self) -> bool:
+        return self.inlet_is_100_percent and self.outlet_is_100_percent
+
+
+class CfxBlockageParser:
+    """Incrementally pair boundary warnings with ratios inside one iteration.
+
+    A ratio is accepted only when it follows the INLET/OUTLET warning in the
+    same warning block.  An alarm status is produced only after both boundaries
+    have an explicit faces-and-area ratio for the same solver iteration.
+    """
+
+    ITERATION_RE = re.compile(
+        r"^[^A-Za-z0-9]*(?:OUTER\s+LOOP\s+ITERATION|ITERATION)"
+        r"\s*(?:=|:)?\s*(\d+)\b",
+        re.IGNORECASE,
+    )
+    BOUNDARY_RE = re.compile(
+        r"wall\s+has\s+been\s+placed\s+at\s+portion\(s\)\s+of\s+an\s+"
+        r"(INLET|OUTLET)\b",
+        re.IGNORECASE,
+    )
+    RATIO_RE = re.compile(
+        r"([0-9]+(?:\.[0-9]+)?)%\s+of\s+the\s+faces\s*,\s*"
+        r"([0-9]+(?:\.[0-9]+)?)%\s+of\s+the\s+area",
+        re.IGNORECASE,
+    )
+    WARNING_START_RE = re.compile(r"\bWARNING\s*#", re.IGNORECASE)
+
+    def __init__(self):
+        self._carry = ""
+        self._iteration: int | None = None
+        self._ratios: dict[str, tuple[float, float]] = {}
+        self._block_boundary: str | None = None
+        self._emitted = False
+
+    def feed(self, text: str) -> list[BoundaryBlockageStatus]:
+        combined = self._carry + str(text or "")
+        raw_lines = combined.splitlines(keepends=True)
+        self._carry = ""
+        if raw_lines and not raw_lines[-1].endswith(("\n", "\r")):
+            self._carry = raw_lines.pop()
+
+        statuses: list[BoundaryBlockageStatus] = []
+        for raw_line in raw_lines:
+            line = raw_line.rstrip("\r\n")
+            iteration_match = self.ITERATION_RE.search(line)
+            if iteration_match:
+                next_iteration = int(iteration_match.group(1))
+                if self._iteration != next_iteration:
+                    prior = self._status_if_observed()
+                    if prior is not None and not self._emitted:
+                        statuses.append(prior)
+                    self._iteration = next_iteration
+                    self._ratios = {}
+                    self._block_boundary = None
+                    self._emitted = False
+
+            # A new warning header closes the previous boundary message block.
+            # Ratios in this new block must not be attached to the old INLET or
+            # OUTLET marker.
+            if self._block_boundary is not None and self.WARNING_START_RE.search(line):
+                self._block_boundary = None
+
+            boundary_match = self.BOUNDARY_RE.search(line)
+            if boundary_match:
+                self._block_boundary = boundary_match.group(1).lower()
+
+            ratio_match = self.RATIO_RE.search(line)
+            if ratio_match and self._block_boundary is not None:
+                self._ratios[self._block_boundary] = (
+                    float(ratio_match.group(1)),
+                    float(ratio_match.group(2)),
+                )
+                self._block_boundary = None
+                if {"inlet", "outlet"}.issubset(self._ratios) and not self._emitted:
+                    status = self._status_if_observed()
+                    if status is not None:
+                        statuses.append(status)
+                        self._emitted = True
+        return statuses
+
+    def _status_if_observed(self) -> BoundaryBlockageStatus | None:
+        if self._iteration is None or not self._ratios:
+            return None
+        inlet = self._ratios.get("inlet", (None, None))
+        outlet = self._ratios.get("outlet", (None, None))
+        return BoundaryBlockageStatus(
+            iteration=self._iteration,
+            inlet_faces_pct=inlet[0],
+            inlet_area_pct=inlet[1],
+            outlet_faces_pct=outlet[0],
+            outlet_area_pct=outlet[1],
+        )
+
+
+def read_new_log_content(path, offset: int) -> tuple[str, int]:
+    """Read bytes appended after ``offset`` and return the new byte position."""
+    if not path or not os.path.exists(path):
+        return "", int(offset)
+    current_size = os.path.getsize(path)
+    start = int(offset)
+    if current_size < start:
+        start = 0
+    if current_size == start:
+        return "", start
+    with open(path, "rb") as stream:
+        stream.seek(start)
+        payload = stream.read(current_size - start)
+    return payload.decode("utf-8", errors="ignore"), current_size
 
 
 def solver_exit_failure_message(out_file, exit_code):
@@ -42,8 +177,8 @@ def _result_metadata_path(result_txt):
     return os.path.join(os.path.dirname(os.path.abspath(result_txt)), RESULT_METADATA_FILENAME)
 
 
-def is_current_cfx_result(result_txt):
-    """Return True only for stationary-frame total-pressure-ratio results."""
+def is_current_cfx_result(result_txt, residual_threshold=1e-4):
+    """Accept current pressure definition only with final converged OUT/RES evidence."""
     if not os.path.exists(result_txt):
         return False
     metadata_path = _result_metadata_path(result_txt)
@@ -54,6 +189,20 @@ def is_current_cfx_result(result_txt):
             metadata = json.load(f)
     except (OSError, ValueError, TypeError):
         return False
+    root = Path(result_txt).parent
+    if (root / "CFX_INVALID.json").exists() or (root / "DOE_INVALID.json").exists():
+        return False
+    out, res = latest_pair(root)
+    if out is None or res is None:
+        return False
+    evidence = inspect_out(out, residual_threshold)
+    if not evidence["accepted"] or max(out.stat().st_mtime_ns, res.stat().st_mtime_ns) > Path(result_txt).stat().st_mtime_ns:
+        return False
+    proof = metadata.get("convergence", {})
+    if proof and (proof.get("out_sha256") != digest(out) or proof.get("res_name") != res.name
+                  or proof.get("res_size") != res.stat().st_size
+                  or proof.get("res_mtime_ns") != res.stat().st_mtime_ns):
+        return False
     return (
         int(metadata.get("schema_version", 0)) == RESULT_SCHEMA_VERSION
         and metadata.get("total_pressure_frame") == "stationary"
@@ -61,13 +210,15 @@ def is_current_cfx_result(result_txt):
     )
 
 
-def _write_result_metadata(result_txt):
+def _write_result_metadata(result_txt, convergence=None):
     metadata = {
         "schema_version": RESULT_SCHEMA_VERSION,
         "total_pressure_frame": "stationary",
         "total_pressure_averaging": "massFlowAve",
         "total_pressure_ratio": "outlet_total_pressure / inlet_total_pressure",
     }
+    if convergence is not None:
+        metadata["convergence"] = convergence
     with open(_result_metadata_path(result_txt), "w", encoding="utf-8") as f:
         json.dump(metadata, f, ensure_ascii=False, indent=2)
 
@@ -114,6 +265,207 @@ def _run_cancellable_process(cmd, cwd, cancel_event=None, stdout=subprocess.DEVN
     return int(proc.returncode or 0)
 
 
+class _SolverProcesses:
+    """Retain process identities across reparenting; scope detached CFX to this run."""
+
+    NAMES = {'solver-mpi.exe', 'cfx5solve.exe', 'cfx5control.exe',
+             'solver.exe', 'solver-mpi', 'cfx5solve', 'cfx5control'}
+
+    def __init__(self, pid, working_dir, started):
+        self.pid = pid
+        self.directory = Path(working_dir).resolve()
+        self.started = started
+        self.known = {}
+
+    def refresh(self):
+        candidates = []
+        # Keep Process objects: psutil verifies creation time before kill(),
+        # preventing a recycled PID from targeting an unrelated process.
+        roots = list(self.known.values())
+        if not roots:
+            try:
+                roots = [psutil.Process(self.pid)]
+            except psutil.NoSuchProcess:
+                pass
+        for root in roots:
+            try:
+                if root.is_running():
+                    candidates.extend([root, *root.children(recursive=True)])
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+        for proc in psutil.process_iter(['name', 'create_time']):
+            try:
+                if ((proc.info.get('name') or '').lower() in self.NAMES
+                        and proc.info.get('create_time', 0) >= self.started
+                        and Path(proc.cwd()).resolve().is_relative_to(self.directory)):
+                    candidates.extend([proc, *proc.children(recursive=True)])
+            except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+                continue
+        for proc in candidates:
+            try:
+                self.known[(proc.pid, proc.create_time())] = proc
+            except psutil.NoSuchProcess:
+                pass
+
+    def stop(self, reason):
+        print(f'[CFX] {reason}，正在终止本次求解进程 (launcher PID={self.pid})', flush=True)
+        alive = []
+        for _ in range(3):
+            self.refresh()
+            targets = list(self.known.values())
+            for proc in reversed(targets):
+                try:
+                    if proc.is_running():
+                        print(f'[CFX] 终止 PID={proc.pid}', flush=True)
+                        proc.kill()
+                except psutil.NoSuchProcess:
+                    pass
+                except psutil.AccessDenied:
+                    print(f'[CFX] 无权终止 PID={proc.pid}', flush=True)
+            _, alive = psutil.wait_procs(targets, timeout=3)
+            if not alive:
+                print('[CFX] 本次求解进程已确认退出', flush=True)
+                return
+        raise RuntimeError(f'CFX process cleanup failed; surviving PIDs: {[p.pid for p in alive]}')
+
+
+def _run_monitored_solver(cmd, working_dir, out_file, cancel_event=None):
+    """Monitor this invocation only; never kill other runs by executable name."""
+    started = time.time()
+    proc = subprocess.Popen(cmd, cwd=working_dir, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL, creationflags=CREATE_NO_WINDOW)
+    processes = _SolverProcesses(proc.pid, working_dir, started)
+    parser = CfxBlockageParser()
+    offset = 0
+    consecutive = {'inlet': 0, 'outlet': 0}
+    previous = None
+    stopped = False
+    try:
+        while True:
+            processes.refresh()
+            if _is_cancelled(cancel_event):
+                stopped = True
+                processes.stop('收到取消请求')
+                return False, "canceled"
+            content, offset = read_new_log_content(out_file, offset)
+            blocked = False
+            for status in parser.feed(content):
+                if previous is None or status.iteration != previous + 1:
+                    consecutive = {'inlet': 0, 'outlet': 0}
+                for side in consecutive:
+                    consecutive[side] = (consecutive[side] + 1
+                        if getattr(status, f'{side}_is_100_percent') else 0)
+                previous = status.iteration
+                blocked = blocked or max(consecutive.values()) >= 3
+            # Include the last complete warning even before the next iteration begins.
+            if blocked or (Path(out_file).exists() and inspect_out(out_file)["blocked"]):
+                stopped = True
+                processes.stop('进出口任一边界连续三次迭代 100% wall')
+                return False, "进出口任一边界持续100%堵塞 (blockage)"
+            code = proc.poll()
+            if code is not None:
+                if code != 0:
+                    return False, solver_exit_failure_message(out_file, code)
+                return True, "Success"
+            time.sleep(5)
+    except Exception:
+        if not stopped:
+            processes.stop('求解监控异常')
+        raise
+
+
+def _solve_to_convergence(working_dir, initial_def, ccl_file, solver, cores,
+                          residual_threshold, max_extra_iterations, restart_chunk, cancel_event=None):
+    root = Path(working_dir)
+    state_path = root / "cfx_convergence_state.json"
+    state = json.loads(state_path.read_text(encoding="utf-8")) if state_path.exists() else legacy_restart_budget(root)
+    latest_out, latest_res = latest_pair(root)
+    for name in ('DOE_INVALID.json','CFX_INVALID.json'):
+        marker = root/name
+        if not marker.exists():
+            continue
+        invalid = json.loads(marker.read_text(encoding='utf-8'))
+        superseded = (latest_out is not None and latest_res is not None
+                      and latest_out.stat().st_mtime_ns > marker.stat().st_mtime_ns
+                      and inspect_out(latest_out,residual_threshold)['accepted'])
+        if not superseded:
+            reason = str(invalid.get('reason',''))
+            if '100_percent_wall' in reason or 'blockage' in reason:
+                return None, None, 'Previously confirmed 100%堵塞 (blockage); a new successful rerun is required'
+            if 'residual_unconverged' in reason:
+                return None, None, reason
+    if state.get("pending") and latest_out is not None and latest_res is not None and inspect_out(latest_out,residual_threshold)["accepted"]:
+        state.pop("pending")
+        atomic_json(state_path,state)
+    if state.get("pending"):
+        pending = root / state["pending"]
+        if not pending.exists() or not pending.with_suffix('.res').exists() or not inspect_out(pending)["finished"]:
+            return None, None, "CFX convergence restart interrupted; pending attempt requires review (budget retained)"
+        state.pop("pending")
+        atomic_json(state_path, state)
+    out, res = latest_pair(root)
+    if out is None:
+        if list(root.glob('*.res')):
+            return None, None, "CFX residual_unavailable: RES exists without matching OUT"
+        name = "CFX_initial_" + uuid.uuid4().hex[:12]
+        out = root / (name + '.out')
+        cmd = [solver, '-def', str(initial_def), '-ccl', str(ccl_file), '-fullname', name,
+               '-double', '-par-local', '-part', str(cores), '-batch']
+        ok, message = _run_monitored_solver(cmd, str(root), str(out), cancel_event)
+        if not ok:
+            if 'blockage' in message:
+                reject_result(root, message, {'out':str(out)})
+            return None, None, message
+        res = out.with_suffix('.res')
+    while True:
+        if _is_cancelled(cancel_event):
+            return None, None, "canceled"
+        if out is None or res is None or not out.exists() or not res.exists():
+            return None, None, "CFX residual_unavailable: latest OUT has no matching RES"
+        evidence = inspect_out(out, residual_threshold)
+        state['latest_evidence'] = evidence
+        atomic_json(state_path, state)
+        if evidence['blocked']:
+            message = '进出口任一边界持续100%堵塞 (blockage)'
+            reject_result(root, message, evidence)
+            return None, None, message
+        if evidence['fatal']:
+            return None, None, solver_exit_failure_message(str(out), 1)
+        if not evidence['complete'] or not evidence['finished']:
+            return None, None, 'CFX residual_unavailable: incomplete final RMS table or unfinished solver'
+        if evidence['accepted']:
+            evidence.update(out_sha256=digest(out), res_name=res.name,
+                            res_size=res.stat().st_size,res_mtime_ns=res.stat().st_mtime_ns,
+                            extra_iterations_reserved=state['extra_iterations_reserved'],policy_version=1)
+            return str(res), evidence, 'Success'
+        remaining = max_extra_iterations - state['extra_iterations_reserved']
+        if remaining <= 0:
+            message = f"CFX residual_unconverged: extra iteration budget {max_extra_iterations} exhausted; point discarded"
+            reject_result(root, message, evidence)
+            return None, None, message
+        count = min(restart_chunk, remaining)
+        name = 'CFX_resume_' + uuid.uuid4().hex[:12]
+        next_out = root / (name + '.out')
+        override = root / (name + '.ccl')
+        override.write_text(restart_ccl(out, count, residual_threshold), encoding='utf-8')
+        # Reserve before launching so cancellation/recovery cannot grant another 1500.
+        state['extra_iterations_reserved'] += count
+        state['attempts'].append({'source_res':res.name,'out':next_out.name,'iterations':count})
+        state['pending'] = next_out.name
+        atomic_json(state_path, state)
+        print(f"[CFX] RMS max={evidence['max_rms']:.3g}; restart from {res.name}, +{count} iterations")
+        cmd = [solver, '-def', str(res), '-ccl', str(override), '-fullname', name,
+               '-double', '-par-local', '-part', str(cores), '-batch']
+        ok, message = _run_monitored_solver(cmd, str(root), str(next_out), cancel_event)
+        if not ok:
+            if 'blockage' in message:
+                reject_result(root, message, {'out':str(next_out)})
+            return None, None, message
+        state.pop('pending', None)
+        atomic_json(state_path, state)
+        out, res = next_out, next_out.with_suffix('.res')
+
+
 def run_cfx_pipeline(
     working_dir,
     run_id,
@@ -124,6 +476,9 @@ def run_cfx_pipeline(
     template_cfx=None,
     template_cse=None,
     cancel_event=None,
+    residual_threshold=1e-4,
+    max_extra_iterations=1500,
+    restart_chunk=500,
 ):
     """
     完整的 CFX 自动化流水线：网格替换 -> 求解 -> 结果提取
@@ -145,7 +500,11 @@ def run_cfx_pipeline(
     # 0-A. 若结果文件已存在，则直接读取返回
     # 与 DOE.py 中的已完成检测配合，避免重复求解。
     # =============================================================================
-    if is_current_cfx_result(output_txt):
+    if not (0 < residual_threshold < 1) or not (0 <= max_extra_iterations <= 1500) or restart_chunk <= 0:
+        raise ValueError("Invalid CFX convergence policy")
+    if _is_cancelled(cancel_event):
+        return False, None, "canceled"
+    if is_current_cfx_result(output_txt, residual_threshold):
         try:
             with open(output_txt, 'r') as f:
                 data = f.read().strip().split(',')
@@ -186,23 +545,11 @@ END
     
     # ==========================================
     # 0-C. 断点续算：检查是否已有 .res 求解结果
-    #      注意：只有在 output_txt 不存在时才会走到这里，
-    #      因此 existing_res 代表"求解完成但 Post 未提取"的状态。
+    #      已有 RES 必须与最新 OUT 同名，并通过残差验收后才进入 Post。
+    #      不达标时从 RES 续算，不依赖已清理的 DEF。
     # ==========================================
-    existing_res = sorted(
-        glob.glob(os.path.join(working_dir, "*.res")),
-        key=os.path.getmtime
-    )
- 
-    if existing_res:
-        # .res 存在 + output_txt 不存在 → 求解已完成，仅需重跑 Post
-        res_file = existing_res[-1].replace("\\", "/")
-        print(f"[{run_id}] 发现已有 .res 文件 {os.path.basename(res_file)}，"
-              f"跳过求解，直接进入后处理。")
-    else:
-        # ==========================================
-        # 1. CFX-Pre：动态生成脚本并替换网格
-        # ==========================================
+    existing_out, existing_res = latest_pair(working_dir)
+    if existing_out is None and not glob.glob(os.path.join(working_dir, '*.res')):
         print(f"[{run_id}] 正在合成物理边界条件 (CFX-Pre)...")
         pre_content = f"""
 COMMAND FILE:
@@ -234,187 +581,23 @@ write def file
         if not os.path.exists(def_file):
             return False, None, "CFX-Pre 运行结束但未找到 .def 文件"
 
-        # ==========================================
-        # 2. CFX-Solve：调用求解器
-        # ==========================================
-        print(f"[{run_id}] 正在运行 CFX 求解器...")
-        solve_cmd = [
-            cfx5solve_exe,
-            "-def",      def_file,
-            "-ccl",      ccl_file,
-            "-double",
-            "-par-local",
-            "-part",     str(cores),
-            "-batch"
-        ]
 
-
-    # 找到 .out 文件路径（CFX 自动生成，名称与 def 文件一致）
-        def_basename = os.path.splitext(os.path.basename(def_file))[0]
-        out_file = os.path.join(working_dir, f"{def_basename}_001.out")
-
-        solve_proc = subprocess.Popen(
-            solve_cmd,
-            cwd=working_dir,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            creationflags=CREATE_NO_WINDOW
-    )
-
-        # ── 堵塞监控线程 ──────────────────────────────────────────────
-        blocked_flag = threading.Event()
-        def kill_cfx_tree(pid: int, run_id: str):
-            """
-            先用 psutil 递归收集整棵进程树，
-            再逐个强杀，确保 solver-mpi.exe 等脱离子树的进程也被清理。
-            """
-            killed = []
-            try:
-                root = psutil.Process(pid)
-        # recursive=True 可以拿到所有后代，包括跨 Job Object 的情况
-                children = root.children(recursive=True)
-                targets = children + [root]
-                for p in targets:
-                    try:
-                        print(f"[{run_id}] 正在杀死进程: {p.name()} (PID={p.pid})")
-                        p.kill()
-                        killed.append(p.pid)
-                    except (psutil.NoSuchProcess, psutil.AccessDenied):
-                        pass
-            except psutil.NoSuchProcess:
-                pass
-
-    # 兜底：按进程名强杀，应对 detached 的 solver-mpi.exe
-            for proc_name in ["solver-mpi.exe", "cfx5solve.exe", "cfx5control.exe"]:
-                for p in psutil.process_iter(['name', 'pid']):
-                    if p.info['name'] and p.info['name'].lower() == proc_name.lower():
-                        try:
-                            p.kill()
-                            print(f"[{run_id}] 按名称补杀: {proc_name} (PID={p.pid})")
-                        except (psutil.NoSuchProcess, psutil.AccessDenied):
-                            pass
-
-            return killed   # 触发后主线程知道要终止
-
-        def monitor_out_file():
-            """
-            每30秒检查一次 .out 文件。
-            若连续 CHECK_PATIENCE 次都同时出现 INLET 和 OUTLET 100% 堵塞，
-            则设置 blocked_flag 通知主线程终止求解。
-            """
-            CHECK_INTERVAL  = 30   # 秒，检查间隔
-            CHECK_PATIENCE  = 3    # 连续出现几次才判定为真正堵塞（避免误判启动阶段）
-            WAIT_BEFORE_MON = 120  # 秒，求解开始后等多久才开始监控（避免初始迭代误判）
-
-            inlet_pattern  = "wall has been placed at portion(s) of an INLET"
-            outlet_pattern = "wall has been placed at portion(s) of an OUTLET"
-            block_100      = "100.0% of the faces, 100.0% of the area"
-
-        # 等待求解稳定后再开始监控
-            time.sleep(WAIT_BEFORE_MON)
-
-            consecutive = 0
-            last_size   = 0
-
-            while not blocked_flag.is_set() and solve_proc.poll() is None:
-                time.sleep(CHECK_INTERVAL)
-
-                if not os.path.exists(out_file):
-                   continue
-
-            # 只读取文件新增内容，避免每次全量扫描大文件
-                current_size = os.path.getsize(out_file)
-                if current_size == last_size:
-                   continue
-
-                try:
-                    with open(out_file, 'r', errors='ignore') as f:
-                    # 只读最新的 50KB，避免大文件读取太慢
-                        f.seek(max(0, current_size - 51200))
-                        recent_content = f.read()
-                except Exception:
-                    continue
-
-                last_size = current_size
-
-            # 判断是否同时出现 INLET 和 OUTLET 100% 堵塞
-                has_inlet_block  = (inlet_pattern  in recent_content and
-                                    block_100       in recent_content)
-                has_outlet_block = (outlet_pattern in recent_content and
-                                    block_100       in recent_content)
-
-                if has_inlet_block and has_outlet_block:
-                    consecutive += 1
-                    print(f"[{run_id}] ⚠ 检测到进出口100%堵塞 "
-                        f"（第 {consecutive}/{CHECK_PATIENCE} 次）")
-                    if consecutive >= CHECK_PATIENCE:
-                        print(f"[{run_id}] ✗ 确认持续堵塞，强制终止求解器。")
-                        blocked_flag.set()
-                else:
-                # 堵塞消失，重置计数（求解可能在恢复）
-                    if consecutive > 0:
-                        print(f"[{run_id}] 堵塞消失，重置计数，继续监控...")
-                    consecutive = 0
-
-        monitor_thread = threading.Thread(target=monitor_out_file, daemon=True)
-        monitor_thread.start()
-
-    # ── 主线程等待求解器，同时响应监控信号 ─────────────────────────
-        try:
-            while True:
-                ret = solve_proc.poll()
-
-                if blocked_flag.is_set():
-                    print(f"[{run_id}] 正在强制终止 CFX 进程树...")
-                    kill_cfx_tree(solve_proc.pid, run_id)
-                    time.sleep(3)
-            # 确认 solver-mpi.exe 已经退出
-    
-                    still_alive = [p for p in psutil.process_iter(['name', 'pid'])
-                                   if p.info['name'] and 'solver-mpi' in p.info['name'].lower()]
-                    if still_alive:
-                        print(f"[{run_id}] ⚠ 仍有 {len(still_alive)} 个 solver-mpi 进程残留，正在补杀...")
-                        for p in still_alive:
-                            try:
-                                p.kill()
-                                print(f"[{run_id}] 补杀成功: solver-mpi.exe (PID={p.pid})")
-                            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                                pass
-                    return False, None, "进出口持续100%堵塞，提前终止"
-
-                if _is_cancelled(cancel_event):
-                    print(f"[{run_id}] 收到取消请求，正在终止 CFX 求解器...")
-                    kill_cfx_tree(solve_proc.pid, run_id)
-                    return False, None, "canceled"
-
-                if ret is not None:
-                    break  # 求解器自然退出
-
-                time.sleep(5)
-
-            if solve_proc.returncode != 0:
-                return False, None, solver_exit_failure_message(
-                    out_file,
-                    solve_proc.returncode,
-                )
-
-        # ✅ 修复后
-        except Exception as e:
-            kill_cfx_tree(solve_proc.pid, run_id)
-            return False, None, f"求解器异常: {e}"
-
-        finally:
-            blocked_flag.set()
-            monitor_thread.join(timeout=10)
-
-        new_res = sorted(
-            glob.glob(os.path.join(working_dir, "*.res")),
-            key=os.path.getmtime
-        )
-        if not new_res:
-            return False, None, "求解结束但未生成任何 .res 结果文件"
-        res_file = new_res[-1].replace("\\", "/")
-        print(f"[{run_id}] 求解成功！生成结果文件: {os.path.basename(res_file)}")
+    try:
+        res_file, convergence, message = _solve_to_convergence(
+            working_dir, def_file, ccl_file, cfx5solve_exe, cores,
+            residual_threshold, max_extra_iterations, restart_chunk, cancel_event)
+    except (OSError, ValueError) as exc:
+        return False, None, f"CFX convergence check failed: {exc}"
+    if res_file is None:
+        return False, None, message
+    # A successful Post must create a fresh file; stale values cannot masquerade as success.
+    if os.path.exists(output_txt):
+        archive = Path(working_dir) / 'replaced_results' / uuid.uuid4().hex
+        archive.mkdir(parents=True)
+        Path(output_txt).replace(archive / 'CFX_Results.txt')
+        old_meta = Path(_result_metadata_path(output_txt))
+        if old_meta.exists():
+            old_meta.replace(archive / old_meta.name)
     # ==========================================
     # 3. CFX-Post：运行宏提取数据
     # ==========================================
@@ -450,7 +633,11 @@ write def file
                     'MassFlow': float(data[3]) * n_blades,   # 整机流量 = 单流道 × nBl
                     'totalpressureratio': float(data[4])      # 总压比
                 }
-            _write_result_metadata(output_txt)
+            if not all(__import__('math').isfinite(v) for v in cfx_results.values()):
+                raise ValueError("Nonfinite CFX performance result")
+            _write_result_metadata(output_txt, convergence)
+            (Path(working_dir) / 'CFX_INVALID.json').unlink(missing_ok=True)
+            (Path(working_dir) / 'DOE_INVALID.json').unlink(missing_ok=True)
         
             for f_path in [gtm_file, def_file]:
                 try:

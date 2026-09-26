@@ -47,6 +47,7 @@ from design_variables import (
     variable_names,
     write_performance_data_metadata,
 )
+from surrogate_features import make_categorical_nbl_scaler
 
 try:
     import torch
@@ -532,10 +533,20 @@ def polyline_fraction_point(front: pd.DataFrame, frac: float) -> dict:
     }
 
 
-def make_scalers(df_source: pd.DataFrame) -> tuple[SimpleMinMaxScaler, SimpleMinMaxScaler]:
-    x_scaler = SimpleMinMaxScaler.fit(df_source[VAR_NAMES].to_numpy(dtype=float))
-    y_scaler = SimpleMinMaxScaler.fit(df_source[SURROGATE_OUTPUT_NAMES].to_numpy(dtype=float))
-    return x_scaler, y_scaler
+def make_scalers(
+    df_source: pd.DataFrame,
+    model=None,
+) -> tuple[object, SimpleMinMaxScaler]:
+    # A predictor must use its fitted scalers; fitting on query data changes units.
+    from pathlib import Path
+    from impeller_app.core.artifacts import validate_model_bundle
+    model_path = getattr(model, "impeller_model_path", None)
+    if model_path is None or joblib is None:
+        raise ValueError("Load a published model bundle before constructing prediction scalers")
+    folder = Path(model_path).parent
+    x_path, y_path = folder / "scaler_X.pkl", folder / "scaler_Y.pkl"
+    validate_model_bundle(model_path, x_path, y_path, df_source, VAR_NAMES, SURROGATE_OUTPUT_NAMES)
+    return joblib.load(x_path), joblib.load(y_path)
 
 
 def load_surrogate_model(model_path: str):
@@ -544,9 +555,12 @@ def load_surrogate_model(model_path: str):
     if not os.path.exists(model_path):
         raise FileNotFoundError(f"Model weights not found: {model_path}")
 
-    model = PerformanceSurrogate(input_dim=14, output_dim=3)
     state = torch.load(model_path, map_location="cpu")
+    input_dim = int(state["net.0.weight"].shape[1])
+    model = PerformanceSurrogate(input_dim=input_dim, output_dim=3)
     model.load_state_dict(state)
+    model.impeller_input_dim = input_dim
+    model.impeller_model_path = os.path.abspath(model_path)
     model.eval()
     return model
 
@@ -816,7 +830,7 @@ def main() -> int:
         )
 
     model = load_surrogate_model(args.model_path)
-    scaler_x, scaler_y = make_scalers(df)
+    scaler_x, scaler_y = make_scalers(df, model=model)
     inverse_result = inverse_design_search(
         model=model,
         scaler_x=scaler_x,

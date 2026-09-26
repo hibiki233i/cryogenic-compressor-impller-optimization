@@ -15,7 +15,8 @@ from ..models import TaskResult, TaskUpdate
 from ..runner import RunnerAPI
 
 try:
-    from PySide6.QtCore import QObject, Signal, Qt
+    from PySide6.QtCore import QObject, Signal, Qt, QUrl
+    from PySide6.QtGui import QDesktopServices, QFont, QFontDatabase
     from PySide6.QtWidgets import (
         QApplication,
         QCheckBox,
@@ -28,12 +29,15 @@ try:
         QHBoxLayout,
         QLabel,
         QLineEdit,
+        QListWidget,
         QMainWindow,
         QMessageBox,
         QPushButton,
         QPlainTextEdit,
+        QScrollArea,
         QSpinBox,
-        QTabWidget,
+        QSplitter,
+        QStackedWidget,
         QVBoxLayout,
         QWidget,
     )
@@ -49,6 +53,23 @@ TEXTS = {
         "window_title": f"Cryogenic Centrifugal Compressor Geometry Parameter Optimization {APP_VERSION}",
         "app_title": f"Geometry Parameter Active Learning / NSGA-2 Optimization {APP_VERSION}",
         "log_placeholder": "Task logs and structured updates will appear here...",
+        "log_title": "Task activity",
+        "show_log": "Show activity",
+        "hide_log": "Hide activity",
+        "status_ready": "Ready to run",
+        "status_running": "Task running",
+        "status_stopping": "Stopping task...",
+        "status_done": "Task finished",
+        "status_failed": "Task failed",
+        "app_subtitle": "Configure → Sample → Learn → Explore → Export",
+        "environment_intro": "Set project paths and check external tools before launching a run.",
+        "doe_intro": "Choose a sample count and geometry bounds. Engineering thresholds are available below.",
+        "active_learning_intro": "Train, compare, and continue optimization from the current workspace.",
+        "pareto_intro": "Compute a front, then select a point by index, target, or curve position.",
+        "sobol_intro": "Measure sensitivity at a fixed blade count using the current surrogate.",
+        "export_intro": "Export selected cases to a reviewable directory.",
+        "show_advanced": "Show engineering thresholds",
+        "hide_advanced": "Hide engineering thresholds",
         "language": "Language",
         "language_zh": "Chinese",
         "language_en": "English",
@@ -61,6 +82,7 @@ TEXTS = {
         "tab_pareto": "Pareto",
         "tab_export": "Export",
         "environment_group": "Environment Configuration",
+        "solver_group": "Solver and templates",
         "project_root": "Project Root",
         "powershell": "PowerShell",
         "geometry_script": "Geometry Script",
@@ -85,7 +107,7 @@ TEXTS = {
         "default_boundary_flow_g_s": "Boundary Flow (g/s)",
         "default_min_efficiency": "Minimum Efficiency",
         "default_min_power": "Minimum Power",
-        "optimization_outlet_static_pressure_pa": "NSGA-II Fixed Outlet Static Pressure (Pa)",
+        "optimization_outlet_static_pressure_pa": "DOE / Active Learning Fixed Outlet Static Pressure (Pa)",
         "operating_point_pressure_tolerance_pa": "Observed-Data Pressure Band (Pa)",
         "default_min_d2_d1s_gap": "Minimum d2-d1s Gap",
         "default_max_le_sweep_diff": "Maximum LE Sweep Diff",
@@ -94,7 +116,7 @@ TEXTS = {
         "default_min_rake_te_s_nbl_10": "Minimum rake_te_s (nBl=10)",
         "default_min_rake_te_s_nbl_11": "Minimum rake_te_s (nBl=11)",
         "default_min_rake_te_s_nbl_12": "Minimum rake_te_s (nBl=12)",
-        "variable_ranges_group": "Surrogate Input Ranges (Geometry + Operating Condition)",
+        "variable_ranges_group": "Geometry Variable Ranges",
         "variable_name": "Variable",
         "lower_bound": "Lower",
         "upper_bound": "Upper",
@@ -105,7 +127,7 @@ TEXTS = {
         "al_iters": "Additional Iterations",
         "resume_checkpoint": "Resume Checkpoint",
         "train_surrogate": "Train Surrogate",
-        "run_nsga2_only": "Run NSGA-II from LHS",
+        "run_nsga2_only": "Run DOE-only NSGA-II baseline",
         "run_active_learning": "Run Active Learning",
         "pareto_group": "Pareto Front Query and Inverse Design",
         "geom_safe": "Geom Safe Threshold",
@@ -135,6 +157,23 @@ TEXTS = {
         "window_title": f"低温离心压缩机几何参数优化 {APP_VERSION}",
         "app_title": f"几何参数主动学习/NSGA-2优化 {APP_VERSION}",
         "log_placeholder": "任务日志和结构化更新会显示在这里……",
+        "log_title": "任务动态",
+        "show_log": "展开动态",
+        "hide_log": "收起动态",
+        "status_ready": "等待任务",
+        "status_running": "任务运行中",
+        "status_stopping": "正在停止任务……",
+        "status_done": "任务已完成",
+        "status_failed": "任务失败",
+        "app_subtitle": "配置环境 → DOE 采样 → 主动学习 → 结果分析 → 导出",
+        "environment_intro": "先设置工程路径并校验外部工具，再启动计算任务。",
+        "doe_intro": "设置样本量和几何变量范围；工程阈值可在下方展开。",
+        "active_learning_intro": "在当前工作区训练、对照并继续优化。",
+        "pareto_intro": "计算前沿后，可按索引、目标值或曲线位置选点。",
+        "sobol_intro": "基于当前代理模型，在固定叶片数下分析灵敏度。",
+        "export_intro": "将选定案例导出到便于检查的目录。",
+        "show_advanced": "展开工程阈值",
+        "hide_advanced": "收起工程阈值",
         "language": "语言",
         "language_zh": "中文",
         "language_en": "英文",
@@ -147,6 +186,7 @@ TEXTS = {
         "tab_pareto": "帕累托",
         "tab_export": "导出",
         "environment_group": "环境配置",
+        "solver_group": "求解器与模板",
         "project_root": "项目根目录",
         "powershell": "PowerShell",
         "geometry_script": "几何脚本",
@@ -171,7 +211,7 @@ TEXTS = {
         "default_boundary_flow_g_s": "边界流量阈值 (g/s)",
         "default_min_efficiency": "最低效率",
         "default_min_power": "最低功率",
-        "optimization_outlet_static_pressure_pa": "NSGA-II 固定出口静压 (Pa)",
+        "optimization_outlet_static_pressure_pa": "DOE / 主动学习固定出口静压 (Pa)",
         "operating_point_pressure_tolerance_pa": "观测数据工况压力带宽 (Pa)",
         "default_min_d2_d1s_gap": "最小 d2-d1s 差值",
         "default_max_le_sweep_diff": "最大前缘角差",
@@ -180,7 +220,7 @@ TEXTS = {
         "default_min_rake_te_s_nbl_10": "最小 rake_te_s (nBl=10)",
         "default_min_rake_te_s_nbl_11": "最小 rake_te_s (nBl=11)",
         "default_min_rake_te_s_nbl_12": "最小 rake_te_s (nBl=12)",
-        "variable_ranges_group": "代理模型输入范围（几何 + 运行工况）",
+        "variable_ranges_group": "几何变量范围",
         "variable_name": "变量",
         "lower_bound": "下界",
         "upper_bound": "上界",
@@ -191,7 +231,7 @@ TEXTS = {
         "al_iters": "额外迭代次数",
         "resume_checkpoint": "恢复检查点",
         "train_surrogate": "训练代理模型",
-        "run_nsga2_only": "基于 LHS 运行 NSGA-II",
+        "run_nsga2_only": "仅 DOE 的 NSGA-II 基准",
         "run_active_learning": "运行主动学习",
         "pareto_group": "帕累托前沿查询与逆向设计",
         "geom_safe": "几何安全阈值",
@@ -294,6 +334,7 @@ class DirectoryField(PathField):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
+        self._configure_font()
         self.config_path = None
         self.config = AppConfig.load().resolved()
         self.variable_specs = load_variable_specs(self.config.workspace.design_variables_json)
@@ -307,21 +348,65 @@ class MainWindow(QMainWindow):
         root = QWidget()
         self.setCentralWidget(root)
         layout = QVBoxLayout(root)
+        layout.setContentsMargins(20, 18, 20, 16)
+        layout.setSpacing(12)
+        self.resize(1260, 850)
+        self.setMinimumSize(860, 600)
+        self.setStyleSheet(self._style_sheet())
 
         self.title_label = QLabel()
-        self.title_label.setStyleSheet("font-size: 22px; font-weight: 700; padding: 6px 0;")
+        self.title_label.setObjectName("pageTitle")
         layout.addWidget(self.title_label)
+        self.subtitle_label = QLabel()
+        self.subtitle_label.setObjectName("subtitle")
+        layout.addWidget(self.subtitle_label)
 
-        self.tabs = QTabWidget()
-        layout.addWidget(self.tabs, 1)
+        self.splitter = QSplitter(Qt.Orientation.Vertical)
+        self.splitter.setChildrenCollapsible(False)
+        workflow = QWidget()
+        workflow_layout = QHBoxLayout(workflow)
+        workflow_layout.setContentsMargins(0, 0, 0, 0)
+        workflow_layout.setSpacing(0)
+        self.navigation = QListWidget()
+        self.navigation.setObjectName("workflowNavigation")
+        self.navigation.setFixedWidth(172)
+        self.navigation.setSpacing(4)
+        self.pages = QStackedWidget()
+        self.navigation.currentRowChanged.connect(self.pages.setCurrentIndex)
+        workflow_layout.addWidget(self.navigation)
+        workflow_layout.addWidget(self.pages, 1)
+        self.splitter.addWidget(workflow)
+
+        activity = QWidget()
+        activity_layout = QVBoxLayout(activity)
+        activity_layout.setContentsMargins(0, 0, 0, 0)
+        activity_layout.setSpacing(8)
+        activity_header = QHBoxLayout()
+        self.activity_label = QLabel()
+        self.activity_label.setObjectName("sectionTitle")
+        activity_header.addWidget(self.activity_label)
+        activity_header.addStretch(1)
+        self.log_toggle = QPushButton()
+        self.log_toggle.setObjectName("quietButton")
+        self.log_toggle.clicked.connect(self._toggle_log)
+        activity_header.addWidget(self.log_toggle)
+        activity_layout.addLayout(activity_header)
 
         self.log = QPlainTextEdit()
         self.log.setReadOnly(True)
         self.log.setMaximumBlockCount(5000)
-        layout.addWidget(self.log, 1)
+        activity_layout.addWidget(self.log)
+        self.splitter.addWidget(activity)
+        self.splitter.setStretchFactor(0, 4)
+        self.splitter.setStretchFactor(1, 1)
+        layout.addWidget(self.splitter, 1)
 
         task_row = QHBoxLayout()
+        self.status_label = QLabel()
+        self.status_label.setObjectName("statusLabel")
+        task_row.addWidget(self.status_label)
         self.stop_button = QPushButton()
+        self.stop_button.setObjectName("stopButton")
         self.stop_button.clicked.connect(self._stop_current_tasks)
         self.stop_button.setEnabled(False)
         task_row.addStretch(1)
@@ -335,6 +420,90 @@ class MainWindow(QMainWindow):
         self._build_sobol_tab()
         self._build_export_tab()
         self._apply_language()
+        self._set_status("status_ready")
+        self.splitter.setSizes([620, 150])
+
+    @staticmethod
+    def _style_sheet() -> str:
+        return """
+            QMainWindow { background: #f5f7fa; }
+            QWidget { color: #203149; font-size: 13px; }
+            QLabel#pageTitle { font-size: 22px; font-weight: 700; padding: 2px 0 8px; }
+            QLabel#subtitle { color: #60738b; padding-bottom: 8px; }
+            QLabel#pageIntro { color: #60738b; font-size: 14px; padding: 5px 0 11px; }
+            QLabel#sectionTitle { font-size: 13px; font-weight: 700; color: #52647d; }
+            QLabel#statusLabel { color: #52647d; font-weight: 600; }
+            QListWidget#workflowNavigation { background: #eaf0f6; border: none;
+                border-radius: 9px 0 0 9px; padding: 12px 7px; outline: none; }
+            QListWidget#workflowNavigation::item { color: #52647d; padding: 13px 12px;
+                border-radius: 6px; }
+            QListWidget#workflowNavigation::item:selected { background: #ffffff;
+                color: #145caa; font-weight: 700; }
+            QStackedWidget { border: 1px solid #dce4ed; background: #ffffff;
+                border-radius: 0 9px 9px 0; }
+            QScrollArea, QScrollArea > QWidget > QWidget { background: #ffffff; border: none; }
+            QGroupBox { background: #ffffff; border: 1px solid #dce4ed;
+                        border-radius: 9px; margin-top: 16px; padding: 18px 14px 12px; font-weight: 700; }
+            QGroupBox::title { subcontrol-origin: margin; left: 12px; padding: 0 5px;
+                               color: #284a73; }
+            QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox, QPlainTextEdit {
+                background: #ffffff; border: 1px solid #cbd6e2; border-radius: 6px;
+                padding: 6px 8px; selection-background-color: #176cc2; }
+            QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus, QComboBox:focus,
+            QPlainTextEdit:focus { border: 1px solid #176cc2; }
+            QPlainTextEdit { font-family: Consolas, monospace; }
+            QPushButton { background: #176cc2; color: #ffffff; border: none;
+                          border-radius: 6px; padding: 8px 14px; font-weight: 600; }
+            QPushButton:hover { background: #115baf; }
+            QPushButton:disabled { background: #dce4ed; color: #7a899a; }
+            QPushButton#quietButton { background: transparent; color: #176cc2; }
+            QPushButton#quietButton:hover { background: #eaf0f6; }
+            QPushButton#stopButton { background: #fff0ed; color: #a72d23; }
+            QPushButton#stopButton:hover { background: #ffe0da; }
+            QSplitter::handle { background: #e2e9f0; height: 5px; }
+        """
+
+    def _add_page(self, page: QWidget, key: str):
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        scroll.setWidget(page)
+        self._tab_indexes[key] = self.pages.addWidget(scroll)
+        self.navigation.addItem("")
+        if self.navigation.currentRow() < 0:
+            self.navigation.setCurrentRow(0)
+
+    @staticmethod
+    def _configure_font():
+        if sys.platform != "win32":
+            return
+        font_file = Path(os.environ.get("WINDIR", "C:/Windows")) / "Fonts" / "msyh.ttc"
+        if font_file.is_file():
+            QFontDatabase.addApplicationFont(str(font_file))
+            QApplication.instance().setFont(QFont("Microsoft YaHei UI", 10))
+
+    def _page_intro(self, layout: QVBoxLayout, key: str) -> QLabel:
+        label = QLabel()
+        label.setObjectName("pageIntro")
+        label.setWordWrap(True)
+        layout.addWidget(label)
+        self._form_labels[key] = label
+        return label
+
+    def _toggle_log(self):
+        self.log.setHidden(not self.log.isHidden())
+        self.log_toggle.setText(self.tr("show_log") if self.log.isHidden() else self.tr("hide_log"))
+
+    def _toggle_advanced(self):
+        self.engineering_defaults_group.setHidden(not self.engineering_defaults_group.isHidden())
+        self.advanced_button.setText(
+            self.tr("show_advanced") if self.engineering_defaults_group.isHidden()
+            else self.tr("hide_advanced")
+        )
+
+    def _set_status(self, key: str):
+        self._status_key = key
+        self.status_label.setText(self.tr(key))
 
     def tr(self, key: str) -> str:
         return translate(self._language, key)
@@ -359,9 +528,12 @@ class MainWindow(QMainWindow):
     def _build_environment_tab(self):
         page = QWidget()
         wrapper = QVBoxLayout(page)
+        self._page_intro(wrapper, "environment_intro")
 
         self.environment_group = QGroupBox()
-        solver_form = QFormLayout(self.environment_group)
+        workspace_form = QFormLayout(self.environment_group)
+        self.solver_group = QGroupBox()
+        solver_form = QFormLayout(self.solver_group)
         self.language_selector = QComboBox()
         self.language_selector.addItem("")
         self.language_selector.addItem("")
@@ -382,8 +554,10 @@ class MainWindow(QMainWindow):
         self.cfx_cores.setRange(1, 128)
         self.cfx_cores.setValue(self.config.runtime.cfx_cores)
 
-        self._add_form_row(solver_form, "language", self.language_selector)
-        self._add_form_row(solver_form, "project_root", self.project_root)
+        self._add_form_row(workspace_form, "language", self.language_selector)
+        self._add_form_row(workspace_form, "project_root", self.project_root)
+        self._add_form_row(workspace_form, "training_csv", self.training_csv)
+        self._add_form_row(workspace_form, "cfx_cores", self.cfx_cores)
         self._add_form_row(solver_form, "powershell", self.powershell)
         self._add_form_row(solver_form, "geometry_script", self.geometry_script)
         self._add_form_row(solver_form, "cfturbo_exe", self.cfturbo_exe)
@@ -394,18 +568,19 @@ class MainWindow(QMainWindow):
         self._add_form_row(solver_form, "base_cft", self.base_cft)
         self._add_form_row(solver_form, "batch_template", self.batch_template)
         self._add_form_row(solver_form, "turbogrid_template", self.turbogrid_template)
-        self._add_form_row(solver_form, "training_csv", self.training_csv)
-        self._add_form_row(solver_form, "cfx_cores", self.cfx_cores)
         wrapper.addWidget(self.environment_group)
+        wrapper.addWidget(self.solver_group)
 
         self.validate_button = QPushButton()
         self.validate_button.clicked.connect(self._validate_environment)
         wrapper.addWidget(self.validate_button, alignment=Qt.AlignmentFlag.AlignLeft)
-        self._tab_indexes["tab_environment"] = self.tabs.addTab(page, "")
+        wrapper.addStretch(1)
+        self._add_page(page, "tab_environment")
 
     def _build_doe_tab(self):
         page = QWidget()
         layout = QVBoxLayout(page)
+        self._page_intro(layout, "doe_intro")
         self.doe_group = QGroupBox()
         form = QFormLayout(self.doe_group)
         self.doe_initial_samples = QSpinBox()
@@ -419,6 +594,16 @@ class MainWindow(QMainWindow):
         self._add_form_row(form, "doe_target_samples", self.doe_target_samples)
         self._add_form_row(form, "doe_runs_dir", self.doe_runs_dir)
         layout.addWidget(self.doe_group)
+
+        row = QHBoxLayout()
+        self.recover_button = QPushButton()
+        self.recover_button.clicked.connect(self._recover_doe_runs)
+        self.start_doe_button = QPushButton()
+        self.start_doe_button.clicked.connect(self._start_doe)
+        row.addWidget(self.recover_button)
+        row.addWidget(self.start_doe_button)
+        row.addStretch(1)
+        layout.addLayout(row)
 
         self.engineering_defaults_group = QGroupBox()
         defaults_form = QFormLayout(self.engineering_defaults_group)
@@ -437,12 +622,12 @@ class MainWindow(QMainWindow):
         self.default_min_rake_te_s_nbl_10 = self._double_spin(runtime.default_min_rake_te_s_nbl_10, 3, -180.0, 180.0, 1.0)
         self.default_min_rake_te_s_nbl_11 = self._double_spin(runtime.default_min_rake_te_s_nbl_11, 3, -180.0, 180.0, 1.0)
         self.default_min_rake_te_s_nbl_12 = self._double_spin(runtime.default_min_rake_te_s_nbl_12, 3, -180.0, 180.0, 1.0)
+        self._add_form_row(form, "optimization_outlet_static_pressure_pa", self.optimization_outlet_static_pressure_pa)
         self._add_form_row(defaults_form, "default_invalid_flow_g_s", self.default_invalid_flow_g_s)
         self._add_form_row(defaults_form, "default_discard_flow_g_s", self.default_discard_flow_g_s)
         self._add_form_row(defaults_form, "default_boundary_flow_g_s", self.default_boundary_flow_g_s)
         self._add_form_row(defaults_form, "default_min_efficiency", self.default_min_efficiency)
         self._add_form_row(defaults_form, "default_min_power", self.default_min_power)
-        self._add_form_row(defaults_form, "optimization_outlet_static_pressure_pa", self.optimization_outlet_static_pressure_pa)
         self._add_form_row(defaults_form, "operating_point_pressure_tolerance_pa", self.operating_point_pressure_tolerance_pa)
         self._add_form_row(defaults_form, "default_min_d2_d1s_gap", self.default_min_d2_d1s_gap)
         self._add_form_row(defaults_form, "default_max_le_sweep_diff", self.default_max_le_sweep_diff)
@@ -451,7 +636,12 @@ class MainWindow(QMainWindow):
         self._add_form_row(defaults_form, "default_min_rake_te_s_nbl_10", self.default_min_rake_te_s_nbl_10)
         self._add_form_row(defaults_form, "default_min_rake_te_s_nbl_11", self.default_min_rake_te_s_nbl_11)
         self._add_form_row(defaults_form, "default_min_rake_te_s_nbl_12", self.default_min_rake_te_s_nbl_12)
+        self.advanced_button = QPushButton()
+        self.advanced_button.setObjectName("quietButton")
+        self.advanced_button.clicked.connect(self._toggle_advanced)
+        layout.addWidget(self.advanced_button, alignment=Qt.AlignmentFlag.AlignLeft)
         layout.addWidget(self.engineering_defaults_group)
+        self.engineering_defaults_group.setVisible(False)
 
         self.variable_ranges_group = QGroupBox()
         range_layout = QGridLayout(self.variable_ranges_group)
@@ -462,7 +652,10 @@ class MainWindow(QMainWindow):
         range_layout.addWidget(self.range_header_min, 0, 1)
         range_layout.addWidget(self.range_header_max, 0, 2)
 
-        for row_idx, spec in enumerate(self.variable_specs, start=1):
+        geometry_specs = [
+            spec for spec in self.variable_specs if spec.get("role") == "geometry"
+        ]
+        for row_idx, spec in enumerate(geometry_specs, start=1):
             name_label = QLabel(spec["name"])
             min_spin = QDoubleSpinBox()
             max_spin = QDoubleSpinBox()
@@ -482,20 +675,13 @@ class MainWindow(QMainWindow):
             self._range_spinboxes[spec["name"]] = (min_spin, max_spin)
         layout.addWidget(self.variable_ranges_group)
 
-        row = QHBoxLayout()
-        self.recover_button = QPushButton()
-        self.recover_button.clicked.connect(self._recover_doe_runs)
-        self.start_doe_button = QPushButton()
-        self.start_doe_button.clicked.connect(self._start_doe)
-        row.addWidget(self.recover_button)
-        row.addWidget(self.start_doe_button)
-        row.addStretch(1)
-        layout.addLayout(row)
-        self._tab_indexes["tab_doe"] = self.tabs.addTab(page, "")
+        layout.addStretch(1)
+        self._add_page(page, "tab_doe")
 
     def _build_active_learning_tab(self):
         page = QWidget()
         layout = QVBoxLayout(page)
+        self._page_intro(layout, "active_learning_intro")
         self.active_learning_group = QGroupBox()
         form = QFormLayout(self.active_learning_group)
         self.al_runs_dir = self._register_field(DirectoryField(str(self.config.workspace.active_learning_runs_dir)))
@@ -506,7 +692,7 @@ class MainWindow(QMainWindow):
         self._add_form_row(form, "al_iters", self.al_iters)
         layout.addWidget(self.active_learning_group)
 
-        row = QHBoxLayout()
+        row = QGridLayout()
         self.resume_button = QPushButton()
         self.resume_button.clicked.connect(self._resume_checkpoint)
         self.train_button = QPushButton()
@@ -515,17 +701,18 @@ class MainWindow(QMainWindow):
         self.run_nsga2_button.clicked.connect(self._run_nsga2_only)
         self.run_active_learning_button = QPushButton()
         self.run_active_learning_button.clicked.connect(self._run_active_learning)
-        row.addWidget(self.resume_button)
-        row.addWidget(self.train_button)
-        row.addWidget(self.run_nsga2_button)
-        row.addWidget(self.run_active_learning_button)
-        row.addStretch(1)
+        row.addWidget(self.resume_button, 0, 0)
+        row.addWidget(self.train_button, 0, 1)
+        row.addWidget(self.run_nsga2_button, 1, 0)
+        row.addWidget(self.run_active_learning_button, 1, 1)
         layout.addLayout(row)
-        self._tab_indexes["tab_active_learning"] = self.tabs.addTab(page, "")
+        layout.addStretch(1)
+        self._add_page(page, "tab_active_learning")
 
     def _build_pareto_tab(self):
         page = QWidget()
         layout = QVBoxLayout(page)
+        self._page_intro(layout, "pareto_intro")
         self.pareto_group = QGroupBox()
         form = QFormLayout(self.pareto_group)
         self.geom_safe = QDoubleSpinBox()
@@ -564,11 +751,13 @@ class MainWindow(QMainWindow):
         row.addWidget(self.query_button)
         row.addStretch(1)
         layout.addLayout(row)
-        self._tab_indexes["tab_pareto"] = self.tabs.addTab(page, "")
+        layout.addStretch(1)
+        self._add_page(page, "tab_pareto")
 
     def _build_sobol_tab(self):
         page = QWidget()
         layout = QVBoxLayout(page)
+        self._page_intro(layout, "sobol_intro")
         self.sobol_group = QGroupBox()
         form = QFormLayout(self.sobol_group)
         self.sobol_fixed_nbl = QSpinBox()
@@ -592,11 +781,12 @@ class MainWindow(QMainWindow):
         self.run_sobol_button.clicked.connect(self._run_sobol)
         layout.addWidget(self.run_sobol_button, alignment=Qt.AlignmentFlag.AlignLeft)
         layout.addStretch(1)
-        self._tab_indexes["tab_sobol"] = self.tabs.addTab(page, "")
+        self._add_page(page, "tab_sobol")
 
     def _build_export_tab(self):
         page = QWidget()
         layout = QVBoxLayout(page)
+        self._page_intro(layout, "export_intro")
         self.export_group = QGroupBox()
         form = QFormLayout(self.export_group)
         self.export_top_n = QSpinBox()
@@ -610,12 +800,21 @@ class MainWindow(QMainWindow):
         self.export_button = QPushButton()
         self.export_button.clicked.connect(self._export_cases)
         layout.addWidget(self.export_button, alignment=Qt.AlignmentFlag.AlignLeft)
-        self._tab_indexes["tab_export"] = self.tabs.addTab(page, "")
+        self._add_page(page, "tab_export")
 
     def _apply_language(self):
         self.setWindowTitle(self.tr("window_title"))
         self.title_label.setText(self.tr("app_title"))
+        self.subtitle_label.setText(self.tr("app_subtitle"))
         self.log.setPlaceholderText(self.tr("log_placeholder"))
+        self.activity_label.setText(self.tr("log_title"))
+        self.log_toggle.setText(self.tr("show_log") if self.log.isHidden() else self.tr("hide_log"))
+        self.advanced_button.setText(
+            self.tr("show_advanced") if self.engineering_defaults_group.isHidden()
+            else self.tr("hide_advanced")
+        )
+        if hasattr(self, "_status_key"):
+            self.status_label.setText(self.tr(self._status_key))
 
         self.language_selector.blockSignals(True)
         self.language_selector.setItemText(0, self.tr("language_zh"))
@@ -630,6 +829,7 @@ class MainWindow(QMainWindow):
             field.set_language(self._language)
 
         self.environment_group.setTitle(self.tr("environment_group"))
+        self.solver_group.setTitle(self.tr("solver_group"))
         self.doe_group.setTitle(self.tr("doe_group"))
         self.engineering_defaults_group.setTitle(self.tr("engineering_defaults_group"))
         self.variable_ranges_group.setTitle(self.tr("variable_ranges_group"))
@@ -656,7 +856,7 @@ class MainWindow(QMainWindow):
         self.stop_button.setText(self.tr("stop_task"))
 
         for key, index in self._tab_indexes.items():
-            self.tabs.setTabText(index, self.tr(key))
+            self.navigation.item(index).setText(self.tr(key))
 
     def _on_language_changed(self, index: int):
         self._language = "zh" if index == 0 else "en"
@@ -665,6 +865,11 @@ class MainWindow(QMainWindow):
     def _serialize_variable_specs(self) -> list[dict]:
         serialized = []
         for spec in self.variable_specs:
+            if spec.get("role") != "geometry":
+                # Operating conditions such as P_out are configured as one
+                # fixed runtime value, not edited as DOE design ranges.
+                serialized.append(dict(spec))
+                continue
             min_spin, max_spin = self._range_spinboxes[spec["name"]]
             lower = float(min_spin.value())
             upper = float(max_spin.value())
@@ -724,6 +929,9 @@ class MainWindow(QMainWindow):
         )
         runtime = RuntimeSettings(
             cfx_cores=self.cfx_cores.value(),
+            cfx_residual_threshold=self.config.runtime.cfx_residual_threshold,
+            cfx_max_extra_iterations=self.config.runtime.cfx_max_extra_iterations,
+            cfx_restart_chunk=self.config.runtime.cfx_restart_chunk,
             rpm=self.config.runtime.rpm,
             mass_flow=self.config.runtime.mass_flow,
             alpha0=self.config.runtime.alpha0,
@@ -770,6 +978,8 @@ class MainWindow(QMainWindow):
         worker.failed.connect(self._handle_failure)
         self._workers.append(worker)
         self.stop_button.setEnabled(True)
+        self._set_status("status_running")
+        self.log.setVisible(True)
         worker.start()
 
     def _cleanup_workers(self):
@@ -782,6 +992,7 @@ class MainWindow(QMainWindow):
                 worker.stop()
         self.log.appendPlainText("[running] Stop requested; waiting for external processes to terminate...")
         self.stop_button.setEnabled(False)
+        self._set_status("status_stopping")
 
     def _handle_update(self, payload):
         if isinstance(payload, TaskUpdate):
@@ -795,11 +1006,20 @@ class MainWindow(QMainWindow):
     def _handle_result(self, result):
         self._cleanup_workers()
         if isinstance(result, TaskResult):
+            if hasattr(self, "_set_status"):
+                self._set_status("status_failed" if result.status == "failed" else "status_done")
             self.log.appendPlainText(f"[{result.status}] {result.message}")
             if result.metrics:
                 self.log.appendPlainText(str(result.metrics))
             if result.artifacts:
                 self.log.appendPlainText(str(result.artifacts))
+            if result.status == "succeeded" and result.artifacts.get("hv_plot"):
+                plot = Path(result.artifacts["hv_plot"])
+                if plot.is_file():
+                    if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(plot.resolve()))):
+                        self.log.appendPlainText(f"HV 图片已保存，请手动打开：{plot}")
+                else:
+                    self.log.appendPlainText(f"HV 图片未生成，请检查日志：{plot}")
             if result.status == "failed":
                 QMessageBox.warning(self, self.tr("task_failed"), result.message)
         else:
@@ -807,6 +1027,7 @@ class MainWindow(QMainWindow):
 
     def _handle_failure(self, text):
         self._cleanup_workers()
+        self._set_status("status_failed")
         self.log.appendPlainText(text)
         QMessageBox.critical(self, self.tr("unhandled_error"), text)
 
@@ -859,6 +1080,7 @@ class MainWindow(QMainWindow):
             lambda callback, cancel_event: ActiveLearningService(config).run_active_learning_iteration(
                 config.runtime.active_learning_additional_iters,
                 progress_callback=callback,
+                cancel_event=cancel_event,
             )
         )
 

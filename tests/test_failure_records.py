@@ -8,6 +8,7 @@ from failure_records import (
     classify_cfx_failure_stage,
     classify_geometry_failure_stage,
     load_failure_training_sets,
+    load_run_outcome,
     record_run_outcome,
 )
 
@@ -80,6 +81,28 @@ class FailureRecordTests(unittest.TestCase):
                 status="failed",
                 failure_stage="fatal_overflow",
             )
+            self.assertTrue(record["confirmed"])
+
+    def test_blockage_outcome_can_be_reloaded_as_confirmed_terminal_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "failures.csv"
+            record_run_outcome(
+                path,
+                VARIABLE_NAMES,
+                self.sample(),
+                source="doe",
+                run_id="Run_001",
+                status="failed",
+                failure_stage="blockage",
+                reason="进出口持续100%堵塞，提前终止",
+            )
+
+            record = load_run_outcome(
+                path, source="doe", run_id="Run_001"
+            )
+
+            self.assertIsNotNone(record)
+            self.assertEqual(record["failure_stage"], "blockage")
             self.assertTrue(record["confirmed"])
 
     def test_loader_separates_feature_spaces_and_excludes_system_faults(self):

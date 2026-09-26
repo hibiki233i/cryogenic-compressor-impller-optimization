@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -165,12 +168,25 @@ class ImpellerAppTests(unittest.TestCase):
                 12.0,
             )
 
+    def test_legacy_overrides_use_project_fixed_test_set(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self.make_config(Path(tmp))
+
+            overrides = config.legacy_overrides()
+
+            self.assertEqual(
+                Path(overrides["TEST_SET_CSV"]),
+                config.workspace.project_root / "fixed_test_set.csv",
+            )
+
     def test_recover_runs_rebuilds_training_csv(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             config = self.make_config(root)
             run_dir = root / "Runs" / "Run_000"
             run_dir.mkdir(parents=True)
+            from tests.test_convergence_policy import make_pair
+            make_pair(run_dir)
             (run_dir / "CFX_Results.txt").write_text("0.71,1.91,10.0,0.40,2.01", encoding="utf-8")
             (run_dir / "CFX_Results.meta.json").write_text(
                 json.dumps(
@@ -248,6 +264,27 @@ class ImpellerAppTests(unittest.TestCase):
                 config.solver.turbogrid_template,
             )
 
+    def test_doe_samples_pin_p_out_and_apply_active_learning_geometry_rules(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self.make_config(Path(tmp))
+            # The fixed operating condition is independent of the legacy
+            # P_out metadata range (8..13 Pa).
+            config.runtime.optimization_outlet_static_pressure_pa = 14.0
+            runner = RunnerAPI(config)
+            samples = runner.generate_lhs_samples(40)
+            self.assertTrue(all(sample["P_out"] == 14.0 for sample in samples))
+            matrix = np.array(
+                [[sample[name] for name in runner.variable_names] for sample in samples]
+            )
+            violations = legacy_al.shared_geometry_rule_violations(
+                matrix,
+                runner.variable_names,
+                runner.l_bounds,
+                runner.u_bounds,
+                config=runner.geometry_constraint_config,
+            )
+            self.assertTrue(np.all(violations <= 0.0))
+
     def test_geometry_script_requires_gui_turbogrid_template(self):
         script = Path(__file__).resolve().parents[1] / "Run-GeometryMeshing.ps1"
         content = script.read_text(encoding="utf-8-sig")
@@ -281,6 +318,25 @@ class ImpellerAppTests(unittest.TestCase):
             args, kwargs = mock_run_doe_sample.call_args
             self.assertEqual(args[0], 0)
             self.assertTrue(kwargs["force"])
+
+    @mock.patch.object(RunnerAPI, "run_doe_sample")
+    def test_doe_does_not_repeat_confirmed_blockage(self, mock_run_doe_sample):
+        with tempfile.TemporaryDirectory() as tmp:
+            runner = RunnerAPI(self.make_config(Path(tmp)))
+            sample = runner.generate_lhs_samples(1)[0]
+            mock_run_doe_sample.return_value = TaskResult(
+                status="failed",
+                message="进出口持续100%堵塞，提前终止",
+                metrics={
+                    "failure_stage": "blockage",
+                    "failure_confirmed": True,
+                },
+            )
+
+            result = runner._run_doe_sample_with_failure_confirmation(1, sample)
+
+            self.assertEqual(result.status, "failed")
+            self.assertEqual(mock_run_doe_sample.call_count, 1)
 
     def test_resume_from_checkpoint_reads_existing_meta(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -355,7 +411,7 @@ class ImpellerAppTests(unittest.TestCase):
         self.assertEqual(full.shape, (1, len(legacy_al.VAR_NAMES)))
         self.assertEqual(full[0, legacy_al.P_OUT_IDX], 12.0)
 
-    def test_active_learning_candidate_quota_is_two_plus_one_plus_one(self):
+    def test_reliable_model_uses_three_positive_ehvi_and_one_local_uncertainty(self):
         midpoint = (legacy_al.L_BOUNDS + legacy_al.U_BOUNDS) / 2.0
         nbl_idx = legacy_al.VAR_NAMES.index("nBl")
         vary_idx = legacy_al.VAR_NAMES.index("d1s")
@@ -386,27 +442,203 @@ class ImpellerAppTests(unittest.TestCase):
         )
         ehvi = np.array([0.9, 0.8, 0.2, 0.1, 0.05, 0.04])
         uncertainty = np.full((len(candidates), 3), 0.01)
-        uncertainty[2] = 0.5
+        uncertainty[3] = 0.5
         selected, labels = legacy_al.select_candidates_diverse(
             acq_X=candidates,
             ehvi_vals=ehvi,
             scaler_X=scaler,
             acq_info={
                 "valid_mask": np.ones(len(candidates), dtype=bool),
+                "exploration_mask": np.ones(len(candidates), dtype=bool),
+                "trust_region_mask": np.ones(len(candidates), dtype=bool),
                 "pred_std_norm": uncertainty,
+                "candidate_source": np.full(len(candidates), "true_front_local"),
+                "flow_feasible_probability": np.ones(len(candidates)),
+                "p_feas": np.ones(len(candidates)),
+                "p_geom_safe": np.ones(len(candidates)),
             },
             X_pool_raw=pool,
             n_pick=4,
             min_dist_norm=0.01,
-            n_ehvi=2,
+            n_ehvi=3,
+            model_reliability="reliable",
         )
 
         self.assertEqual(len(selected), 4)
         self.assertTrue(labels[0].startswith("Pareto/EHVI#1"))
         self.assertTrue(labels[1].startswith("Pareto/EHVI#2"))
-        self.assertTrue(labels[2].startswith("最大不确定性"))
-        self.assertTrue(labels[3].startswith("欠采样nBl/空间填充"))
-        self.assertEqual(int(round(selected[3][nbl_idx])), 12)
+        self.assertTrue(labels[2].startswith("Pareto/EHVI#3"))
+        self.assertTrue(labels[3].startswith("安全局部不确定性"))
+
+    def test_global_accuracy_mode_reserves_sparse_preferred_nbl_coverage(self):
+        midpoint = (legacy_al.L_BOUNDS + legacy_al.U_BOUNDS) / 2.0
+        nbl_idx = legacy_al.VAR_NAMES.index("nBl")
+        vary_idx = legacy_al.VAR_NAMES.index("d1s")
+        candidates = np.tile(midpoint, (4, 1))
+        candidates[:, vary_idx] = np.linspace(
+            legacy_al.L_BOUNDS[vary_idx],
+            legacy_al.U_BOUNDS[vary_idx],
+            len(candidates),
+        )
+        candidates[:, nbl_idx] = [9, 10, 11, 12]
+        candidates = legacy_al.pin_optimization_operating_point(candidates)
+        pool = legacy_al.pin_optimization_operating_point(midpoint[None, :])
+        scaler = MinMaxScaler().fit(
+            np.vstack([legacy_al.L_BOUNDS, legacy_al.U_BOUNDS])
+        )
+
+        selected, labels = legacy_al.select_candidates_diverse(
+            acq_X=candidates,
+            ehvi_vals=np.zeros(len(candidates)),
+            scaler_X=scaler,
+            acq_info={
+                "valid_mask": np.ones(len(candidates), dtype=bool),
+                "exploration_mask": np.ones(len(candidates), dtype=bool),
+                "trust_region_mask": np.ones(len(candidates), dtype=bool),
+                "pred_std_norm": np.zeros((len(candidates), 3)),
+                "candidate_source": np.full(len(candidates), "global"),
+                "flow_feasible_probability": np.ones(len(candidates)),
+                "p_feas": np.ones(len(candidates)),
+                "p_geom_safe": np.ones(len(candidates)),
+            },
+            X_pool_raw=pool,
+            n_pick=1,
+            model_reliability="general",
+            reserve_coverage=True,
+        )
+
+        self.assertEqual(len(selected), 1)
+        self.assertIn(int(round(selected[0][nbl_idx])), {10, 11, 12})
+        self.assertTrue(labels[0].startswith("安全边界覆盖"))
+
+    def test_local_online_metrics_drive_reliability_without_r2(self):
+        midpoint = (legacy_al.L_BOUNDS + legacy_al.U_BOUNDS) / 2.0
+        midpoint[legacy_al.VAR_NAMES.index("nBl")] = 9
+        midpoint = legacy_al.pin_optimization_operating_point(midpoint)[0]
+        scaler = legacy_al.make_categorical_nbl_scaler(
+            legacy_al.VAR_NAMES, legacy_al.L_BOUNDS, legacy_al.U_BOUNDS
+        )
+        scaler.fit(np.vstack([legacy_al.L_BOUNDS, legacy_al.U_BOUNDS, midpoint]))
+        rows = []
+        for idx in range(10):
+            true_mf = 3.7 if idx % 2 == 0 else 3.5
+            row = {
+                "iter": 26 + idx // 2,
+                "status": "success",
+                "pred_eff": 0.795,
+                "true_eff": 0.800,
+                "pred_pr": 3.98,
+                "true_pr": 4.00,
+                "pred_mf": true_mf + 0.05,
+                "true_mf": true_mf,
+                "pred_flow_feasible_probability": 0.8 if true_mf >= 3.6 else 0.2,
+            }
+            row.update(dict(zip(legacy_al.VAR_NAMES, midpoint)))
+            rows.append(row)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            query_path = Path(tmp) / "queries.csv"
+            pd.DataFrame(rows).to_csv(query_path, index=False)
+            metrics = legacy_al.compute_local_online_metrics(
+                str(query_path), midpoint[None, :], scaler, 30, legacy_al.CFG
+            )
+        reliability, quota, score = legacy_al.assess_model_reliability(
+            metrics, legacy_al.CFG
+        )
+        self.assertEqual(metrics["local_online_status"], "ready")
+        self.assertEqual(metrics["local_online_samples"], 10)
+        self.assertLess(metrics["local_flow_brier"], 0.05)
+        self.assertEqual(reliability, "reliable")
+        self.assertEqual(quota, 3)
+        self.assertGreater(score, 0.0)
+
+    def test_three_round_verified_hv_gain_triggers_review(self):
+        history = [
+            {"iter": 27, "true_hv": 0.6664108310260001},
+            {"iter": 28, "true_hv": 0.6664610378080001},
+            {"iter": 29, "true_hv": 0.6664610378080001},
+            {"iter": 30, "true_hv": 0.6664703453240002},
+        ]
+        state = legacy_al.assess_hv_stagnation(history, legacy_al.CFG)
+        self.assertTrue(state["hv_stagnation_triggered"])
+        self.assertAlmostEqual(
+            state["rolling_true_hv_gain"], 5.9514298e-5, places=11
+        )
+        self.assertEqual(state["hv_stagnation_action"], "stop")
+
+    def test_coverage_policy_uses_safe_and_boundary_mc_bands(self):
+        midpoint = (legacy_al.L_BOUNDS + legacy_al.U_BOUNDS) / 2.0
+        nbl_idx = legacy_al.VAR_NAMES.index("nBl")
+        vary_idx = legacy_al.VAR_NAMES.index("d1s")
+        candidates = np.tile(midpoint, (4, 1))
+        candidates[:, vary_idx] = np.linspace(
+            legacy_al.L_BOUNDS[vary_idx],
+            legacy_al.U_BOUNDS[vary_idx],
+            len(candidates),
+        )
+        candidates[:, nbl_idx] = [10, 11, 12, 10]
+        candidates = legacy_al.pin_optimization_operating_point(candidates)
+        pool = legacy_al.pin_optimization_operating_point(midpoint[None, :])
+        # The boundary candidate must have observed support in its own category.
+        pool[:, nbl_idx] = 11
+        scaler = MinMaxScaler().fit(
+            np.vstack([legacy_al.L_BOUNDS, legacy_al.U_BOUNDS])
+        )
+        common = {
+            "valid_mask": np.ones(len(candidates), dtype=bool),
+            "exploration_mask": np.ones(len(candidates), dtype=bool),
+            "trust_region_mask": np.ones(len(candidates), dtype=bool),
+            "pred_std_norm": np.zeros((len(candidates), 3)),
+            "candidate_source": np.full(len(candidates), "global"),
+            "p_feas": np.full(len(candidates), 0.9),
+            "p_geom_safe": np.full(len(candidates), 0.9),
+            "flow_feasible_probability": np.array([0.95, 0.50, 0.90, 0.20]),
+            "flow_lower_confidence_bound": np.array([3.62, 3.35, 3.70, 3.10]),
+            "pred_mean": np.array([
+                [0.80, 4.0, 3.72],
+                [0.80, 4.0, 3.61],
+                [0.80, 4.0, 4.20],
+                [0.80, 4.0, 3.30],
+            ]),
+        }
+
+        safe_selected, safe_labels = legacy_al.select_candidates_diverse(
+            acq_X=candidates,
+            ehvi_vals=np.zeros(len(candidates)),
+            scaler_X=scaler,
+            acq_info=common,
+            X_pool_raw=pool,
+            n_pick=1,
+            model_reliability="general",
+            reserve_coverage=True,
+            coverage_iteration=41,
+        )
+        safe_idx = next(
+            idx for idx, row in enumerate(candidates)
+            if np.allclose(row, safe_selected[0])
+        )
+        self.assertTrue(safe_labels[0].startswith("安全边界覆盖"))
+        self.assertGreaterEqual(common["flow_feasible_probability"][safe_idx], 0.8)
+        self.assertGreaterEqual(common["flow_lower_confidence_bound"][safe_idx], 3.55)
+
+        boundary_selected, boundary_labels = legacy_al.select_candidates_diverse(
+            acq_X=candidates,
+            ehvi_vals=np.zeros(len(candidates)),
+            scaler_X=scaler,
+            acq_info=common,
+            X_pool_raw=pool,
+            n_pick=1,
+            model_reliability="general",
+            reserve_coverage=True,
+            coverage_iteration=42,
+        )
+        boundary_idx = next(
+            idx for idx, row in enumerate(candidates)
+            if np.allclose(row, boundary_selected[0])
+        )
+        self.assertTrue(boundary_labels[0].startswith("边界辨识覆盖"))
+        self.assertGreaterEqual(common["flow_feasible_probability"][boundary_idx], 0.3)
+        self.assertLess(common["flow_feasible_probability"][boundary_idx], 0.8)
 
     def test_failure_classifiers_exclude_nbl_and_are_nbl_invariant(self):
         midpoint = (legacy_al.L_BOUNDS + legacy_al.U_BOUNDS) / 2.0
@@ -456,7 +688,7 @@ class ImpellerAppTests(unittest.TestCase):
         self.assertAlmostEqual(float(p_operating[0]), float(p_operating[1]), places=12)
         self.assertAlmostEqual(float(p_geometry[0]), float(p_geometry[1]), places=12)
 
-    def test_exploration_bypasses_surrogate_mask_and_counts_failed_attempts(self):
+    def test_reliable_model_never_fills_zero_ehvi_slots(self):
         midpoint = (legacy_al.L_BOUNDS + legacy_al.U_BOUNDS) / 2.0
         nbl_idx = legacy_al.VAR_NAMES.index("nBl")
         vary_idx = legacy_al.VAR_NAMES.index("d1s")
@@ -494,24 +726,96 @@ class ImpellerAppTests(unittest.TestCase):
         uncertainty[2] = 1.0
         selected, labels = legacy_al.select_candidates_diverse(
             acq_X=candidates,
-            ehvi_vals=np.array([0.8, 0.7, -np.inf, -np.inf, -np.inf, -np.inf]),
+            ehvi_vals=np.zeros(len(candidates)),
             scaler_X=scaler,
             acq_info={
-                "valid_mask": np.array([True, True, False, False, False, False]),
+                "valid_mask": np.ones(len(candidates), dtype=bool),
                 "exploration_mask": np.ones(len(candidates), dtype=bool),
+                "trust_region_mask": np.ones(len(candidates), dtype=bool),
                 "pred_std_norm": uncertainty,
+                "candidate_source": np.full(len(candidates), "true_front_local"),
+                "flow_feasible_probability": np.ones(len(candidates)),
+                "p_feas": np.ones(len(candidates)),
+                "p_geom_safe": np.ones(len(candidates)),
             },
             X_pool_raw=pool,
             X_failed_raw=failed,
             n_pick=4,
             min_dist_norm=0.01,
-            n_ehvi=2,
+            n_ehvi=3,
+            model_reliability="reliable",
         )
 
-        self.assertEqual(int(round(selected[2][nbl_idx])), 12)
-        self.assertTrue(labels[2].startswith("最大不确定性"))
-        self.assertEqual(int(round(selected[3][nbl_idx])), 9)
-        self.assertIn("failed=0", labels[3])
+        self.assertEqual(len(selected), 1)
+        self.assertEqual(int(round(selected[0][nbl_idx])), 12)
+        self.assertTrue(labels[0].startswith("安全局部不确定性"))
+
+    def test_surrogate_scaler_one_hot_encodes_nbl(self):
+        scaler = legacy_al.make_categorical_nbl_scaler(
+            legacy_al.VAR_NAMES, legacy_al.L_BOUNDS, legacy_al.U_BOUNDS
+        )
+        samples = np.vstack([legacy_al.L_BOUNDS, legacy_al.U_BOUNDS])
+        encoded = scaler.fit_transform(samples)
+        self.assertEqual(encoded.shape[1], len(legacy_al.VAR_NAMES) - 1 + 4)
+        np.testing.assert_array_equal(encoded[:, -4:].sum(axis=1), np.ones(2))
+        self.assertFalse(np.array_equal(encoded[0, -4:], encoded[1, -4:]))
+
+    def test_acquisition_generates_one_reusable_mc_distribution_for_full_pool(self):
+        scaler_x = MinMaxScaler().fit(
+            np.vstack([legacy_al.L_BOUNDS, legacy_al.U_BOUNDS])
+        )
+        scaler_y = MinMaxScaler().fit(
+            np.array([[0.6, 1.0, 3.0], [0.8, 2.0, 4.0]])
+        )
+        midpoint = legacy_al.pin_optimization_operating_point(
+            ((legacy_al.L_BOUNDS + legacy_al.U_BOUNDS) / 2.0)[None, :]
+        )
+        cfg = legacy_al.ALConfig(
+            n_candidates=24,
+            mc_samples=30,
+            local_sample_ratio=0.0,
+            surrogate_front_sample_ratio=0.0,
+        )
+
+        def distribution(
+            _model, x_norm, _scaler_y, n_samples, cancel_event=None
+        ):
+            count = len(x_norm)
+            samples = np.empty((n_samples, count, 3), dtype=float)
+            samples[:, :, 0] = 0.70
+            samples[:, :, 1] = 1.80
+            samples[: n_samples // 2, :, 2] = 3.50
+            samples[n_samples // 2 :, :, 2] = 3.70
+            return (
+                samples,
+                samples.mean(axis=0),
+                np.full((count, 3), 0.02),
+            )
+
+        with mock.patch.object(
+            legacy_al,
+            "mc_dropout_distribution",
+            side_effect=distribution,
+        ) as mc_mock:
+            _, _, info = legacy_al.compute_ehvi_acquisition(
+                reg_model=object(),
+                feas_clf=None,
+                geom_warn_clf=None,
+                scaler_X=scaler_x,
+                scaler_Y=scaler_y,
+                X_pool_raw=midpoint,
+                failed_points_raw=[],
+                current_pareto_Y=None,
+                current_pareto_X=None,
+                ref_eff=0.6,
+                ref_pr=1.0,
+                cfg=cfg,
+            )
+
+        mc_mock.assert_called_once()
+        self.assertEqual(mc_mock.call_args.kwargs["n_samples"], 30)
+        self.assertEqual(info["mc_sample_count"], 30)
+        np.testing.assert_allclose(info["flow_feasible_probability"], 0.5)
 
     def test_legacy_failure_classifier_is_marginalized_over_nbl(self):
         midpoint = (legacy_al.L_BOUNDS + legacy_al.U_BOUNDS) / 2.0
@@ -678,7 +982,9 @@ class ImpellerAppTests(unittest.TestCase):
             def get_resume_iter(self):
                 return 0
 
-            def main_multiobjective_active_learning(self, max_al_iters=None):
+            def main_multiobjective_active_learning(
+                self, max_al_iters=None, cancel_event=None
+            ):
                 raise ValueError("TRAINING_CSV 中没有可用于主动学习的样本。")
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -688,6 +994,56 @@ class ImpellerAppTests(unittest.TestCase):
             result = service.run_active_learning_iteration(1)
             self.assertEqual(result.status, "failed")
             self.assertIn("TRAINING_CSV 中没有可用于主动学习的样本", result.message)
+
+    def test_active_learning_service_forwards_gui_cancel_event(self):
+        class Cancelled(Exception):
+            pass
+
+        class CancellableLegacy:
+            ActiveLearningCancelled = Cancelled
+
+            def __init__(self):
+                self.received_event = None
+
+            def get_resume_iter(self):
+                return 0
+
+            def main_multiobjective_active_learning(
+                self, max_al_iters=None, cancel_event=None
+            ):
+                self.received_event = cancel_event
+                raise Cancelled("Active learning canceled by user.")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self.make_config(Path(tmp))
+            service = ActiveLearningService(config)
+            fake = CancellableLegacy()
+            service._legacy = fake
+            cancel_event = threading.Event()
+            result = service.run_active_learning_iteration(
+                1, cancel_event=cancel_event
+            )
+
+            self.assertIs(fake.received_event, cancel_event)
+            self.assertEqual(result.status, "canceled")
+            self.assertIn("canceled", result.message.lower())
+
+    def test_active_learning_cancel_kills_running_geometry_process(self):
+        cancel_event = threading.Event()
+        timer = threading.Timer(0.2, cancel_event.set)
+        timer.start()
+        started = time.monotonic()
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                with self.assertRaises(legacy_al.ActiveLearningCancelled):
+                    legacy_al._run_cancellable_capture(
+                        [sys.executable, "-c", "import time; time.sleep(30)"],
+                        cwd=tmp,
+                        cancel_event=cancel_event,
+                    )
+        finally:
+            timer.cancel()
+        self.assertLess(time.monotonic() - started, 6.0)
 
     def test_run_nsga2_only_returns_artifacts(self):
         class FakeLegacy:
@@ -841,6 +1197,14 @@ class ImpellerAppTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
+            from cfx_convergence import digest
+            front.to_csv(config.workspace.training_csv,index=False)
+            write_performance_data_metadata(config.workspace.training_csv)
+            config.workspace.pareto_engineering_json.write_text(json.dumps({
+                "source_sha256":digest(config.workspace.training_csv),
+                "front_sha256":digest(config.workspace.pareto_front_csv),
+                "engineering_sha256":digest(config.workspace.pareto_engineering_csv),
+                "runtime":config.to_dict()["runtime"]}),encoding="utf-8")
             result = ParetoService(config).export_cases(top_n=1, force=True)
 
             self.assertEqual(result.status, "succeeded")

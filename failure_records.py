@@ -13,7 +13,7 @@ GEOMETRY_FAILURE_STAGES = frozenset({"geometry", "mesh", "geometry_mesh"})
 OPERATING_FAILURE_STAGES = frozenset(
     {"fatal_overflow", "blockage", "physical_invalid"}
 )
-NUMERICAL_FAILURE_STAGES = frozenset({"cfx_solver"})
+NUMERICAL_FAILURE_STAGES = frozenset({"cfx_solver", "residual_unconverged"})
 
 
 def _timestamp() -> str:
@@ -38,6 +38,39 @@ def _sample_dict(variable_names: Sequence[str], sample) -> dict[str, float]:
             f"Expected {len(variable_names)} failure-point values, got {len(values)}."
         )
     return {name: float(value) for name, value in zip(variable_names, values)}
+
+
+def load_run_outcome(
+    csv_path: str | Path,
+    *,
+    source: str,
+    run_id: str,
+) -> dict | None:
+    """Return the latest normalized audit record for one run, if present."""
+    path = Path(csv_path)
+    if not path.exists():
+        return None
+    try:
+        records = pd.read_csv(path)
+    except (pd.errors.EmptyDataError, pd.errors.ParserError, OSError):
+        return None
+    if records.empty or not {"source", "run_id"}.issubset(records.columns):
+        return None
+    matched = records[
+        (records["source"].astype(str) == str(source))
+        & (records["run_id"].astype(str) == str(run_id))
+    ]
+    if matched.empty:
+        return None
+    record = matched.iloc[-1].to_dict()
+    record["status"] = str(record.get("status", "")).strip().lower()
+    record["failure_stage"] = str(
+        record.get("failure_stage", "")
+    ).strip().lower()
+    record["confirmed"] = str(record.get("confirmed", "")).strip().lower() in {
+        "1", "true", "yes"
+    }
+    return record
 
 
 def record_run_outcome(
@@ -140,6 +173,7 @@ def load_failure_training_sets(
     csv_path: str | Path,
     variable_names: Sequence[str],
     geometry_variable_names: Sequence[str],
+    sources: Sequence[str] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, pd.DataFrame]:
     """Return design-intrinsic geometry and operating failures.
 
@@ -157,6 +191,9 @@ def load_failure_training_sets(
         records = pd.read_csv(path)
     except (pd.errors.EmptyDataError, pd.errors.ParserError):
         return empty_geom, empty_full, pd.DataFrame()
+    if sources is not None:
+        records = (records[records["source"].astype(str).str.lower().isin(sources)].copy()
+                   if "source" in records else records.iloc[:0].copy())
     required = {
         "status",
         "failure_stage",
@@ -226,6 +263,10 @@ def classify_cfx_failure_stage(reason: str) -> str:
         for token in ("fatal overflow", "floating point overflow", "overflow error")
     ):
         return "fatal_overflow"
+    if "residual_unconverged" in message:
+        return "residual_unconverged"
+    if "residual_unavailable" in message or "convergence" in message:
+        return "cfx_solver"
     if "100%堵塞" in message or "blockage" in message:
         return "blockage"
     if any(
