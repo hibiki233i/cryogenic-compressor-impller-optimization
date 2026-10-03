@@ -270,3 +270,47 @@ python -m unittest discover -s tests -v
 测试使用临时工作区和模拟求解器，覆盖最终残差、严格门槛、OUT/RES 配对、wall、预算耗尽、
 取消恢复、旧 TXT 失效、成功结果来源、新阶段隔离、固定测试无泄漏、保存路径及过期导出拒绝。
 不需要 ANSYS 许可证。真实求解只能由用户之后明确启动。
+
+### BOUNDYR desktop appearance
+
+The desktop uses a dark engineering-console palette with teal primary actions, a persistent workflow sidebar, and a page heading that follows navigation. Ctrl+1 through Ctrl+6 switch between the six workflow pages; Ctrl+7 opens live results. Forms scroll and wrap long labels on smaller windows; engineering thresholds and task activity remain collapsible. Task status uses both text and color. Chinese and English navigation, headings, and hints update together. This visual refresh does not change solver execution, performance schemas, fixed outlet pressure, or model compatibility.
+
+界面采用深色工程工作台与青绿色主操作按钮，保留六步工作流，支持 Ctrl+1 至 Ctrl+6 切换工作流页面，Ctrl+7 打开实时结果。小窗口可滚动表单，工程阈值与任务动态可折叠；任务状态同时以文字和颜色表达。此次界面调整无需重新训练模型或生成 Pareto 数据。
+
+### Live results / 实时结果
+
+The **Live results** page (`Ctrl+7`) shows task messages and provided progress immediately. Starting a background task opens this page; DOE selects the DOE data source and active learning selects the training pool. A background reader checks saved files every 3 seconds, with manual refresh and pause controls. Monitoring uses the loaded configuration, updated when a task saves its configuration; editing an input alone does not redirect a running monitor.
+
+The page displays accepted record counts, highest recorded efficiency and total-to-total pressure ratio, a CFD scatter plot, and the last 200 file rows in reverse file order. DOE and AL-pool data are separate selectable sources, never silently merged. Counts include boundary samples and do not imply engineering feasibility. Nonfinite values, invalid boundary flags, and samples outside the configured fixed `P_out` pressure band are excluded. Duplicate geometry/operating-point rows keep the last record. Summary values use the complete filtered dataset; scatter plots render at most 5,000 evenly selected rows. Table order is file order, not solver completion time.
+
+HV curves distinguish verified CFD HV from surrogate HV. They preserve round zero and missing-value gaps and show only iterations committed in checkpoint metadata. History, checkpoint and `al_stage.json` must agree on stage/policy, current performance schema and recorded operating condition. Legacy histories missing this provenance are reported as unavailable rather than silently attributed to the current stage. No solver or model is run to fill missing values. File sources, modification times and check time are shown; hover over a warning for the underlying diagnostic. Missing, malformed, changing, oversized (>64 MiB), or incompatible files clear the affected data and are retried on later refreshes. Other valid data sources remain visible.
+
+实时结果页每 3 秒在后台检查已保存的数据，支持手动刷新及暂停自动刷新。任务日志与已有的进度回调即时显示；单个 CFD 算例尚未完成并写入结果表时，不显示推算的中间性能，HV 则在迭代完成并提交 checkpoint 后更新。本功能不读取 CFX 内部每一步残差，也不启动额外求解。
+
+DOE 与主动学习训练池分别展示；效率—总压比图为已记录 CFD 样本散点，不代表经过工程筛选的 Pareto 前沿。真实 HV 与代理预测 HV 分开标注。缺少阶段来源信息的历史 HV 会显示不可用提示，需要指向已有完整阶段配置与产物，而不是由界面补写元数据。监视当前加载的配置，并随任务启动时保存的配置更新；仅编辑输入框不会把正在监视的任务切换到另一个目录。此功能只读结果文件，不改变训练、求解、采集协议或模型兼容性。
+
+### Native data analysis and case browser / 原生数据分析与算例浏览
+
+The PySide6 desktop now includes **Data analysis (Ctrl+8)** and **Case browser (Ctrl+9)**. Both use native Qt tables and QtCharts; no embedded website, external dashboard or model rerun is required. Visible inspection pages refresh in a background worker every 15 seconds. The shared auto-refresh switch pauses polling; manual refresh remains available. Switching configurations or cases discards late responses from previous reads.
+
+**Open results config…** loads an existing application or stage JSON for read-only inspection in these two pages. Relative workspace roots resolve against the selected configuration file. This does not change the task runner configuration, the live task monitor, saved engineering settings or training data. **View current workspace** returns to the currently loaded task configuration. This is useful when a historical stage has its own training pool, audit files and case directory.
+
+Data analysis provides:
+
+- DOE/pool selection, boundary-flag and categorical blade-count filtering; variable/target scatter plots for efficiency, stationary-frame mass-flow-averaged total-to-total pressure ratio, mass flow and power.
+- Pearson correlations for continuous geometry variables only. `nBl` is summarized by group (count, mean, sample standard deviation, min/max); `P_out` remains a fixed operating-condition filter, not a design variable. Correlation is descriptive and does not replace the existing Sobol workflow.
+- Separate online pre-CFD and fixed-test prediction views, with latest/specific/all-iteration selection, parity plots, signed errors (`prediction - observation`), original-unit uncertainty where recorded, and MAE/RMSE/bias/R². R² remains unavailable for insufficient or constant truth. Power has no surrogate prediction column and is not fabricated.
+- Historical prediction truth is matched by design/operating-point values against schema-v2 observations. Online records must be successful (and `result_valid` when that field exists). Named stages require matching stage tags; legacy untagged records are only numerically verified in a legacy workspace, not attributed to a named stage. Unverified records remain inspectable in raw audit tables but do not enter prediction statistics. These views never rerun or fit a model.
+- CV fold histories separated by recorded protocol and any recorded stage; old untagged protocol/stage records are explicitly historical audits rather than current-condition evaluations. Candidate source distributions, raw query records and validation summaries are available under Iteration audit.
+- Wheel zoom, rectangle zoom, double-click reset and hover values. Clicking a linked online prediction opens its case. Charts are bounded to 5,000 displayed points; statistics and table exports use all eligible rows. Tables support text search, numeric sorting and atomic export of the currently filtered/sorted rows; monitored source CSVs cannot be overwritten by the export action. Inspection exports are review tables, not automatically schema-tagged training artifacts.
+
+Case browser provides:
+
+- Separate DOE and active-learning inventories, including audit-only records whose directories are missing, and unregistered directories. Source/status/keyword filters do not treat unknown cases as failures. Identity includes source and directory as well as run ID. A same-named case from another stage is not linked to the current audit or prediction point.
+- Input parameters, recorded outcome/attempt count/failure reason, structured metadata and current CFX result validity. Recorded success is distinct from current valid-result evidence. The existing CFX definition/convergence checker is reused; no recovery, postprocessing or solver command is executed. Historical fractional LHS `nBl` inputs are retained verbatim while full-impeller flow and power use the same `int(round(nBl))` executed count as the runner.
+- File inventory, text/log/JSON preview, bounded raster-image preview and an explicit open-folder button. Text previews read at most the last 256 KiB / 800 lines; images are limited to 8 MiB / 32 million source pixels. Binary solver files and scripts are never executed by preview. File traversal stays within the selected case; directory and file inventories are bounded to 10,000 cases per source and 2,000 files/five directory levels per case.
+- Missing, malformed, changed or incompatible data produce explicit diagnostics. Software/license/numerical failures remain audit outcomes and are not reclassified as physical infeasibility. Successful reruns and later cancellations are not overridden by older failure records.
+
+新增页面：**数据分析（Ctrl+8）**、**算例浏览（Ctrl+9）**，均采用 PySide6 原生表格、标签页和 QtCharts。数据分析可以在界面内筛选变量/工况数据、查看分类叶片数统计、对比历史预测与真实值、查看误差/不确定度及不同协议下的交叉验证记录。算例浏览支持按来源、状态和关键词检索，核对输入参数和结果证据，查看文件、日志、JSON 和图片，并从在线预测点跳转到对应算例。
+
+“打开结果配置…”仅切换这两个页面的只读查看工程，不改变实际运行配置或实时任务页。页面显示期间可每 15 秒后台刷新，也可关闭自动刷新；切换工程/算例后不会接收旧读取任务的迟到结果。跨阶段同名算例、来源不明的真实值、缺失数据不会被自动拼接或补造。此次增加的是离线读取、统计与界面操作能力，不修改采集/CV 协议、性能 schema、模型或 scaler，已有模型无需重新训练。

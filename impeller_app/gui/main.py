@@ -13,10 +13,15 @@ from ..config import AppConfig, RuntimeSettings, SolverPaths, WorkspacePaths
 from ..core import ActiveLearningService, ParetoService, SobolService
 from ..models import TaskResult, TaskUpdate
 from ..runner import RunnerAPI
+from .theme import build_palette, build_stylesheet
+from .live_results import LiveResultsPage
+from .analytics import AnalyticsPage
+from .cases import CasesPage
+from ..core.review_config import load_review_config
 
 try:
-    from PySide6.QtCore import QObject, Signal, Qt, QUrl
-    from PySide6.QtGui import QDesktopServices, QFont, QFontDatabase
+    from PySide6.QtCore import QObject, Signal, Qt, QUrl, QSize
+    from PySide6.QtGui import QDesktopServices, QFont, QFontDatabase, QKeySequence, QShortcut
     from PySide6.QtWidgets import (
         QApplication,
         QCheckBox,
@@ -61,6 +66,15 @@ TEXTS = {
         "status_stopping": "Stopping task...",
         "status_done": "Task finished",
         "status_failed": "Task failed",
+        "status_canceled": "Task canceled",
+        "tab_results": "Live results",
+        "tab_analytics": "Data analysis",
+        "tab_cases": "Case browser",
+        "review_config": "Open results config…",
+        "review_current": "View current workspace",
+        "review_source": "Read-only inspection workspace",
+        "review_error": "Cannot open results configuration",
+        "review_auto": "Auto refresh · 15 s",
         "app_subtitle": "Configure → Sample → Learn → Explore → Export",
         "environment_intro": "Set project paths and check external tools before launching a run.",
         "doe_intro": "Choose a sample count and geometry bounds. Engineering thresholds are available below.",
@@ -165,6 +179,15 @@ TEXTS = {
         "status_stopping": "正在停止任务……",
         "status_done": "任务已完成",
         "status_failed": "任务失败",
+        "status_canceled": "任务已取消",
+        "tab_results": "实时结果",
+        "tab_analytics": "数据分析",
+        "tab_cases": "算例浏览",
+        "review_config": "打开结果配置…",
+        "review_current": "查看当前工程",
+        "review_source": "只读查看工程",
+        "review_error": "无法打开结果配置",
+        "review_auto": "自动刷新 · 15 秒",
         "app_subtitle": "配置环境 → DOE 采样 → 主动学习 → 结果分析 → 导出",
         "environment_intro": "先设置工程路径并校验外部工具，再启动计算任务。",
         "doe_intro": "设置样本量和几何变量范围；工程阈值可在下方展开。",
@@ -337,6 +360,8 @@ class MainWindow(QMainWindow):
         self._configure_font()
         self.config_path = None
         self.config = AppConfig.load().resolved()
+        self._review_config = self.config
+        self._review_path = None
         self.variable_specs = load_variable_specs(self.config.workspace.design_variables_json)
         self._workers = []
         self._language = "zh"
@@ -347,19 +372,62 @@ class MainWindow(QMainWindow):
 
         root = QWidget()
         self.setCentralWidget(root)
-        layout = QVBoxLayout(root)
-        layout.setContentsMargins(20, 18, 20, 16)
+        shell = QHBoxLayout(root)
+        shell.setContentsMargins(0, 0, 0, 0)
+        shell.setSpacing(0)
+        sidebar = QWidget()
+        sidebar.setObjectName("sidebar")
+        sidebar.setFixedWidth(196)
+        sidebar_layout = QVBoxLayout(sidebar)
+        sidebar_layout.setContentsMargins(14, 26, 14, 18)
+        brand = QLabel("BOUNDYR")
+        brand.setObjectName("brand")
+        sidebar_layout.addWidget(brand)
+        self.brand_caption = QLabel()
+        self.brand_caption.setObjectName("subtitle")
+        sidebar_layout.addWidget(self.brand_caption)
+        sidebar_layout.addSpacing(24)
+        shell.addWidget(sidebar)
+        content = QWidget()
+        shell.addWidget(content, 1)
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(24, 22, 24, 16)
         layout.setSpacing(12)
         self.resize(1260, 850)
         self.setMinimumSize(860, 600)
+        self.setPalette(build_palette())
         self.setStyleSheet(self._style_sheet())
 
         self.title_label = QLabel()
         self.title_label.setObjectName("pageTitle")
+        self.title_label.setWordWrap(True)
         layout.addWidget(self.title_label)
         self.subtitle_label = QLabel()
         self.subtitle_label.setObjectName("subtitle")
+        self.subtitle_label.setWordWrap(True)
         layout.addWidget(self.subtitle_label)
+        self.review_bar = QWidget()
+        review_layout = QVBoxLayout(self.review_bar)
+        review_layout.setContentsMargins(0, 0, 0, 0)
+        review_controls = QHBoxLayout()
+        self.review_open = QPushButton()
+        self.review_open.clicked.connect(self._choose_review_config)
+        self.review_current = QPushButton()
+        self.review_current.clicked.connect(self._review_current_workspace)
+        review_controls.addWidget(self.review_open)
+        review_controls.addWidget(self.review_current)
+        self.review_auto = QCheckBox()
+        self.review_auto.setChecked(True)
+        review_controls.addWidget(self.review_auto)
+        review_controls.addStretch(1)
+        review_layout.addLayout(review_controls)
+        self.review_label = QLabel()
+        self.review_label.setWordWrap(True)
+        self.review_label.setTextFormat(Qt.PlainText)
+        self.review_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        review_layout.addWidget(self.review_label)
+        layout.addWidget(self.review_bar)
+        self.review_bar.hide()
 
         self.splitter = QSplitter(Qt.Orientation.Vertical)
         self.splitter.setChildrenCollapsible(False)
@@ -369,17 +437,24 @@ class MainWindow(QMainWindow):
         workflow_layout.setSpacing(0)
         self.navigation = QListWidget()
         self.navigation.setObjectName("workflowNavigation")
-        self.navigation.setFixedWidth(172)
+        self.navigation.setMinimumWidth(160)
         self.navigation.setSpacing(4)
         self.pages = QStackedWidget()
         self.navigation.currentRowChanged.connect(self.pages.setCurrentIndex)
-        workflow_layout.addWidget(self.navigation)
+        sidebar_layout.addWidget(self.navigation, 1)
+        self.sidebar_footer = QLabel()
+        self.sidebar_footer.setObjectName("sidebarFooter")
+        self.sidebar_footer.setWordWrap(True)
+        sidebar_layout.addWidget(self.sidebar_footer)
+        self.navigation.currentRowChanged.connect(self._update_page_heading)
         workflow_layout.addWidget(self.pages, 1)
         self.splitter.addWidget(workflow)
 
         activity = QWidget()
+        self.activity_panel = activity
+        activity.setObjectName("activityPanel")
         activity_layout = QVBoxLayout(activity)
-        activity_layout.setContentsMargins(0, 0, 0, 0)
+        activity_layout.setContentsMargins(14, 10, 14, 12)
         activity_layout.setSpacing(8)
         activity_header = QHBoxLayout()
         self.activity_label = QLabel()
@@ -419,57 +494,76 @@ class MainWindow(QMainWindow):
         self._build_pareto_tab()
         self._build_sobol_tab()
         self._build_export_tab()
+        self.live_results = LiveResultsPage(self.config)
+        self._add_page(self.live_results, "tab_results")
+        self.analytics_page = AnalyticsPage(self.config)
+        self.cases_page = CasesPage(self.config)
+        self._add_page(self.analytics_page, "tab_analytics")
+        self._add_page(self.cases_page, "tab_cases")
+        self.analytics_page.case_requested.connect(self._show_case)
+        self.review_auto.toggled.connect(self.analytics_page.set_auto_refresh)
+        self.review_auto.toggled.connect(self.cases_page.set_auto_refresh)
+        for button in (self.validate_button, self.start_doe_button,
+                       self.run_active_learning_button, self.compute_pareto_button,
+                       self.run_sobol_button, self.export_button):
+            button.setProperty("role", "primary")
+            button.style().unpolish(button)
+            button.style().polish(button)
+        for index in range(self.pages.count()):
+            QShortcut(QKeySequence(f"Ctrl+{index + 1}"), self,
+                      activated=lambda i=index: self.navigation.setCurrentRow(i))
         self._apply_language()
         self._set_status("status_ready")
         self.splitter.setSizes([620, 150])
 
     @staticmethod
     def _style_sheet() -> str:
-        return """
-            QMainWindow { background: #f5f7fa; }
-            QWidget { color: #203149; font-size: 13px; }
-            QLabel#pageTitle { font-size: 22px; font-weight: 700; padding: 2px 0 8px; }
-            QLabel#subtitle { color: #60738b; padding-bottom: 8px; }
-            QLabel#pageIntro { color: #60738b; font-size: 14px; padding: 5px 0 11px; }
-            QLabel#sectionTitle { font-size: 13px; font-weight: 700; color: #52647d; }
-            QLabel#statusLabel { color: #52647d; font-weight: 600; }
-            QListWidget#workflowNavigation { background: #eaf0f6; border: none;
-                border-radius: 9px 0 0 9px; padding: 12px 7px; outline: none; }
-            QListWidget#workflowNavigation::item { color: #52647d; padding: 13px 12px;
-                border-radius: 6px; }
-            QListWidget#workflowNavigation::item:selected { background: #ffffff;
-                color: #145caa; font-weight: 700; }
-            QStackedWidget { border: 1px solid #dce4ed; background: #ffffff;
-                border-radius: 0 9px 9px 0; }
-            QScrollArea, QScrollArea > QWidget > QWidget { background: #ffffff; border: none; }
-            QGroupBox { background: #ffffff; border: 1px solid #dce4ed;
-                        border-radius: 9px; margin-top: 16px; padding: 18px 14px 12px; font-weight: 700; }
-            QGroupBox::title { subcontrol-origin: margin; left: 12px; padding: 0 5px;
-                               color: #284a73; }
-            QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox, QPlainTextEdit {
-                background: #ffffff; border: 1px solid #cbd6e2; border-radius: 6px;
-                padding: 6px 8px; selection-background-color: #176cc2; }
-            QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus, QComboBox:focus,
-            QPlainTextEdit:focus { border: 1px solid #176cc2; }
-            QPlainTextEdit { font-family: Consolas, monospace; }
-            QPushButton { background: #176cc2; color: #ffffff; border: none;
-                          border-radius: 6px; padding: 8px 14px; font-weight: 600; }
-            QPushButton:hover { background: #115baf; }
-            QPushButton:disabled { background: #dce4ed; color: #7a899a; }
-            QPushButton#quietButton { background: transparent; color: #176cc2; }
-            QPushButton#quietButton:hover { background: #eaf0f6; }
-            QPushButton#stopButton { background: #fff0ed; color: #a72d23; }
-            QPushButton#stopButton:hover { background: #ffe0da; }
-            QSplitter::handle { background: #e2e9f0; height: 5px; }
-        """
+        return build_stylesheet()
+
+    def _update_page_heading(self, index: int):
+        keys = list(self._tab_indexes)
+        if 0 <= index < len(keys):
+            self.title_label.setText(self.tr(keys[index]))
+            self.subtitle_label.setText(self.tr("app_subtitle"))
+            self.review_bar.setVisible(keys[index] in {"tab_analytics", "tab_cases"})
+
+    def _choose_review_config(self):
+        path, _ = QFileDialog.getOpenFileName(self, self.tr("review_config"), str(self._review_config.workspace.project_root), "JSON (*.json)")
+        if not path:
+            return
+        try:
+            config = load_review_config(Path(path))
+        except (OSError, ValueError, TypeError, KeyError) as exc:
+            QMessageBox.warning(self, self.tr("review_error"), str(exc))
+            return
+        self._set_review_config(config, Path(path))
+
+    def _set_review_config(self, config, path=None):
+        self._review_config, self._review_path = config.resolved(), path
+        self.analytics_page.set_config(self._review_config)
+        self.cases_page.set_config(self._review_config)
+        self._update_review_label()
+
+    def _review_current_workspace(self):
+        self._set_review_config(self.config)
+
+    def _update_review_label(self):
+        self.review_label.setText(f"{self.tr('review_source')}: {self._review_config.workspace.project_root}" + (f"\n{self._review_path}" if self._review_path else ""))
+
+    def _show_case(self, source, run_id):
+        self.navigation.setCurrentRow(self._tab_indexes["tab_cases"])
+        self.cases_page.select_case(source, run_id)
 
     def _add_page(self, page: QWidget, key: str):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        page.layout().setContentsMargins(2, 4, 12, 16)
+        page.layout().setSpacing(16)
         scroll.setWidget(page)
         self._tab_indexes[key] = self.pages.addWidget(scroll)
         self.navigation.addItem("")
+        self.navigation.item(self.navigation.count() - 1).setSizeHint(QSize(150, 46))
         if self.navigation.currentRow() < 0:
             self.navigation.setCurrentRow(0)
 
@@ -493,6 +587,9 @@ class MainWindow(QMainWindow):
     def _toggle_log(self):
         self.log.setHidden(not self.log.isHidden())
         self.log_toggle.setText(self.tr("show_log") if self.log.isHidden() else self.tr("hide_log"))
+        self.activity_panel.setMaximumHeight(58 if self.log.isHidden() else 16777215)
+        if not self.log.isHidden():
+            self.splitter.setSizes([max(300, self.height() - 270), 150])
 
     def _toggle_advanced(self):
         self.engineering_defaults_group.setHidden(not self.engineering_defaults_group.isHidden())
@@ -504,6 +601,9 @@ class MainWindow(QMainWindow):
     def _set_status(self, key: str):
         self._status_key = key
         self.status_label.setText(self.tr(key))
+        self.status_label.setProperty("state", key)
+        self.status_label.style().unpolish(self.status_label)
+        self.status_label.style().polish(self.status_label)
 
     def tr(self, key: str) -> str:
         return translate(self._language, key)
@@ -515,6 +615,11 @@ class MainWindow(QMainWindow):
     def _add_form_row(self, form: QFormLayout, key: str, field: QWidget):
         label = QLabel()
         self._form_labels[key] = label
+        label.setWordWrap(True)
+        form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        form.setHorizontalSpacing(20)
+        form.setVerticalSpacing(12)
         form.addRow(label, field)
 
     def _double_spin(self, value: float, decimals: int, minimum: float, maximum: float, step: float) -> QDoubleSpinBox:
@@ -857,6 +962,20 @@ class MainWindow(QMainWindow):
 
         for key, index in self._tab_indexes.items():
             self.navigation.item(index).setText(self.tr(key))
+            self.navigation.item(index).setToolTip(f"{self.tr(key)} · Ctrl+{index + 1}")
+        self.brand_caption.setText("低温叶轮优化工作台" if self._language == "zh" else "Cryogenic impeller studio")
+        self.sidebar_footer.setText(
+            "几何优化 / 13 个变量\nDOE · CFD · NSGA-II\n\nCtrl + 1–9 切换工作区"
+            if self._language == "zh" else
+            "Geometry / 13 variables\nDOE · CFD · NSGA-II\n\nCtrl + 1–9 to navigate")
+        self.live_results.set_language(self._language)
+        self.analytics_page.set_language(self._language)
+        self.cases_page.set_language(self._language)
+        self.review_open.setText(self.tr("review_config"))
+        self.review_current.setText(self.tr("review_current"))
+        self.review_auto.setText(self.tr("review_auto"))
+        self._update_review_label()
+        self._update_page_heading(self.navigation.currentRow())
 
     def _on_language_changed(self, index: int):
         self._language = "zh" if index == 0 else "en"
@@ -969,6 +1088,9 @@ class MainWindow(QMainWindow):
         save_variable_specs(serialized_specs, resolved.workspace.design_variables_json)
         self.variable_specs = load_variable_specs(resolved.workspace.design_variables_json)
         self.config_path = self.config.save()
+        self.live_results.set_config(resolved)
+        if self._review_path is None:
+            self._set_review_config(resolved)
         return resolved
 
     def _run_worker(self, fn):
@@ -980,6 +1102,10 @@ class MainWindow(QMainWindow):
         self.stop_button.setEnabled(True)
         self._set_status("status_running")
         self.log.setVisible(True)
+        self.activity_panel.setMaximumHeight(16777215)
+        self.log_toggle.setText(self.tr("hide_log"))
+        self.live_results.show_event(TaskUpdate(status="running", message=self.tr("status_running")))
+        self.navigation.setCurrentRow(self._tab_indexes["tab_results"])
         worker.start()
 
     def _cleanup_workers(self):
@@ -995,6 +1121,7 @@ class MainWindow(QMainWindow):
         self._set_status("status_stopping")
 
     def _handle_update(self, payload):
+        self.live_results.show_event(payload)
         if isinstance(payload, TaskUpdate):
             line = f"[{payload.status}] {payload.message}"
             if payload.metrics:
@@ -1005,9 +1132,11 @@ class MainWindow(QMainWindow):
 
     def _handle_result(self, result):
         self._cleanup_workers()
+        if hasattr(self, "live_results"):
+            self.live_results.show_event(result, final=True)
         if isinstance(result, TaskResult):
             if hasattr(self, "_set_status"):
-                self._set_status("status_failed" if result.status == "failed" else "status_done")
+                self._set_status({"failed": "status_failed", "canceled": "status_canceled"}.get(result.status, "status_done"))
             self.log.appendPlainText(f"[{result.status}] {result.message}")
             if result.metrics:
                 self.log.appendPlainText(str(result.metrics))
@@ -1027,6 +1156,7 @@ class MainWindow(QMainWindow):
 
     def _handle_failure(self, text):
         self._cleanup_workers()
+        self.live_results.show_event(TaskResult(status="failed", message=text), final=True)
         self._set_status("status_failed")
         self.log.appendPlainText(text)
         QMessageBox.critical(self, self.tr("unhandled_error"), text)
@@ -1053,6 +1183,7 @@ class MainWindow(QMainWindow):
         config = self._with_config(lambda cfg: cfg)
         if config is None:
             return
+        self.live_results.source.setCurrentIndex(0)
         self._run_worker(lambda callback, cancel_event: RunnerAPI(config).run_doe_batch(progress_callback=callback, cancel_event=cancel_event))
 
     def _resume_checkpoint(self):
@@ -1076,6 +1207,7 @@ class MainWindow(QMainWindow):
         config = self._with_config(lambda cfg: cfg)
         if config is None:
             return
+        self.live_results.source.setCurrentIndex(1)
         self._run_worker(
             lambda callback, cancel_event: ActiveLearningService(config).run_active_learning_iteration(
                 config.runtime.active_learning_additional_iters,
@@ -1134,7 +1266,14 @@ class MainWindow(QMainWindow):
             )
         )
 
+    def showEvent(self, event):
+        super().showEvent(event)
+        self.live_results.start()
+
     def closeEvent(self, event):
+        self.live_results.stop()
+        self.analytics_page.stop()
+        self.cases_page.stop()
         for worker in self._workers:
             if not worker.done:
                 worker.stop()
