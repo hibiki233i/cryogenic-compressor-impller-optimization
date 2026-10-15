@@ -283,6 +283,11 @@ GUI 和离线复现。离线复现测试执行真实训练和 NSGA-II，连续�
 `tests/test_convergence_policy.py` 提供恢复测试所需的最小 OUT/RES fixture；历史文档提到的
 `tests.test_al_stages` 未入库，因此不再列为可运行命令。不需要 ANSYS 许可证。
 
+每次 push 和 Pull Request 都由 GitHub Actions（`.github/workflows/ci.yml`）自动执行：
+Python 3.12 全量字节编译与 ruff 错误检查（语法错误、未定义名称），然后在
+Ubuntu Python 3.12/3.13/3.14 和 Windows Python 3.12 上运行上述全部测试与离线复现命令，
+复现输出作为构建产物上传。最低支持 Python 3.12（`cfx_runner.py` 使用了 PEP 701 f-string）。
+
 ### BOUNDYR desktop appearance
 
 The desktop uses a dark engineering-console palette with teal primary actions, a persistent workflow sidebar, and a page heading that follows navigation. Ctrl+1 through Ctrl+6 switch between the six workflow pages; Ctrl+7 opens live results. Forms scroll and wrap long labels on smaller windows; engineering thresholds and task activity remain collapsible. Task status uses both text and color. Chinese and English navigation, headings, and hints update together. This visual refresh does not change solver execution, performance schemas, fixed outlet pressure, or model compatibility.
