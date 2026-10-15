@@ -551,11 +551,12 @@ END
     existing_out, existing_res = latest_pair(working_dir)
     if existing_out is None and not glob.glob(os.path.join(working_dir, '*.res')):
         print(f"[{run_id}] 正在合成物理边界条件 (CFX-Pre)...")
+        template_cfx_path = template_cfx.replace("\\", "/")
         pre_content = f"""
 COMMAND FILE:
   CFX Pre Version = 25.1
 END
->load filename={template_cfx.replace("\\", "/")}
+>load filename={template_cfx_path}
 >update
 > gtmImport filename={gtm_file}, type=GTM, \
 units=m, nameStrategy= Assembly

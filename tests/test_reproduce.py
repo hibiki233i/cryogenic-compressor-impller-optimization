@@ -44,6 +44,34 @@ class OfflineReproductionTests(unittest.TestCase):
             self.assertEqual(summary["nsga2"]["test_samples"], 58)
             self.assertTrue(1 <= summary["nsga2"]["front_size"] <= 48)
             self.assertAlmostEqual(summary["selection"]["engineering_score"], 0.8300447961, delta=1e-6)
+            # POLA-1's analytic reference has no model/BLAS randomness. Its
+            # values and all 50 observed Pareto rows use tight CSV tolerances.
+            for key, expected in (("Efficiency", 0.7486677356),
+                                  ("totalpressureratio", 1.6819375),
+                                  ("MassFlow", 4.49925)):
+                self.assertAlmostEqual(summary["selection"]["true_outputs"][key], expected, delta=1e-8)
+            generated = pd.read_csv(output / "Compressor_Training_Data.csv")
+            pd.testing.assert_frame_equal(
+                generated, pd.read_csv(ROOT / "examples/offline/Compressor_Training_Data.csv"),
+                check_exact=False, rtol=0, atol=1e-10)
+            ranked = pd.read_csv(output / "pareto_engineering_ranked.csv")
+            self.assertEqual(len(ranked), 50)
+            np.testing.assert_allclose(ranked.iloc[0][["Efficiency", "totalpressureratio", "MassFlow"]],
+                                       [0.7486677356, 1.6819375, 4.49925], rtol=0, atol=1e-8)
+            predicted = pd.read_csv(output / "nsga2_surrogate_pareto.csv")
+            self.assertEqual(len(predicted), summary["nsga2"]["front_size"])
+            # The runner already fixes CPU threads, deterministic torch and seeds.
+            # Discrete NSGA-II membership can differ with torch/BLAS versions
+            # (POLA-1 recorded 30 and 31 rows), so retain its 1..population bound
+            # and compare the objective extrema as well as RMSE and HV above.
+            # 0.01 efficiency / 0.05 total PR permit small model drift; losing
+            # either end of the tradeoff must still fail. Not CFD tolerances.
+            for column, expected, tolerance in (("pred_Efficiency", 0.775687, 0.01),
+                                                ("pred_totalpressureratio", 2.040334, 0.05)):
+                self.assertTrue(np.isfinite(predicted[column]).all(), column)
+                self.assertAlmostEqual(predicted[column].max(), expected, delta=tolerance)
+            np.testing.assert_allclose(predicted.surrogate_hv, summary["nsga2"]["surrogate_hv"],
+                                       rtol=0, atol=1e-12)
 
     def test_seeded_pipeline_exports_reproducible_results_without_solvers(self):
         if importlib.util.find_spec("impeller_app.reproduce") is None:

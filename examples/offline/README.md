@@ -156,3 +156,17 @@ scikit-learn 1.9.1、PyTorch 2.14.1、pymoo 0.6.2、PySide6 6.12.0；96 个测�
 GUI 测试需要 PySide6。Linux 无桌面环境时使用 `QT_QPA_PLATFORM=offscreen`；
 Debian slim 可先安装 `libegl1 libgl1 libxkbcommon0 libdbus-1-3 libglib2.0-0 libfontconfig1`。
 用例因缺依赖跳过时应单列报告，不能把跳过当作该能力验证通过。
+
+## 数值回归与 CI
+
+`python -m unittest tests.test_reproduce -v` 运行真实的离线训练/优化，
+比对入库的 384 行合成数据、50 行解析前沿、推荐点的三项输出、模型误差、HV 和代理目标极值。
+代理最大效率参考为 `0.775687 ± 0.01`，最大总压比为 `2.040334 ± 0.05`；
+这些模型容差允许 CPU/依赖版本带来的小幅差异，解析输出仍使用上表的严格容差。
+代理行数须与摘要一致且介于 1 和种群大小 48 之间：离散前沿成员在不同依赖栈下会改变，
+因此结合目标极值与 HV 检查前沿，而不强制 30 行逐项相等。
+
+现有 CI 增加 Ubuntu Python 3.11，保留其余平台和版本，并在 Python 3.11 上做语法检查。
+手工验证测试敏感性时，可临时把 `config.json` 中的 `seed` 从 42 改为 43，
+运行 `python -m unittest tests.test_reproduce.OfflineReproductionTests.test_documented_default_metrics -v`；
+应返回非零，恢复 42 后再次运行应通过。参考数据不会随运行自动更新。
