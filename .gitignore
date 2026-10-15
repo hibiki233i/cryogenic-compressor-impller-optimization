@@ -25,11 +25,12 @@ patent_materials/
 
 pareto_cft_cases/
 *.csv
-tests/*
-!tests/test_gui_layout.py
-!tests/test_live_results.py
-!tests/test_review_core.py
-!tests/test_review_gui.py
+!examples/
+!examples/offline/
+!examples/offline/*.json
+!examples/offline/*.csv
+!examples/offline/*.md
+offline-output/
 _diagnostics/
 
 ansys_work/
