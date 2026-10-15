@@ -3021,6 +3021,8 @@ def run_nsga2_only_from_lhs(
     output_csv: str = "nsga2_surrogate_pareto.csv",
     summary_json: str | None = None,
     use_pool_checkpoint: bool = False,
+    max_epochs: int = 1200,
+    patience: int = 40,
 ) -> dict:
     """
     Continue the LHS/DOE workflow into surrogate-assisted NSGA-II optimization.
@@ -3077,6 +3079,8 @@ def run_nsga2_only_from_lhs(
         (Y_pool_surr[val_idx, 2] < BOUNDARY_FLOW_G_S).astype(float),
         save_path=model_path,
         sample_weights_train=train_sample_weights,
+        max_epochs=max_epochs,
+        patience=patience,
         random_seed=1000,
     )
     joblib.dump(scaler_X, scaler_x_path)

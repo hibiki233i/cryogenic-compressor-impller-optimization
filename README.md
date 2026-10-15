@@ -63,6 +63,18 @@ thresholds, and geometry screening thresholds, can be edited in the GUI or JSON 
 
 ## Optimization Problem Definition
 
+For a solver-free, seeded example, run:
+
+```sh
+python -m pip install -r requirements-gui.txt
+python -m impeller_app.reproduce --config examples/offline/config.json
+```
+
+See [the offline reproduction guide](examples/offline/README.md) for the complete
+variable bounds, constraints, column definitions, expected values and tolerances.
+The example uses explicitly synthetic analytic data and publishes a new model/scaler
+bundle; it does not use the standalone historical `best_regressor.pth`.
+
 - DOE samples only the 13 geometry variables and pins `P_out` to the configured optimization
   outlet static pressure (default `12 Pa`). The same hard geometry rules used by active learning
   are applied before a DOE case is launched.
@@ -263,13 +275,13 @@ python -m impeller_app
 ## 离线回归验证
 
 ```powershell
-python -m unittest tests.test_convergence_policy tests.test_al_stages -v
 python -m unittest discover -s tests -v
 ```
 
-测试使用临时工作区和模拟求解器，覆盖最终残差、严格门槛、OUT/RES 配对、wall、预算耗尽、
-取消恢复、旧 TXT 失效、成功结果来源、新阶段隔离、固定测试无泄漏、保存路径及过期导出拒绝。
-不需要 ANSYS 许可证。真实求解只能由用户之后明确启动。
+测试使用临时工作区和模拟求解器，验证恢复、结果元数据、失败记录、配置路径、Pareto 服务、
+GUI 和离线复现。离线复现测试执行真实训练和 NSGA-II，连续两次比较导出值，并禁止启动外部命令。
+`tests/test_convergence_policy.py` 提供恢复测试所需的最小 OUT/RES fixture；历史文档提到的
+`tests.test_al_stages` 未入库，因此不再列为可运行命令。不需要 ANSYS 许可证。
 
 ### BOUNDYR desktop appearance
 

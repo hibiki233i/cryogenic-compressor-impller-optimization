@@ -185,8 +185,8 @@ class ReviewCoreTests(unittest.TestCase):
         file = folder / "stage_config.json"
         file.write_text(json.dumps({"workspace": {"project_root": ".", "training_csv": "custom.csv"}}))
         result = load_review_config(file)
-        self.assertEqual(result.workspace.project_root, folder)
-        self.assertEqual(result.workspace.training_csv, folder / "custom.csv")
+        self.assertEqual(result.workspace.project_root.resolve(), folder.resolve())
+        self.assertEqual(result.workspace.training_csv.resolve(), (folder / "custom.csv").resolve())
         file.write_text("{}")
         with self.assertRaises(ValueError):
             load_review_config(file)

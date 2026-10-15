@@ -1,0 +1,8 @@
+{
+  "seed": 42,
+  "samples": 384,
+  "max_epochs": 240,
+  "patience": 40,
+  "pop_size": 48,
+  "n_gen": 32
+}
