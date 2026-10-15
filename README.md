@@ -284,9 +284,9 @@ GUI 和离线复现。离线复现测试执行真实训练和 NSGA-II，连续�
 `tests.test_al_stages` 未入库，因此不再列为可运行命令。不需要 ANSYS 许可证。
 
 每次 push 和 Pull Request 都由 GitHub Actions（`.github/workflows/ci.yml`）自动执行：
-Python 3.12 全量字节编译与 ruff 错误检查（语法错误、未定义名称），然后在
-Ubuntu Python 3.12/3.13/3.14 和 Windows Python 3.12 上运行上述全部测试与离线复现命令，
-复现输出作为构建产物上传。最低支持 Python 3.12（`cfx_runner.py` 使用了 PEP 701 f-string）。
+Python 3.11 全量字节编译与 ruff 错误检查（语法错误、未定义名称），然后在
+Ubuntu Python 3.11/3.12/3.13/3.14 和 Windows Python 3.12 上运行上述全部测试与离线复现命令，
+复现输出作为构建产物上传。最低支持 Python 3.11。
 
 ### BOUNDYR desktop appearance
 
