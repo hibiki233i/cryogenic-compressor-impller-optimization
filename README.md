@@ -58,7 +58,7 @@ BOUNDYR 用来给低温压缩机的叶轮找到更好的几何形状。它的思
 
 ## 离线快速开始
 
-在仓库根目录执行（以下为 macOS / Linux 写法；Windows 请把激活命令换成 `.venv\Scripts\activate`）：
+在仓库根目录执行。macOS / Linux：
 
 ```sh
 python3 -m venv .venv
@@ -68,11 +68,23 @@ python -m impeller_app.reproduce --config examples/offline/config.json
 python -m unittest discover -s tests -v
 ```
 
-第三行运行"离线复现"：用固定随机种子生成 384 个合成样本，训练预测模型，再做一次完整的多目标优化，
+Windows（PowerShell）：
+
+```powershell
+py -3 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements-gui.txt
+python -m impeller_app.reproduce --config examples/offline/config.json
+python -m unittest discover -s tests -v
+```
+
+如果 PowerShell 提示禁止运行脚本，可先执行 `Set-ExecutionPolicy -Scope Process RemoteSigned`（仅对当前窗口有效）。
+
+其中 `reproduce` 这一步是"离线复现"：用固定随机种子生成 384 个合成样本，训练预测模型，再做一次完整的多目标优化，
 最后在结果里挑出推荐设计。通常几秒到十几秒完成。结果写入 `offline-output/`（目录必须为空，
 重复运行请用 `--output-dir` 指定新目录）。
 
-最后一行运行全部自动测试，不需要任何 CFD 软件。在没有桌面环境的 Linux 上，请先设置环境变量
+最后一步运行全部自动测试，不需要任何 CFD 软件。在没有桌面环境的 Linux 上，请先设置环境变量
 `QT_QPA_PLATFORM=offscreen`。示例的详细说明、参考数值和允许误差见 [离线复现指南](examples/offline/README.md)。
 
 ## 真实 CFD 运行（Windows）

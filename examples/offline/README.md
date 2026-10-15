@@ -8,7 +8,7 @@
 
 ## 运行方法
 
-在仓库根目录执行（macOS / Linux；Windows 请把激活命令换成 `.venv\Scripts\activate`）：
+在仓库根目录执行。macOS / Linux：
 
 ```sh
 python3 -m venv .venv
@@ -17,6 +17,18 @@ python -m pip install -r requirements-gui.txt
 python -m impeller_app.reproduce --config examples/offline/config.json
 python -m unittest discover -s tests -v
 ```
+
+Windows（PowerShell）：
+
+```powershell
+py -3 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements-gui.txt
+python -m impeller_app.reproduce --config examples/offline/config.json
+python -m unittest discover -s tests -v
+```
+
+如果 PowerShell 提示禁止运行脚本，可先执行 `Set-ExecutionPolicy -Scope Process RemoteSigned`（仅对当前窗口有效）。
 
 建议使用 Python 3.13 或 3.14（最低支持 3.11）。
 
