@@ -30,6 +30,8 @@ pareto_cft_cases/
 !examples/offline/*.json
 !examples/offline/*.csv
 !examples/offline/*.md
+!docs/
+!docs/*.md
 offline-output/
 _diagnostics/
 
