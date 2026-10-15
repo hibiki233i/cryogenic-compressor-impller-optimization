@@ -149,6 +149,10 @@ scikit-learn 1.8.0、PyTorch 2.11.0、pymoo 0.6.1.6。配置为 seed=42、384 �
 解析示例数据也依赖 SciPy LHS 实现；更换采样算法/重大版本需重新建立参考基线，
 `summary.json.environment` 记录实际版本供核对。
 
+干净 macOS Python 3.14.3 虚拟环境也已验证：NumPy 2.5.4、Pandas 3.0.6、SciPy 1.18.1、
+scikit-learn 1.9.1、PyTorch 2.14.1、pymoo 0.6.2、PySide6 6.12.0；96 个测试通过、0 跳过。
+该环境默认复现约 11 秒，代理前沿为 31 行、HV 为 0.15713864，仍满足上表容差。
+
 GUI 测试需要 PySide6。Linux 无桌面环境时使用 `QT_QPA_PLATFORM=offscreen`；
-发行版可能还需 `libegl1 libgl1 libxkbcommon0 libdbus-1-3`。
+Debian slim 可先安装 `libegl1 libgl1 libxkbcommon0 libdbus-1-3 libglib2.0-0 libfontconfig1`。
 用例因缺依赖跳过时应单列报告，不能把跳过当作该能力验证通过。
