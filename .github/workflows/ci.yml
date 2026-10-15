@@ -3,8 +3,11 @@ name: CI
 # Every push and pull request runs the offline checks: no ANSYS/CFturbo,
 # no private training data. Real CFD / active-learning runs stay on the
 # Windows engineering machine and are out of scope here.
+# Branch commits are checked through their pull request; pushes to main
+# (including merges) are checked directly. Avoids duplicate runs per commit.
 on:
   push:
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
